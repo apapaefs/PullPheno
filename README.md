@@ -6,6 +6,8 @@ The pull vector is designed to resolve colour-flow information that is not conta
 
 The purpose of this project is to determine whether this difference remains observable once a physical Higgs decay, realistic event selection, detector acceptance, pileup, irreducible backgrounds, event yields and systematic uncertainties are included. The central result should therefore not be a truth-level ROC curve. It should be the change in the expected VBF signal sensitivity or precision when pull information is added to an otherwise realistic analysis.
 
+The concrete nominal event-generation setup used to start this programme is recorded in [PILOT_GENERATION.md](PILOT_GENERATION.md).
+
 ## Executive recommendation
 
 We propose a two-tier analysis programme:

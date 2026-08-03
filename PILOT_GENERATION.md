@@ -13,11 +13,13 @@ statistics target for the final phenomenology.
 | EW Zjj | electroweak resonant Zjj with the common VBF approximation | Z to e+e- and mu+mu- combined | decay-inclusive |
 | QCD Zjj | QCD-induced resonant Zjj | Z to e+e- and mu+mu- combined | decay-inclusive |
 
-For the Higgs samples, the forced decay is not accompanied by a generator
-branching-ratio reweighting.  Event-yield predictions must multiply both
-generator chains by one common external physical BR(H to gamma gamma).  The
-Z samples already include both requested dilepton branching fractions and
-must not be multiplied by another Z branching fraction.
+For the Higgs samples, Herwig performs the forced decay internally.  In the
+MG5+Pythia chain, MG5 writes an undecayed on-shell Higgs to the LHE file and
+Pythia 8 performs the forced H to gamma gamma decay.  The forced decay is not
+accompanied by generator branching-ratio reweighting.  Event-yield predictions
+must multiply both generator chains by one common external physical BR(H to
+gamma gamma).  The Z samples already include both requested dilepton branching
+fractions and must not be multiplied by another Z branching fraction.
 
 The pilot contains two nominal chains:
 
@@ -43,9 +45,12 @@ generators.  A tiresias probe confirmed that the installed OpenLoops `pphjj2`
 library constructs all 176 subprocesses.
 
 The Z samples are resonant on-shell-Z samples.  MG5 uses spin-correlated decay
-chains; Herwig uses direct dilepton matrix-element final states with
-`OnShellZProduction.in`.  Electroweak and QCD Zjj orders are generated
-separately, and their interference is deferred beyond the first pilot.
+chains.  Herwig/VBFNLO uses direct dilepton hard final states, whereas the QCD
+Herwig sample produces an on-shell Z and forces its e/mu decays with a
+branching-ratio reweighter.  The latter choice avoids adding gamma-star and
+other non-resonant diagrams only on the Herwig side.  Electroweak and QCD Zjj
+orders are generated separately, and their interference is deferred beyond
+the first pilot.
 
 ## Common inputs and generation cuts
 

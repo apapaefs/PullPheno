@@ -44,11 +44,12 @@ colour structures.  The pilot therefore uses the full pp process in both
 generators.  A tiresias probe confirmed that the installed OpenLoops `pphjj2`
 library constructs all 176 subprocesses.
 
-The Z samples are resonant on-shell-Z samples.  MG5 uses spin-correlated decay
-chains.  Herwig/VBFNLO uses direct dilepton hard final states, whereas the QCD
-Herwig sample produces an on-shell Z and forces its e/mu decays with a
-branching-ratio reweighter.  The latter choice avoids adding gamma-star and
-other non-resonant diagrams only on the Herwig side.  Electroweak and QCD Zjj
+The Z samples target the same resonant Z region.  MG5 uses spin-correlated
+on-shell-Z decay chains.  The QCD Herwig sample produces an explicit on-shell Z
+and forces its e/mu decays with a branching-ratio reweighter.  The
+Herwig/VBFNLO interface instead supports direct dilepton hard final states, so
+a common 60--120 GeV dilepton generation window removes the low-mass gamma-star
+region absent from the MG5 decay-chain definition.  Electroweak and QCD Zjj
 orders are generated separately, and their interference is deferred beyond
 the first pilot.
 
@@ -68,6 +69,19 @@ campaign conventions mH = 125 GeV and mt = 173 GeV are applied to both.
 These loose cuts are not the analysis selection.  The phenomenological code
 will reconstruct anti-kT R=0.4 jets and impose the photon/lepton acceptance,
 tagging-jet, mjj and rapidity-gap cuts downstream.
+
+The ROOT `evweight` values are native relative weights and do not have one
+common absolute convention across generators.  The smoke sample, for example,
+has unit Herwig weights and constant MG5 weights equal to the MG5 sample cross
+section.  A bin yield at luminosity `L` in fb^-1 must therefore be evaluated as
+
+```text
+N_bin = 1000 L sigma_pb (sum_bin w_i / sum_all w_i),
+```
+
+with the external H-to-gamma-gamma branching fraction applied once for Hjj and
+no additional branching fraction for the decay-inclusive Zjj samples.  Raw
+`evweight` must never be interpreted directly as a per-event yield.
 
 ## Production gate
 

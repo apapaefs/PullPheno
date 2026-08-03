@@ -44,14 +44,14 @@ colour structures.  The pilot therefore uses the full pp process in both
 generators.  A tiresias probe confirmed that the installed OpenLoops `pphjj2`
 library constructs all 176 subprocesses.
 
-The Z samples target the same resonant Z region.  MG5 uses spin-correlated
-on-shell-Z decay chains.  The QCD Herwig sample produces an explicit on-shell Z
-and forces its e/mu decays with a branching-ratio reweighter.  The
-Herwig/VBFNLO interface instead supports direct dilepton hard final states, so
-a common 60--120 GeV dilepton generation window removes the low-mass gamma-star
-region absent from the MG5 decay-chain definition.  Electroweak and QCD Zjj
-orders are generated separately, and their interference is deferred beyond
-the first pilot.
+The Z samples use explicit resonant on-shell-Z production in both chains.  MG5
+uses spin-correlated decay chains.  Both Herwig samples use Matchbox's MadGraph
+amplitude interface for the same production process, then force the e/mu decays
+with a branching-ratio reweighter.  This exact hard-process harmonization
+excludes the low-mass gamma-star region and makes the initial comparison
+primarily a shower/hadronization comparison.  Electroweak and QCD Zjj orders
+are generated separately, and their interference is deferred beyond the first
+pilot.
 
 ## Common inputs and generation cuts
 

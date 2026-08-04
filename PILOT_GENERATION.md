@@ -32,10 +32,15 @@ tests will be separate, explicitly labelled variations.
 
 ## Harmonization choices
 
-The VBF samples retain the approximation already selected by the Herwig cards:
-`VBFDiagramsOnly.in` in Herwig and `$$ w+ w- z a` in MG5.  Changing only one
-generator to the full electroweak process would create a process-definition
-mismatch.
+The VBF samples use the same `$$ w+ w- z a` exclusion in their MadGraph
+process definitions.  For EW Zjj, the campaign runner applies that exclusion
+through a version-checked bridge around Herwig's external `mg2herwig`
+interface.  This bridge is necessary because `VBFDiagramsOnly.in` filters only
+Herwig's internal diagram generator; it does not constrain amplitudes supplied
+by external MadGraph.  The Herwig card retains `VBFDiagramsOnly.in` as a
+defensive setting, but the generated `proc.dat` is the authoritative check.
+Changing only one generator to the full electroweak process would create a
+process-definition mismatch.
 
 The previous loop-induced Hjj comparison was restricted to gg initial states.
 That is useful as a matrix-element diagnostic but incomplete for jet-pull

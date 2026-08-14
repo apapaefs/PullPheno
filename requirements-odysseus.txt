@@ -1,4 +1,4 @@
 # PyROOT, NumPy and Matplotlib are supplied by the Odysseus ROOT/system setup.
 -r requirements-xgboost.txt
 fastjet==3.5.1.4
-scikit-learn==1.9.0
+scikit-learn==1.7.2

@@ -1,0 +1,2 @@
+# Last XGBoost release supporting Timur's Python 3.9 runtime.
+xgboost==2.1.4

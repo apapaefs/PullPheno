@@ -1,0 +1,88 @@
+{
+  "description": "Odysseus summer2026 campaign 3, MG5_aMC plus Pythia 8 samples",
+  "campaign_id": 3,
+  "chain": "mg5_pythia",
+  "higgs_branching_ratio": 0.00227,
+  "tree_name": "Data",
+  "luminosities_fb": [
+    300.0,
+    3000.0
+  ],
+  "samples": [
+    {
+      "name": "aajj",
+      "channel": "higgs",
+      "role": "background",
+      "files": [
+        "/micron/Projects/PullPheno/campaigns/campaign-00003/merged/aajj_mg5_pythia.root"
+      ],
+      "generator_cross_section_pb": 1.4348842422810897,
+      "cross_section_pb": 1.4348842422810897,
+      "cross_section_unc_pb": 0.00016959017733577994,
+      "cross_section_source": "MG5 LHE init",
+      "label": "QCD gamma gamma jj",
+      "color": "#D5A84B",
+      "stack_order": 0
+    },
+    {
+      "name": "QCDHjj",
+      "channel": "higgs",
+      "role": "background",
+      "files": [
+        "/micron/Projects/PullPheno/campaigns/campaign-00003/merged/QCDHjj_mg5_pythia.root"
+      ],
+      "generator_cross_section_pb": 2.670419511316176,
+      "cross_section_pb": 0.00606185229068772,
+      "cross_section_unc_pb": 0.0000016082272839673615,
+      "cross_section_source": "MG5 LHE init times BR(H to gamma gamma)",
+      "label": "QCD Hjj",
+      "color": "#4E79A7",
+      "stack_order": 1
+    },
+    {
+      "name": "VBFH",
+      "channel": "higgs",
+      "role": "signal",
+      "files": [
+        "/micron/Projects/PullPheno/campaigns/campaign-00003/merged/VBFH_mg5_pythia.root"
+      ],
+      "generator_cross_section_pb": 2.623679686921405,
+      "cross_section_pb": 0.00595575288931159,
+      "cross_section_unc_pb": 0.000002598746913085589,
+      "cross_section_source": "MG5 LHE init times BR(H to gamma gamma)",
+      "label": "VBF H",
+      "color": "#59A14F",
+      "stack_order": 2
+    },
+    {
+      "name": "QCDZjj",
+      "channel": "z",
+      "role": "background",
+      "files": [
+        "/micron/Projects/PullPheno/campaigns/campaign-00003/merged/QCDZjj_mg5_pythia.root"
+      ],
+      "generator_cross_section_pb": 90.263893345611,
+      "cross_section_pb": 90.263893345611,
+      "cross_section_unc_pb": 0.010422451121937836,
+      "cross_section_source": "MG5 LHE init; decay-inclusive Z to electrons and muons",
+      "label": "QCD Zjj",
+      "color": "#4E79A7",
+      "stack_order": 0
+    },
+    {
+      "name": "VBFZ",
+      "channel": "z",
+      "role": "signal",
+      "files": [
+        "/micron/Projects/PullPheno/campaigns/campaign-00003/merged/VBFZ_mg5_pythia.root"
+      ],
+      "generator_cross_section_pb": 0.8580643818569051,
+      "cross_section_pb": 0.8580643818569051,
+      "cross_section_unc_pb": 0.00031209510561373924,
+      "cross_section_source": "MG5 LHE init; decay-inclusive Z to electrons and muons",
+      "label": "VBF Z",
+      "color": "#59A14F",
+      "stack_order": 1
+    }
+  ]
+}

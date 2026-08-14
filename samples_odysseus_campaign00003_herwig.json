@@ -1,0 +1,88 @@
+{
+  "description": "Odysseus summer2026 campaign 3, nominal Herwig samples",
+  "campaign_id": 3,
+  "chain": "herwig",
+  "higgs_branching_ratio": 0.00227,
+  "tree_name": "Data",
+  "luminosities_fb": [
+    300.0,
+    3000.0
+  ],
+  "samples": [
+    {
+      "name": "aajj",
+      "channel": "higgs",
+      "role": "background",
+      "files": [
+        "/micron/Projects/PullPheno/campaigns/campaign-00003/merged/aajj_herwig.root"
+      ],
+      "generator_cross_section_pb": 4.697674879700447,
+      "cross_section_pb": 4.697674879700447,
+      "cross_section_unc_pb": 0.00604721669911737,
+      "cross_section_source": "Herwig .out",
+      "label": "QCD gamma gamma jj",
+      "color": "#D5A84B",
+      "stack_order": 0
+    },
+    {
+      "name": "QCDHjj",
+      "channel": "higgs",
+      "role": "background",
+      "files": [
+        "/micron/Projects/PullPheno/campaigns/campaign-00003/merged/QCDHjj_herwig.root"
+      ],
+      "generator_cross_section_pb": 7.500492805755396,
+      "cross_section_pb": 0.0170261186690647,
+      "cross_section_unc_pb": 0.000017048119793373362,
+      "cross_section_source": "Herwig .out times BR(H to gamma gamma)",
+      "label": "QCD Hjj",
+      "color": "#4E79A7",
+      "stack_order": 1
+    },
+    {
+      "name": "VBFH",
+      "channel": "higgs",
+      "role": "signal",
+      "files": [
+        "/micron/Projects/PullPheno/campaigns/campaign-00003/merged/VBFH_herwig.root"
+      ],
+      "generator_cross_section_pb": 2.9679696951784202,
+      "cross_section_pb": 0.006737291208055014,
+      "cross_section_unc_pb": 0.000006981105060480095,
+      "cross_section_source": "Herwig .out times BR(H to gamma gamma)",
+      "label": "VBF H",
+      "color": "#59A14F",
+      "stack_order": 2
+    },
+    {
+      "name": "QCDZjj",
+      "channel": "z",
+      "role": "background",
+      "files": [
+        "/micron/Projects/PullPheno/campaigns/campaign-00003/merged/QCDZjj_herwig.root"
+      ],
+      "generator_cross_section_pb": 344.3551637279597,
+      "cross_section_pb": 344.3551637279597,
+      "cross_section_unc_pb": 0.10037712264569912,
+      "cross_section_source": "Herwig .out; decay-inclusive Z to electrons and muons",
+      "label": "QCD Zjj",
+      "color": "#4E79A7",
+      "stack_order": 0
+    },
+    {
+      "name": "VBFZ",
+      "channel": "z",
+      "role": "signal",
+      "files": [
+        "/micron/Projects/PullPheno/campaigns/campaign-00003/merged/VBFZ_herwig.root"
+      ],
+      "generator_cross_section_pb": 1.1099,
+      "cross_section_pb": 1.1099,
+      "cross_section_unc_pb": 0.001,
+      "cross_section_source": "Herwig .out; decay-inclusive Z to electrons and muons",
+      "label": "VBF Z",
+      "color": "#59A14F",
+      "stack_order": 1
+    }
+  ]
+}

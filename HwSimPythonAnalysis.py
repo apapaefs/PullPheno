@@ -1,471 +1,3554 @@
-import ROOT
-import sys
-import numpy as np
-import math
-import random
-from matplotlib import colors
-import matplotlib.gridspec as gridspec # more plotting 
-import matplotlib.ticker as ticker
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-import multiprocessing
-import time
-from time import sleep
+#!/usr/bin/env python3
+"""Particle-level cut-based pull-angle analysis for HwSim ROOT events.
+
+The module is deliberately import-safe: ROOT, FastJet and Matplotlib are loaded
+only by the command-line execution path.  This keeps the object selection,
+normalisation, pull-vector and run-management helpers independently testable.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import csv
+import hashlib
+import html
+import json
 import logging
-from functools import partial
-tqdm = partial(tqdm, position=0, leave=True)
-import fastjet
-import cppyy.ll, cppyy
+import math
+import multiprocessing
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from collections import OrderedDict
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
-# print root version and check whether to use the new root cppyy treatment:
-print('ROOT version:', ROOT.__version__)
-newroot = False
-if float(ROOT.__version__[:4]) >= 6.32:
-    newroot = True
-    print('>= 6.32 => Using new cppyy root bindings!')
+import numpy as np
 
-##########################
-# VARIABLES
-##########################
+import xgboost_root_varfiles_module as xgbtools
 
-# Cuts for jets 
-jetPtMin    = 10 # pT in GeV
-jetEtaMax   = 5  # HGCAL is up to 3
 
-# cuts for particles to enter jet algorithm:
-jcPtMin = 0.1
-jcEtaMax = 6.0
+ANALYSIS_VERSION = "2.1.0"
+MZ_GEV = 91.1876
+NEUTRINO_IDS = frozenset((12, 14, 16))
+ANALYSIS_STRATEGIES = ("cutbased", "xgboost")
+PULL_BIN_COUNT = 6
+PULL_BIN_EDGES = np.linspace(0.0, math.pi, PULL_BIN_COUNT + 1, dtype=np.float64)
+PULL_VALUE_NAMES = ("t_beam", "t_phi", "magnitude", "signed_angle", "zero_magnitude")
 
-# jet algorithm radius parameter
-R=0.4
+CUTS: Dict[str, float] = {
+    "photon_pt_lead_min_gev": 40.0,
+    "photon_pt_sublead_min_gev": 30.0,
+    "photon_abs_eta_max": 2.5,
+    "photon_mass_min_gev": 120.0,
+    "photon_mass_max_gev": 130.0,
+    "photon_isolation_dr": 0.4,
+    "photon_relative_isolation_max": 0.1,
+    "lepton_pt_lead_min_gev": 25.0,
+    "lepton_pt_sublead_min_gev": 20.0,
+    "lepton_abs_eta_max": 2.5,
+    "lepton_mass_min_gev": 80.0,
+    "lepton_mass_max_gev": 100.0,
+    "jet_radius": 0.4,
+    "jet_pt_min_gev": 30.0,
+    "jet_abs_y_max": 4.5,
+    "mjj_min_gev": 400.0,
+    "abs_delta_y_min": 2.5,
+}
 
-# Cuts for Leptons and Photons
-electronPtMin = 10
-electronEtaMax = 5
+HIGGS_CUTFLOW = (
+    "all_events",
+    "at_least_two_photons",
+    "photon_acceptance",
+    "leading_photon_pt",
+    "subleading_photon_pt",
+    "photon_isolation",
+    "diphoton_mass_window",
+    "at_least_two_jets",
+    "opposite_hemispheres",
+    "mjj",
+    "delta_yjj",
+    "boson_centrality",
+)
 
-muonPtMin = 10
-muonEtaMax = 5
+Z_CUTFLOW = (
+    "all_events",
+    "at_least_two_leptons",
+    "lepton_acceptance",
+    "ossf_pair",
+    "leading_lepton_pt",
+    "subleading_lepton_pt",
+    "dilepton_mass_window",
+    "at_least_two_jets",
+    "opposite_hemispheres",
+    "mjj",
+    "delta_yjj",
+    "boson_centrality",
+)
 
-photonPtMin = 10
-photonEtaMax = 5
+XGBOOST_HIGGS_CUTFLOW = HIGGS_CUTFLOW[:-3] + (
+    "xgboost_application_sample",
+    "xgboost_score",
+)
+XGBOOST_Z_CUTFLOW = Z_CUTFLOW[:-3] + (
+    "xgboost_application_sample",
+    "xgboost_score",
+)
 
-# Debug
-debug = False
+CUT_LABELS = {
+    "all_events": "All generated events",
+    "at_least_two_photons": "At least two photons",
+    "photon_acceptance": r"Two photons with |eta| < 2.5",
+    "leading_photon_pt": r"Leading photon pT > 40 GeV",
+    "subleading_photon_pt": r"Subleading photon pT > 30 GeV",
+    "photon_isolation": r"Two isolated photons (Irel < 0.1)",
+    "diphoton_mass_window": r"120 < m(gamma gamma) < 130 GeV",
+    "at_least_two_leptons": "At least two electrons or muons",
+    "lepton_acceptance": r"Two leptons with |eta| < 2.5",
+    "ossf_pair": "Opposite-sign, same-flavour pair",
+    "leading_lepton_pt": r"Leading lepton pT > 25 GeV",
+    "subleading_lepton_pt": r"Subleading lepton pT > 20 GeV",
+    "dilepton_mass_window": r"80 < m(ll) < 100 GeV",
+    "at_least_two_jets": r"At least two jets (pT > 30 GeV, |y| < 4.5)",
+    "opposite_hemispheres": r"Opposite hemispheres (y1 y2 < 0)",
+    "mjj": r"mjj > 400 GeV",
+    "delta_yjj": r"|Delta yjj| > 2.5",
+    "boson_centrality": "Boson between tagging jets",
+    "xgboost_application_sample": "XGBoost application sample",
+    "xgboost_score": "Frozen XGBoost score requirement",
+}
 
-##########################
-# FUNCTIONS
-##########################
 
-# choose the next colour -- for plotting
-ccount = 0
-def next_color():
-    global ccount
-    colors = ['green', 'orange', 'red', 'blue', 'black', 'cyan', 'magenta', 'brown', 'violet'] # 9 colours
-    color_chosen = colors[ccount]
-    if ccount < 8:
-        ccount = ccount + 1
+@dataclass(frozen=True)
+class FourVector:
+    energy: float
+    px: float
+    py: float
+    pz: float
+
+    @property
+    def pt(self) -> float:
+        return math.hypot(self.px, self.py)
+
+    @property
+    def phi(self) -> float:
+        return math.atan2(self.py, self.px)
+
+    @property
+    def mass2(self) -> float:
+        return self.energy * self.energy - self.px * self.px - self.py * self.py - self.pz * self.pz
+
+    @property
+    def mass(self) -> float:
+        return math.sqrt(max(0.0, self.mass2))
+
+    @property
+    def rapidity(self) -> float:
+        plus = self.energy + self.pz
+        minus = self.energy - self.pz
+        if plus <= 0.0 or minus <= 0.0:
+            if self.pz > 0.0:
+                return math.inf
+            if self.pz < 0.0:
+                return -math.inf
+            return 0.0
+        return 0.5 * math.log(plus / minus)
+
+    def __add__(self, other: "FourVector") -> "FourVector":
+        return FourVector(
+            self.energy + other.energy,
+            self.px + other.px,
+            self.py + other.py,
+            self.pz + other.pz,
+        )
+
+
+@dataclass
+class EventParticles:
+    energy: np.ndarray
+    px: np.ndarray
+    py: np.ndarray
+    pz: np.ndarray
+    pid: np.ndarray
+    pt: np.ndarray = field(init=False)
+    phi: np.ndarray = field(init=False)
+    eta: np.ndarray = field(init=False)
+
+    def __post_init__(self) -> None:
+        lengths = {len(self.energy), len(self.px), len(self.py), len(self.pz), len(self.pid)}
+        if len(lengths) != 1:
+            raise ValueError("Particle arrays have inconsistent lengths")
+        self.energy = np.asarray(self.energy, dtype=np.float64)
+        self.px = np.asarray(self.px, dtype=np.float64)
+        self.py = np.asarray(self.py, dtype=np.float64)
+        self.pz = np.asarray(self.pz, dtype=np.float64)
+        self.pid = np.asarray(self.pid, dtype=np.int64)
+        self.pt = np.hypot(self.px, self.py)
+        self.phi = np.arctan2(self.py, self.px)
+        momentum = np.sqrt(self.pt * self.pt + self.pz * self.pz)
+        plus = momentum + self.pz
+        minus = momentum - self.pz
+        self.eta = np.zeros_like(momentum)
+        finite = (plus > 0.0) & (minus > 0.0)
+        self.eta[finite] = 0.5 * np.log(plus[finite] / minus[finite])
+        self.eta[(~finite) & (self.pz > 0.0)] = math.inf
+        self.eta[(~finite) & (self.pz < 0.0)] = -math.inf
+
+    def __len__(self) -> int:
+        return len(self.energy)
+
+    def p4(self, index: int) -> FourVector:
+        return FourVector(
+            float(self.energy[index]),
+            float(self.px[index]),
+            float(self.py[index]),
+            float(self.pz[index]),
+        )
+
+    def relative_photon_isolation(self, photon_index: int, radius: float = 0.4) -> float:
+        photon_pt = float(self.pt[photon_index])
+        if photon_pt <= 0.0:
+            return math.inf
+        visible = ~np.isin(np.abs(self.pid), tuple(NEUTRINO_IDS))
+        visible[photon_index] = False
+        delta_eta = self.eta - self.eta[photon_index]
+        delta_phi = wrap_delta_phi_array(self.phi - self.phi[photon_index])
+        cone = visible & ((delta_eta * delta_eta + delta_phi * delta_phi) < radius * radius)
+        return float(np.sum(self.pt[cone], dtype=np.float64) / photon_pt)
+
+
+@dataclass(frozen=True)
+class BosonCandidate:
+    leading_index: int
+    subleading_index: int
+    p4: FourVector
+    leading_isolation: Optional[float] = None
+    subleading_isolation: Optional[float] = None
+    flavour: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CandidateDecision:
+    passed_steps: Tuple[str, ...]
+    candidate: Optional[BosonCandidate]
+
+
+@dataclass(frozen=True)
+class VBFDecision:
+    passed_steps: Tuple[str, ...]
+    mjj: float
+    abs_delta_y: float
+    zstar: float
+    boson_central: bool
+
+
+@dataclass(frozen=True)
+class PullVector:
+    t_y: float
+    t_phi: float
+    t_beam: float
+    magnitude: float
+    signed_angle: float
+    zero_magnitude: bool
+
+
+@dataclass(frozen=True)
+class SampleSpec:
+    name: str
+    channel: str
+    files: Tuple[str, ...]
+    cross_section_pb: float
+    label: str
+    color: str
+    stack_order: int
+    role: str = "background"
+
+
+@dataclass(frozen=True)
+class AnalysisConfig:
+    tree_name: str
+    luminosities_fb: Tuple[float, ...]
+    samples: Tuple[SampleSpec, ...]
+    source_manifest: str
+
+
+@dataclass(frozen=True)
+class PlotSpec:
+    key: str
+    channel: str
+    stage: str
+    title: str
+    xlabel: str
+    edges: np.ndarray
+
+
+@dataclass
+class WeightedHistogram:
+    edges: np.ndarray
+    sumw: np.ndarray = field(init=False)
+    sumw2: np.ndarray = field(init=False)
+    entries: int = 0
+
+    def __post_init__(self) -> None:
+        self.edges = np.asarray(self.edges, dtype=np.float64)
+        if self.edges.ndim != 1 or len(self.edges) < 2 or np.any(np.diff(self.edges) <= 0.0):
+            raise ValueError("Histogram edges must be a strictly increasing one-dimensional array")
+        self.sumw = np.zeros(len(self.edges) - 1, dtype=np.float64)
+        self.sumw2 = np.zeros(len(self.edges) - 1, dtype=np.float64)
+
+    def fill(self, value: float, weight: float) -> None:
+        value = float(value)
+        weight = float(weight)
+        if not math.isfinite(value) or not math.isfinite(weight):
+            raise ValueError(f"Non-finite histogram fill: value={value}, weight={weight}")
+        index = int(np.searchsorted(self.edges, value, side="right") - 1)
+        index = min(max(index, 0), len(self.sumw) - 1)
+        self.sumw[index] += weight
+        self.sumw2[index] += weight * weight
+        self.entries += 1
+
+    @property
+    def integral(self) -> float:
+        return float(np.sum(self.sumw, dtype=np.float64))
+
+
+@dataclass
+class CutStat:
+    raw_count: int = 0
+    sumw: float = 0.0
+    sumw2: float = 0.0
+
+    def fill(self, weight: float) -> None:
+        self.raw_count += 1
+        self.sumw += float(weight)
+        self.sumw2 += float(weight) * float(weight)
+
+
+@dataclass
+class SampleResult:
+    spec: SampleSpec
+    total_entries: int
+    generated_sumw: float
+    strategy: str = "cutbased"
+    application_scope: str = "all_events"
+    processed_entries: int = 0
+    processed_sumw: float = 0.0
+    cutflow: MutableMapping[str, CutStat] = field(default_factory=OrderedDict)
+    histograms: MutableMapping[str, WeightedHistogram] = field(default_factory=dict)
+    pull_total_sumw: float = 0.0
+    pull_beam_sumw: float = 0.0
+    pull_left_sumw: float = 0.0
+    pull_right_sumw: float = 0.0
+    zero_pull_jets: int = 0
+    zero_pull_sumw: float = 0.0
+    pull_bin_sumw: np.ndarray = field(
+        default_factory=lambda: np.zeros(PULL_BIN_COUNT, dtype=np.float64)
+    )
+    pull_event_second_sumw: np.ndarray = field(
+        default_factory=lambda: np.zeros((PULL_BIN_COUNT, PULL_BIN_COUNT), dtype=np.float64)
+    )
+    pull_mc_second_sumw2: np.ndarray = field(
+        default_factory=lambda: np.zeros((PULL_BIN_COUNT, PULL_BIN_COUNT), dtype=np.float64)
+    )
+    pull_moment_model: str = "event_level_two_jet"
+    invalid_events: int = 0
+    files: List[Dict[str, Any]] = field(default_factory=list)
+    common_events: Optional["CommonEventTable"] = None
+
+
+@dataclass(frozen=True)
+class CommonEventTable:
+    observable_keys: Tuple[str, ...]
+    weights: np.ndarray
+    observables: np.ndarray
+    pulls: np.ndarray
+    source_file_indices: np.ndarray
+    source_entries: np.ndarray
+
+    def __len__(self) -> int:
+        return len(self.weights)
+
+    def feature_matrix(self) -> np.ndarray:
+        from xgboost_root_varfiles_module import FEATURE_NAMES
+
+        indices = [self.observable_keys.index(name) for name in FEATURE_NAMES]
+        matrix = self.observables[:, indices]
+        if matrix.shape != (len(self), len(FEATURE_NAMES)) or not np.all(np.isfinite(matrix)):
+            raise ValueError("Common-event XGBoost feature matrix is invalid")
+        return matrix
+
+
+class CommonEventBuffer:
+    """Geometrically growing, compact buffer used during the ROOT stream."""
+
+    def __init__(self, observable_keys: Sequence[str], initial_capacity: int = 4096) -> None:
+        self.observable_keys = tuple(observable_keys)
+        self.size = 0
+        self.capacity = max(1, int(initial_capacity))
+        self.weights = np.empty(self.capacity, dtype=np.float64)
+        self.observables = np.empty((self.capacity, len(self.observable_keys)), dtype=np.float64)
+        self.pulls = np.empty((self.capacity, 2, len(PULL_VALUE_NAMES)), dtype=np.float64)
+        self.source_file_indices = np.empty(self.capacity, dtype=np.int32)
+        self.source_entries = np.empty(self.capacity, dtype=np.int64)
+
+    def _grow(self) -> None:
+        new_capacity = 2 * self.capacity
+        self.weights = _grow_array(self.weights, new_capacity)
+        self.observables = _grow_array(self.observables, new_capacity)
+        self.pulls = _grow_array(self.pulls, new_capacity)
+        self.source_file_indices = _grow_array(self.source_file_indices, new_capacity)
+        self.source_entries = _grow_array(self.source_entries, new_capacity)
+        self.capacity = new_capacity
+
+    def append(
+        self,
+        weight: float,
+        observable_values: Mapping[str, float],
+        pulls: Sequence[PullVector],
+        source_file_index: int,
+        source_entry: int,
+    ) -> None:
+        if len(pulls) != 2:
+            raise ValueError("A common-selected event must contain two tagging-jet pulls")
+        if self.size == self.capacity:
+            self._grow()
+        row = self.size
+        values = np.asarray([observable_values[key] for key in self.observable_keys], dtype=np.float64)
+        if not np.all(np.isfinite(values)):
+            raise ValueError("Non-finite common-event observable")
+        self.weights[row] = float(weight)
+        self.observables[row] = values
+        for jet_index, pull in enumerate(pulls):
+            self.pulls[row, jet_index] = (
+                pull.t_beam,
+                pull.t_phi,
+                pull.magnitude,
+                pull.signed_angle,
+                float(pull.zero_magnitude),
+            )
+        self.source_file_indices[row] = int(source_file_index)
+        self.source_entries[row] = int(source_entry)
+        self.size += 1
+
+    def finalize(self) -> CommonEventTable:
+        return CommonEventTable(
+            observable_keys=self.observable_keys,
+            weights=self.weights[: self.size].copy(),
+            observables=self.observables[: self.size].copy(),
+            pulls=self.pulls[: self.size].copy(),
+            source_file_indices=self.source_file_indices[: self.size].copy(),
+            source_entries=self.source_entries[: self.size].copy(),
+        )
+
+
+@dataclass(frozen=True)
+class RunReservation:
+    run_id: str
+    output_root: Path
+    runs_root: Path
+    incomplete_dir: Path
+    final_dir: Path
+
+
+def _grow_array(array: np.ndarray, new_capacity: int) -> np.ndarray:
+    shape = (int(new_capacity),) + array.shape[1:]
+    grown = np.empty(shape, dtype=array.dtype)
+    grown[: len(array)] = array
+    return grown
+
+
+def histogram_bin_index(edges: np.ndarray, value: float) -> int:
+    index = int(np.searchsorted(edges, float(value), side="right") - 1)
+    return min(max(index, 0), len(edges) - 2)
+
+
+def pull_event_bin_vector(signed_angles: Sequence[float]) -> np.ndarray:
+    if len(signed_angles) != 2:
+        raise ValueError("Exactly two tagging-jet pull angles are required")
+    vector = np.zeros(PULL_BIN_COUNT, dtype=np.float64)
+    for angle in signed_angles:
+        folded = fold_signed_pull_angle(float(angle))
+        vector[histogram_bin_index(PULL_BIN_EDGES, folded)] += 0.5
+    return vector
+
+
+def normalized_fraction_covariance(
+    bin_sums: np.ndarray,
+    unnormalized_covariance: np.ndarray,
+) -> np.ndarray:
+    values = np.asarray(bin_sums, dtype=np.float64)
+    covariance = np.asarray(unnormalized_covariance, dtype=np.float64)
+    if values.shape != (PULL_BIN_COUNT,) or covariance.shape != (PULL_BIN_COUNT, PULL_BIN_COUNT):
+        raise ValueError("Unexpected R_i moment dimensions")
+    total = float(np.sum(values, dtype=np.float64))
+    if total <= 0.0 or not math.isfinite(total):
+        raise ValueError("R_i normalization must be finite and positive")
+    fractions = values / total
+    jacobian = (np.eye(PULL_BIN_COUNT) - fractions[:, None]) / total
+    result = jacobian @ covariance @ jacobian.T
+    return 0.5 * (result + result.T)
+
+
+def differential_pull_statistics(
+    bin_cross_sections_pb: np.ndarray,
+    event_second_moment_pb: np.ndarray,
+    mc_second_moment_pb2: np.ndarray,
+    luminosities_fb: Sequence[float],
+) -> Dict[str, Any]:
+    """Calculate R_i and event-level projected-data/MC covariances."""
+    bins = np.asarray(bin_cross_sections_pb, dtype=np.float64)
+    event_second = np.asarray(event_second_moment_pb, dtype=np.float64)
+    mc_second = np.asarray(mc_second_moment_pb2, dtype=np.float64)
+    total_pb = float(np.sum(bins, dtype=np.float64))
+    if total_pb <= 0.0:
+        return {
+            "bin_edges": PULL_BIN_EDGES.tolist(),
+            "R": None,
+            "f_beam": None,
+            "expected_statistical_covariance": {},
+            "mc_statistical_covariance": None,
+            "f_beam_statistical_error": {},
+            "f_beam_mc_statistical_error": None,
+        }
+    fractions = bins / total_pb
+    mc_covariance = normalized_fraction_covariance(bins, mc_second)
+    mean_outer = event_second / total_pb
+    single_event_covariance = 0.5 * (
+        mean_outer - np.outer(fractions, fractions)
+        + (mean_outer - np.outer(fractions, fractions)).T
+    )
+    selector = np.zeros(PULL_BIN_COUNT, dtype=np.float64)
+    selector[: PULL_BIN_COUNT // 2] = 1.0
+    expected_covariances: Dict[str, List[List[float]]] = {}
+    expected_fbeam_errors: Dict[str, float] = {}
+    for luminosity in luminosities_fb:
+        expected_events = 1000.0 * float(luminosity) * total_pb
+        covariance = single_event_covariance / expected_events
+        covariance = 0.5 * (covariance + covariance.T)
+        expected_covariances[str(float(luminosity))] = covariance.tolist()
+        expected_fbeam_errors[str(float(luminosity))] = math.sqrt(
+            max(float(selector @ covariance @ selector), 0.0)
+        )
+    return {
+        "bin_edges": PULL_BIN_EDGES.tolist(),
+        "bin_cross_sections_pb": bins.tolist(),
+        "R": fractions.tolist(),
+        "sum_R": float(np.sum(fractions, dtype=np.float64)),
+        "f_beam": float(np.sum(fractions[: PULL_BIN_COUNT // 2], dtype=np.float64)),
+        "expected_statistical_covariance": expected_covariances,
+        "expected_statistical_errors": {
+            key: np.sqrt(np.maximum(np.diag(np.asarray(value)), 0.0)).tolist()
+            for key, value in expected_covariances.items()
+        },
+        "mc_statistical_covariance": mc_covariance.tolist(),
+        "mc_statistical_errors": np.sqrt(np.maximum(np.diag(mc_covariance), 0.0)).tolist(),
+        "f_beam_statistical_error": expected_fbeam_errors,
+        "f_beam_mc_statistical_error": math.sqrt(
+            max(float(selector @ mc_covariance @ selector), 0.0)
+        ),
+        "uncertainty_model": "event_level_two_tagging_jet_covariance",
+    }
+
+
+def delta_phi(phi1: float, phi2: float) -> float:
+    return float((phi1 - phi2 + math.pi) % (2.0 * math.pi) - math.pi)
+
+
+def wrap_delta_phi_array(values: np.ndarray) -> np.ndarray:
+    return (np.asarray(values) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def fold_signed_pull_angle(angle: float) -> float:
+    """Fold a signed angle onto [0, pi], identifying +/- theta.
+
+    The endpoint at +/- pi remains pi, while a numerically zero angle remains
+    zero.  This is equivalent to acos(cos(angle)) but avoids the loss of
+    precision from evaluating the inverse trigonometric functions.
+    """
+    angle = float(angle)
+    if not math.isfinite(angle):
+        raise ValueError("Signed pull angle must be finite")
+    wrapped = (angle + math.pi) % (2.0 * math.pi) - math.pi
+    folded = abs(wrapped)
+    if math.isclose(folded, math.pi, rel_tol=0.0, abs_tol=1.0e-15):
+        return math.pi
+    return folded
+
+
+def fold_symmetric_histogram(histogram: WeightedHistogram) -> WeightedHistogram:
+    """Fold a histogram with symmetric edges about zero onto [0, max]."""
+    edges = histogram.edges
+    bins = len(histogram.sumw)
+    if bins % 2 != 0 or not np.allclose(edges, -edges[::-1], rtol=0.0, atol=1.0e-12):
+        raise ValueError("Histogram must have an even number of bins symmetric about zero")
+    half = bins // 2
+    folded = WeightedHistogram(edges[half:].copy())
+    folded.sumw = histogram.sumw[half - 1 :: -1] + histogram.sumw[half:]
+    folded.sumw2 = histogram.sumw2[half - 1 :: -1] + histogram.sumw2[half:]
+    folded.entries = histogram.entries
+    return folded
+
+
+def select_higgs_candidate(particles: EventParticles) -> CandidateDecision:
+    passed: List[str] = []
+    photons = np.flatnonzero(particles.pid == 22)
+    if len(photons) < 2:
+        return CandidateDecision(tuple(passed), None)
+    passed.append("at_least_two_photons")
+
+    accepted = photons[np.abs(particles.eta[photons]) < CUTS["photon_abs_eta_max"]]
+    if len(accepted) < 2:
+        return CandidateDecision(tuple(passed), None)
+    passed.append("photon_acceptance")
+    accepted = accepted[np.argsort(particles.pt[accepted])[::-1]]
+
+    if particles.pt[accepted[0]] <= CUTS["photon_pt_lead_min_gev"]:
+        return CandidateDecision(tuple(passed), None)
+    passed.append("leading_photon_pt")
+    if particles.pt[accepted[1]] <= CUTS["photon_pt_sublead_min_gev"]:
+        return CandidateDecision(tuple(passed), None)
+    passed.append("subleading_photon_pt")
+
+    pt_qualified = accepted[particles.pt[accepted] > CUTS["photon_pt_sublead_min_gev"]]
+    isolated: List[Tuple[int, float]] = []
+    for index in pt_qualified:
+        isolation = particles.relative_photon_isolation(
+            int(index), radius=CUTS["photon_isolation_dr"]
+        )
+        if isolation < CUTS["photon_relative_isolation_max"]:
+            isolated.append((int(index), isolation))
+    isolated.sort(key=lambda item: particles.pt[item[0]], reverse=True)
+    if (
+        len(isolated) < 2
+        or particles.pt[isolated[0][0]] <= CUTS["photon_pt_lead_min_gev"]
+        or particles.pt[isolated[1][0]] <= CUTS["photon_pt_sublead_min_gev"]
+    ):
+        return CandidateDecision(tuple(passed), None)
+    passed.append("photon_isolation")
+
+    lead_index, lead_iso = isolated[0]
+    sublead_index, sublead_iso = isolated[1]
+    boson = particles.p4(lead_index) + particles.p4(sublead_index)
+    if not (CUTS["photon_mass_min_gev"] < boson.mass < CUTS["photon_mass_max_gev"]):
+        return CandidateDecision(tuple(passed), None)
+    passed.append("diphoton_mass_window")
+    return CandidateDecision(
+        tuple(passed),
+        BosonCandidate(
+            lead_index,
+            sublead_index,
+            boson,
+            leading_isolation=lead_iso,
+            subleading_isolation=sublead_iso,
+            flavour="gamma gamma",
+        ),
+    )
+
+
+def select_z_candidate(particles: EventParticles) -> CandidateDecision:
+    passed: List[str] = []
+    leptons = np.flatnonzero(np.isin(np.abs(particles.pid), (11, 13)))
+    if len(leptons) < 2:
+        return CandidateDecision(tuple(passed), None)
+    passed.append("at_least_two_leptons")
+
+    accepted = leptons[np.abs(particles.eta[leptons]) < CUTS["lepton_abs_eta_max"]]
+    if len(accepted) < 2:
+        return CandidateDecision(tuple(passed), None)
+    passed.append("lepton_acceptance")
+
+    pairs: List[Tuple[float, int, int, FourVector]] = []
+    for position, first in enumerate(accepted[:-1]):
+        for second in accepted[position + 1 :]:
+            if particles.pid[first] != -particles.pid[second]:
+                continue
+            pair = particles.p4(int(first)) + particles.p4(int(second))
+            pairs.append((abs(pair.mass - MZ_GEV), int(first), int(second), pair))
+    if not pairs:
+        return CandidateDecision(tuple(passed), None)
+    passed.append("ossf_pair")
+    _, first, second, boson = min(pairs, key=lambda item: item[0])
+    lead_index, sublead_index = sorted((first, second), key=lambda idx: particles.pt[idx], reverse=True)
+
+    if particles.pt[lead_index] <= CUTS["lepton_pt_lead_min_gev"]:
+        return CandidateDecision(tuple(passed), None)
+    passed.append("leading_lepton_pt")
+    if particles.pt[sublead_index] <= CUTS["lepton_pt_sublead_min_gev"]:
+        return CandidateDecision(tuple(passed), None)
+    passed.append("subleading_lepton_pt")
+    if not (CUTS["lepton_mass_min_gev"] < boson.mass < CUTS["lepton_mass_max_gev"]):
+        return CandidateDecision(tuple(passed), None)
+    passed.append("dilepton_mass_window")
+    flavour = "ee" if abs(int(particles.pid[lead_index])) == 11 else "mu mu"
+    return CandidateDecision(
+        tuple(passed),
+        BosonCandidate(lead_index, sublead_index, boson, flavour=flavour),
+    )
+
+
+def evaluate_vbf_selection(jet1: FourVector, jet2: FourVector, boson: FourVector) -> VBFDecision:
+    dijet = jet1 + jet2
+    delta_y = abs(jet1.rapidity - jet2.rapidity)
+    midpoint = 0.5 * (jet1.rapidity + jet2.rapidity)
+    zstar = abs(boson.rapidity - midpoint) / delta_y if delta_y > 0.0 else math.inf
+    central = min(jet1.rapidity, jet2.rapidity) < boson.rapidity < max(
+        jet1.rapidity, jet2.rapidity
+    )
+    passed: List[str] = []
+    if dijet.mass <= CUTS["mjj_min_gev"]:
+        return VBFDecision(tuple(passed), dijet.mass, delta_y, zstar, central)
+    passed.append("mjj")
+    if delta_y <= CUTS["abs_delta_y_min"]:
+        return VBFDecision(tuple(passed), dijet.mass, delta_y, zstar, central)
+    passed.append("delta_yjj")
+    if not central:
+        return VBFDecision(tuple(passed), dijet.mass, delta_y, zstar, central)
+    passed.append("boson_centrality")
+    return VBFDecision(tuple(passed), dijet.mass, delta_y, zstar, central)
+
+
+def _pseudojet_value(obj: Any, name: str) -> float:
+    value = getattr(obj, name)
+    return float(value() if callable(value) else value)
+
+
+def pseudojet_p4(jet: Any) -> FourVector:
+    return FourVector(
+        _pseudojet_value(jet, "e"),
+        _pseudojet_value(jet, "px"),
+        _pseudojet_value(jet, "py"),
+        _pseudojet_value(jet, "pz"),
+    )
+
+
+def pseudojet_pt(jet: Any) -> float:
+    if hasattr(jet, "perp"):
+        return _pseudojet_value(jet, "perp")
+    return _pseudojet_value(jet, "pt")
+
+
+def calculate_pull_vector(jet: Any) -> PullVector:
+    jet_pt = pseudojet_pt(jet)
+    jet_y = _pseudojet_value(jet, "rapidity")
+    jet_phi = _pseudojet_value(jet, "phi")
+    t_y = 0.0
+    t_phi = 0.0
+    if jet_pt > 0.0:
+        for constituent in jet.constituents():
+            constituent_pt = pseudojet_pt(constituent)
+            if constituent_pt <= 0.0:
+                continue
+            dy = _pseudojet_value(constituent, "rapidity") - jet_y
+            dphi = delta_phi(_pseudojet_value(constituent, "phi"), jet_phi)
+            radius = math.hypot(dy, dphi)
+            weight = constituent_pt / jet_pt * radius
+            t_y += weight * dy
+            t_phi += weight * dphi
+    t_beam = math.copysign(1.0, jet_y) * t_y
+    magnitude = math.hypot(t_y, t_phi)
+    zero = magnitude == 0.0
+    signed_angle = math.atan2(t_phi, t_beam) if not zero else 0.0
+    return PullVector(t_y, t_phi, t_beam, magnitude, signed_angle, zero)
+
+
+def normalization_factor(luminosity_fb: float, cross_section_pb: float, generated_sumw: float) -> float:
+    if not math.isfinite(generated_sumw) or generated_sumw == 0.0:
+        raise ValueError("Generated sum of weights must be finite and non-zero")
+    return 1000.0 * float(luminosity_fb) * float(cross_section_pb) / float(generated_sumw)
+
+
+def projected_fbeam_statistical_error(
+    f_beam: float,
+    expected_selected_events: float,
+    pull_entries_per_event: float = 2.0,
+) -> float:
+    """Independent-entry binomial estimate for the projected f_beam error."""
+    f_beam = float(f_beam)
+    expected_selected_events = float(expected_selected_events)
+    pull_entries_per_event = float(pull_entries_per_event)
+    if not 0.0 <= f_beam <= 1.0:
+        raise ValueError("f_beam must lie between zero and one")
+    if expected_selected_events <= 0.0 or not math.isfinite(expected_selected_events):
+        raise ValueError("Expected selected-event yield must be finite and positive")
+    if pull_entries_per_event <= 0.0 or not math.isfinite(pull_entries_per_event):
+        raise ValueError("Pull entries per event must be finite and positive")
+    return math.sqrt(
+        f_beam * (1.0 - f_beam) / (pull_entries_per_event * expected_selected_events)
+    )
+
+
+def weighted_fraction_mc_error(
+    numerator_sumw: float,
+    denominator_sumw: float,
+    numerator_sumw2: float,
+    complement_sumw2: float,
+) -> float:
+    """Propagate weighted MC sumw2 for a fraction B/(B + O)."""
+    numerator_sumw = float(numerator_sumw)
+    denominator_sumw = float(denominator_sumw)
+    numerator_sumw2 = float(numerator_sumw2)
+    complement_sumw2 = float(complement_sumw2)
+    if denominator_sumw <= 0.0 or not math.isfinite(denominator_sumw):
+        raise ValueError("Fraction denominator must be finite and positive")
+    if numerator_sumw2 < 0.0 or complement_sumw2 < 0.0:
+        raise ValueError("Category sumw2 values must be non-negative")
+    fraction = numerator_sumw / denominator_sumw
+    variance = (
+        (1.0 - fraction) ** 2 * numerator_sumw2
+        + fraction * fraction * complement_sumw2
+    ) / (denominator_sumw * denominator_sumw)
+    return math.sqrt(max(variance, 0.0))
+
+
+def _linspace(low: float, high: float, bins: int) -> np.ndarray:
+    return np.linspace(low, high, bins + 1, dtype=np.float64)
+
+
+def plot_registry() -> Tuple[PlotSpec, ...]:
+    specs: List[PlotSpec] = []
+    for channel, object_name, mass_label, mass_range in (
+        ("higgs", "photon", r"$m_{\gamma\gamma}$ [GeV]", (120.0, 130.0)),
+        ("z", "lepton", r"$m_{\ell\ell}$ [GeV]", (80.0, 100.0)),
+    ):
+        specs.extend(
+            [
+                PlotSpec("leading_object_pt", channel, "common", f"Leading {object_name} transverse momentum", rf"Leading {object_name} $p_T$ [GeV]", _linspace(0.0, 500.0, 40)),
+                PlotSpec("subleading_object_pt", channel, "common", f"Subleading {object_name} transverse momentum", rf"Subleading {object_name} $p_T$ [GeV]", _linspace(0.0, 400.0, 40)),
+                PlotSpec("leading_object_eta", channel, "common", f"Leading {object_name} pseudorapidity", rf"Leading {object_name} $\eta$", _linspace(-2.5, 2.5, 30)),
+                PlotSpec("subleading_object_eta", channel, "common", f"Subleading {object_name} pseudorapidity", rf"Subleading {object_name} $\eta$", _linspace(-2.5, 2.5, 30)),
+                PlotSpec("boson_mass", channel, "common", "Reconstructed boson mass", mass_label, _linspace(mass_range[0], mass_range[1], 20)),
+                PlotSpec("boson_pt", channel, "common", "Reconstructed boson transverse momentum", r"Boson $p_T$ [GeV]", _linspace(0.0, 600.0, 40)),
+                PlotSpec("boson_y", channel, "common", "Reconstructed boson rapidity", r"Boson $y$", _linspace(-5.0, 5.0, 40)),
+                PlotSpec("n_jets", channel, "common", "Selected jet multiplicity", r"Number of jets", np.arange(1.5, 11.5, 1.0)),
+                PlotSpec("leading_jet_pt", channel, "common", "Leading tagging-jet transverse momentum", r"Leading jet $p_T$ [GeV]", _linspace(30.0, 800.0, 40)),
+                PlotSpec("subleading_jet_pt", channel, "common", "Subleading tagging-jet transverse momentum", r"Subleading jet $p_T$ [GeV]", _linspace(30.0, 600.0, 40)),
+                PlotSpec("leading_jet_y", channel, "common", "Leading tagging-jet rapidity", r"Leading jet $y$", _linspace(-4.5, 4.5, 36)),
+                PlotSpec("subleading_jet_y", channel, "common", "Subleading tagging-jet rapidity", r"Subleading jet $y$", _linspace(-4.5, 4.5, 36)),
+                PlotSpec("mjj", channel, "common", "Tagging-jet invariant mass", r"$m_{jj}$ [GeV]", _linspace(0.0, 4000.0, 40)),
+                PlotSpec("abs_delta_yjj", channel, "common", "Tagging-jet rapidity separation", r"$|\Delta y_{jj}|$", _linspace(0.0, 9.0, 36)),
+                PlotSpec("zstar", channel, "common", "Boson centrality", r"$z^*$", _linspace(0.0, 2.0, 40)),
+                PlotSpec("pull_t_beam", channel, "vbf", "Beam-oriented pull component", r"$t_{\mathrm{beam}}$", _linspace(-0.03, 0.03, 40)),
+                PlotSpec("pull_t_phi", channel, "vbf", "Azimuthal pull component", r"$t_{\phi}$", _linspace(-0.03, 0.03, 40)),
+                PlotSpec("pull_magnitude", channel, "vbf", "Pull-vector magnitude", r"$|\vec{t}|$", _linspace(0.0, 0.06, 40)),
+                PlotSpec("signed_pull_angle", channel, "vbf", "Signed pull angle", r"Signed pull angle [rad]", _linspace(-math.pi, math.pi, 12)),
+                PlotSpec("folded_pull_angle", channel, "vbf", "Folded signed pull angle", r"$|\theta_{\mathrm{signed}}|$ [rad]", _linspace(0.0, math.pi, 6)),
+            ]
+        )
+    specs.append(
+        PlotSpec("leading_photon_isolation", "higgs", "common", "Leading-photon relative isolation", r"Leading photon $I_{\mathrm{rel}}$", _linspace(0.0, 0.1, 20))
+    )
+    specs.append(
+        PlotSpec("subleading_photon_isolation", "higgs", "common", "Subleading-photon relative isolation", r"Subleading photon $I_{\mathrm{rel}}$", _linspace(0.0, 0.1, 20))
+    )
+    keys = [(spec.channel, spec.key) for spec in specs]
+    if len(keys) != len(set(keys)):
+        raise RuntimeError("Duplicate plot keys in registry")
+    return tuple(specs)
+
+
+def cutflow_steps(channel: str, strategy: str = "cutbased") -> Tuple[str, ...]:
+    if strategy not in ANALYSIS_STRATEGIES:
+        raise ValueError(f"Unknown analysis strategy: {strategy}")
+    if channel == "higgs":
+        return HIGGS_CUTFLOW if strategy == "cutbased" else XGBOOST_HIGGS_CUTFLOW
+    if channel == "z":
+        return Z_CUTFLOW if strategy == "cutbased" else XGBOOST_Z_CUTFLOW
+    raise ValueError(f"Unknown channel: {channel}")
+
+
+def read_manifest(path: Path, luminosity_override: Optional[Sequence[float]] = None) -> AnalysisConfig:
+    path = path.resolve()
+    with path.open("r", encoding="utf-8") as stream:
+        payload = json.load(stream)
+    tree_name = str(payload.get("tree_name", "Data"))
+    luminosities = tuple(float(value) for value in (luminosity_override or payload.get("luminosities_fb", (300.0, 3000.0))))
+    if not luminosities or any(value <= 0.0 or not math.isfinite(value) for value in luminosities):
+        raise ValueError("Luminosities must be finite positive values")
+    samples: List[SampleSpec] = []
+    seen_names = set()
+    for raw in payload.get("samples", []):
+        name = str(raw["name"])
+        if name in seen_names:
+            raise ValueError(f"Duplicate sample name: {name}")
+        seen_names.add(name)
+        channel = str(raw["channel"]).lower()
+        if channel not in ("higgs", "z"):
+            raise ValueError(f"Sample {name} has unsupported channel {channel}")
+        raw_files = raw.get("files")
+        if raw_files is None and "path" in raw:
+            raw_files = [raw["path"]]
+        if not raw_files:
+            raise ValueError(f"Sample {name} does not define any ROOT files")
+        files = tuple(str(Path(value).expanduser()) for value in raw_files)
+        cross_section = float(raw["cross_section_pb"])
+        if cross_section <= 0.0 or not math.isfinite(cross_section):
+            raise ValueError(f"Sample {name} has invalid cross section")
+        role = str(raw.get("role", "background")).lower()
+        if role not in ("signal", "background"):
+            raise ValueError(f"Sample {name} has unsupported XGBoost role {role}")
+        samples.append(
+            SampleSpec(
+                name=name,
+                channel=channel,
+                role=role,
+                files=files,
+                cross_section_pb=cross_section,
+                label=str(raw.get("label", name)),
+                color=str(raw.get("color", "#4C78A8")),
+                stack_order=int(raw.get("stack_order", 0)),
+            )
+        )
+    if not samples:
+        raise ValueError("Manifest contains no samples")
+    for channel in ("higgs", "z"):
+        if not any(sample.channel == channel for sample in samples):
+            raise ValueError(f"Manifest contains no {channel} samples")
+    return AnalysisConfig(tree_name, luminosities, tuple(samples), str(path))
+
+
+def resolved_config_payload(
+    config: AnalysisConfig,
+    max_events: Optional[int],
+    analyses: Sequence[str] = ("cutbased",),
+    xgb_model_run: Optional[Path] = None,
+) -> Dict[str, Any]:
+    return {
+        "analysis_version": ANALYSIS_VERSION,
+        "tree_name": config.tree_name,
+        "luminosities_fb": list(config.luminosities_fb),
+        "samples": [asdict(sample) for sample in config.samples],
+        "cuts": dict(CUTS),
+        "max_events_per_sample": max_events,
+        "source_manifest": config.source_manifest,
+        "analyses": list(analyses),
+        "xgboost": {
+            "model_run": str(xgb_model_run.resolve()) if xgb_model_run is not None else None,
+            "feature_names": list(xgbtools.FEATURE_NAMES),
+            "model_parameters": dict(xgbtools.MODEL_PARAMETERS),
+            "cross_fitting": {
+                "folds": xgbtools.CROSS_FIT_FOLDS,
+                "seed": xgbtools.CROSS_FIT_SEED,
+                "per_pipeline": {
+                    "train_folds": xgbtools.CROSS_FIT_FOLDS - 2,
+                    "validation_folds": 1,
+                    "test_folds": 1,
+                },
+                "validation_rotation": "(test_fold + 1) modulo folds",
+            },
+            "nominal_histogram_scope": "five_fold_out_of_fold_all_events",
+        }
+        if "xgboost" in analyses
+        else None,
+    }
+
+
+def sanitize_run_name(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip()).strip("-._")
+    return cleaned[:48] or None
+
+
+def config_digest(payload: Mapping[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:8]
+
+
+def make_run_id(
+    payload: Mapping[str, Any],
+    run_name: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> str:
+    timestamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    parts = [timestamp]
+    safe_name = sanitize_run_name(run_name)
+    if safe_name:
+        parts.append(safe_name)
+    parts.append(config_digest(payload))
+    return "-".join(parts)
+
+
+def reserve_run_directory(output_root: Path, base_run_id: str) -> RunReservation:
+    output_root = output_root.resolve()
+    runs_root = output_root / "runs"
+    runs_root.mkdir(parents=True, exist_ok=True)
+    suffix = 0
+    while True:
+        run_id = base_run_id if suffix == 0 else f"{base_run_id}-{suffix:02d}"
+        final_dir = runs_root / run_id
+        incomplete_dir = runs_root / f".incomplete-{run_id}"
+        if final_dir.exists() or incomplete_dir.exists():
+            suffix += 1
+            continue
+        try:
+            incomplete_dir.mkdir()
+        except FileExistsError:
+            suffix += 1
+            continue
+        return RunReservation(run_id, output_root, runs_root, incomplete_dir, final_dir)
+
+
+def write_text_exclusive(path: Path, text_value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("x", encoding="utf-8") as stream:
+        stream.write(text_value)
+
+
+def write_json_exclusive(path: Path, payload: Any) -> None:
+    write_text_exclusive(path, json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n")
+
+
+def atomic_write_text(path: Path, text_value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            stream.write(text_value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def git_provenance(repository: Path) -> Dict[str, Any]:
+    def run_git(*arguments: str) -> str:
+        completed = subprocess.run(
+            ("git",) + arguments,
+            cwd=str(repository),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return completed.stdout.strip() if completed.returncode == 0 else ""
+
+    status = run_git("status", "--short")
+    return {
+        "commit": run_git("rev-parse", "HEAD") or None,
+        "branch": run_git("branch", "--show-current") or None,
+        "dirty": bool(status),
+        "status": status.splitlines(),
+    }
+
+
+def initialize_result(
+    spec: SampleSpec,
+    total_entries: int,
+    generated_sumw: float,
+    strategy: str = "cutbased",
+) -> SampleResult:
+    relevant_specs = [item for item in plot_registry() if item.channel == spec.channel]
+    result = SampleResult(spec, total_entries, generated_sumw, strategy=strategy)
+    result.cutflow = OrderedDict(
+        (step, CutStat()) for step in cutflow_steps(spec.channel, strategy)
+    )
+    result.histograms = {item.key: WeightedHistogram(item.edges.copy()) for item in relevant_specs}
+    return result
+
+
+def load_completed_run(
+    run_dir: Path,
+    luminosity_override: Optional[Sequence[float]] = None,
+) -> Tuple[AnalysisConfig, List[SampleResult], Dict[str, Any]]:
+    """Reconstruct cut-based and XGBoost results from an immutable run."""
+    run_dir = run_dir.resolve()
+    metadata_path = run_dir / "run.json"
+    summary_path = run_dir / "summaries" / "analysis.json"
+    histogram_path = run_dir / "summaries" / "histograms.npz"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if metadata.get("status") != "complete":
+        raise ValueError(f"Source run is not complete: {run_dir}")
+    summary_payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    configuration = metadata["configuration"]
+    luminosities = tuple(
+        float(value)
+        for value in (luminosity_override or configuration.get("luminosities_fb", (300.0, 3000.0)))
+    )
+    if not luminosities or any(value <= 0.0 or not math.isfinite(value) for value in luminosities):
+        raise ValueError("Luminosities must be finite positive values")
+    samples = tuple(
+        SampleSpec(
+            name=str(raw["name"]),
+            channel=str(raw["channel"]),
+            files=tuple(str(value) for value in raw["files"]),
+            cross_section_pb=float(raw["cross_section_pb"]),
+            label=str(raw["label"]),
+            color=str(raw["color"]),
+            stack_order=int(raw["stack_order"]),
+            role=str(raw.get("role", "background")),
+        )
+        for raw in configuration["samples"]
+    )
+    config = AnalysisConfig(
+        tree_name=str(configuration.get("tree_name", "Data")),
+        luminosities_fb=luminosities,
+        samples=samples,
+        source_manifest=str(configuration.get("source_manifest", metadata_path)),
+    )
+    specs_by_name = {sample.name: sample for sample in samples}
+    results: List[SampleResult] = []
+    with np.load(histogram_path, allow_pickle=False) as arrays:
+        available = set(arrays.files)
+        for source in summary_payload["samples"]:
+            sample_name = str(source["sample"]["name"])
+            if sample_name not in specs_by_name:
+                raise ValueError(f"Source summary references unknown sample {sample_name}")
+            spec = specs_by_name[sample_name]
+            strategy = str(source.get("strategy", "cutbased"))
+            result = initialize_result(
+                spec,
+                int(source["total_entries"]),
+                float(source["generated_sumw"]),
+                strategy=strategy,
+            )
+            result.processed_entries = int(source["processed_entries"])
+            result.application_scope = str(source.get("application_scope", "all_events"))
+            result.processed_sumw = float(source["processed_sumw"])
+            result.invalid_events = int(source.get("invalid_events", 0))
+            result.files = list(source.get("files", []))
+            result.cutflow = OrderedDict(
+                (step, CutStat(**source["cutflow"][step]))
+                for step in cutflow_steps(spec.channel, strategy)
+            )
+            missing = []
+            for item in plot_registry():
+                if item.channel != spec.channel or item.key == "folded_pull_angle":
+                    continue
+                prefix = f"{strategy}__{spec.name}__{item.key}"
+                legacy_prefix = f"{spec.name}__{item.key}"
+                keys = tuple(f"{prefix}__{suffix}" for suffix in ("edges", "sumw", "sumw2"))
+                legacy_keys = tuple(
+                    f"{legacy_prefix}__{suffix}" for suffix in ("edges", "sumw", "sumw2")
+                )
+                if not all(key in available for key in keys) and strategy == "cutbased":
+                    keys = legacy_keys
+                if not all(key in available for key in keys):
+                    missing.append(item.key)
+                    continue
+                histogram = WeightedHistogram(np.asarray(arrays[keys[0]], dtype=np.float64).copy())
+                histogram.sumw = np.asarray(arrays[keys[1]], dtype=np.float64).copy()
+                histogram.sumw2 = np.asarray(arrays[keys[2]], dtype=np.float64).copy()
+                result.histograms[item.key] = histogram
+            if missing:
+                raise ValueError(f"Source histogram archive for {spec.name} is missing {missing}")
+            folded_prefix = f"{strategy}__{spec.name}__folded_pull_angle"
+            folded_keys = tuple(
+                f"{folded_prefix}__{suffix}" for suffix in ("edges", "sumw", "sumw2")
+            )
+            legacy_folded_prefix = f"{spec.name}__folded_pull_angle"
+            legacy_folded_keys = tuple(
+                f"{legacy_folded_prefix}__{suffix}" for suffix in ("edges", "sumw", "sumw2")
+            )
+            if not all(key in available for key in folded_keys) and strategy == "cutbased":
+                folded_keys = legacy_folded_keys
+            if all(key in available for key in folded_keys):
+                folded = WeightedHistogram(np.asarray(arrays[folded_keys[0]], dtype=np.float64).copy())
+                folded.sumw = np.asarray(arrays[folded_keys[1]], dtype=np.float64).copy()
+                folded.sumw2 = np.asarray(arrays[folded_keys[2]], dtype=np.float64).copy()
+            else:
+                folded = fold_symmetric_histogram(result.histograms["signed_pull_angle"])
+            result.histograms["folded_pull_angle"] = folded
+            pull = source["pull"]
+            result.pull_total_sumw = float(pull["sumw"])
+            f_beam = pull.get("f_beam")
+            result.pull_beam_sumw = 0.0 if f_beam is None else float(f_beam) * result.pull_total_sumw
+            result.pull_left_sumw = float(pull["left_sumw"])
+            result.pull_right_sumw = float(pull["right_sumw"])
+            result.zero_pull_jets = int(pull.get("zero_magnitude_jets", 0))
+            result.zero_pull_sumw = float(pull.get("zero_magnitude_sumw", 0.0))
+            result_prefix = f"{strategy}__{spec.name}"
+            moment_keys = {
+                "bin": f"{result_prefix}__pull_bin_sumw",
+                "event": f"{result_prefix}__pull_event_second_sumw",
+                "mc": f"{result_prefix}__pull_mc_second_sumw2",
+            }
+            if all(key in available for key in moment_keys.values()):
+                result.pull_bin_sumw = np.asarray(arrays[moment_keys["bin"]], dtype=np.float64).copy()
+                result.pull_event_second_sumw = np.asarray(
+                    arrays[moment_keys["event"]], dtype=np.float64
+                ).copy()
+                result.pull_mc_second_sumw2 = np.asarray(
+                    arrays[moment_keys["mc"]], dtype=np.float64
+                ).copy()
+                result.pull_moment_model = str(pull.get("moment_model", "event_level_two_jet"))
+            else:
+                result.pull_bin_sumw = folded.sumw.copy()
+                total = float(np.sum(folded.sumw, dtype=np.float64))
+                fractions = folded.sumw / total if total else np.zeros(PULL_BIN_COUNT)
+                result.pull_event_second_sumw = total * (
+                    0.5 * np.diag(fractions) + 0.5 * np.outer(fractions, fractions)
+                )
+                result.pull_mc_second_sumw2 = np.diag(folded.sumw2)
+                result.pull_moment_model = "legacy_independent_jet_reconstruction"
+            results.append(result)
+    return config, results, metadata
+
+
+def fill_cut_steps(result: SampleResult, steps: Iterable[str], weight: float) -> None:
+    for step in steps:
+        result.cutflow[step].fill(weight)
+
+
+def common_observable_values(
+    channel: str,
+    particles: EventParticles,
+    candidate: BosonCandidate,
+    selected_jets: Sequence[Any],
+    vbf: VBFDecision,
+) -> Dict[str, float]:
+    jet1, jet2 = selected_jets[:2]
+    values = {
+        "leading_object_pt": float(particles.pt[candidate.leading_index]),
+        "subleading_object_pt": float(particles.pt[candidate.subleading_index]),
+        "leading_object_eta": float(particles.eta[candidate.leading_index]),
+        "subleading_object_eta": float(particles.eta[candidate.subleading_index]),
+        "boson_mass": candidate.p4.mass,
+        "boson_pt": candidate.p4.pt,
+        "boson_y": candidate.p4.rapidity,
+        "n_jets": float(len(selected_jets)),
+        "leading_jet_pt": pseudojet_pt(jet1),
+        "subleading_jet_pt": pseudojet_pt(jet2),
+        "leading_jet_y": _pseudojet_value(jet1, "rapidity"),
+        "subleading_jet_y": _pseudojet_value(jet2, "rapidity"),
+        "mjj": vbf.mjj,
+        "abs_delta_yjj": vbf.abs_delta_y,
+        "zstar": vbf.zstar,
+    }
+    if channel == "higgs":
+        values["leading_photon_isolation"] = float(candidate.leading_isolation or 0.0)
+        values["subleading_photon_isolation"] = float(candidate.subleading_isolation or 0.0)
+    return values
+
+
+def common_observable_keys(channel: str) -> Tuple[str, ...]:
+    return tuple(
+        item.key
+        for item in plot_registry()
+        if item.channel == channel and item.key not in {
+            "pull_t_beam",
+            "pull_t_phi",
+            "pull_magnitude",
+            "signed_pull_angle",
+            "folded_pull_angle",
+        }
+    )
+
+
+def fill_common_histograms_from_values(
+    result: SampleResult,
+    values: Mapping[str, float],
+    weight: float,
+) -> None:
+    for key, value in values.items():
+        result.histograms[key].fill(value, weight)
+
+
+def fill_common_histograms(
+    result: SampleResult,
+    particles: EventParticles,
+    candidate: BosonCandidate,
+    selected_jets: Sequence[Any],
+    vbf: VBFDecision,
+    weight: float,
+) -> Dict[str, float]:
+    values = common_observable_values(
+        result.spec.channel, particles, candidate, selected_jets, vbf
+    )
+    fill_common_histograms_from_values(result, values, weight)
+    return values
+
+
+def fill_pull_histograms(result: SampleResult, pulls: Sequence[PullVector], event_weight: float) -> None:
+    if len(pulls) != 2:
+        raise ValueError("Exactly two tagging-jet pulls are required per selected event")
+    q_vector = pull_event_bin_vector([pull.signed_angle for pull in pulls])
+    result.pull_bin_sumw += float(event_weight) * q_vector
+    result.pull_event_second_sumw += float(event_weight) * np.outer(q_vector, q_vector)
+    result.pull_mc_second_sumw2 += float(event_weight) ** 2 * np.outer(q_vector, q_vector)
+    for pull in pulls:
+        entry_weight = 0.5 * float(event_weight)
+        result.histograms["pull_t_beam"].fill(pull.t_beam, entry_weight)
+        result.histograms["pull_t_phi"].fill(pull.t_phi, entry_weight)
+        result.histograms["pull_magnitude"].fill(pull.magnitude, entry_weight)
+        result.histograms["signed_pull_angle"].fill(pull.signed_angle, entry_weight)
+        result.histograms["folded_pull_angle"].fill(fold_signed_pull_angle(pull.signed_angle), entry_weight)
+        result.pull_total_sumw += entry_weight
+        if abs(pull.signed_angle) < 0.5 * math.pi:
+            result.pull_beam_sumw += entry_weight
+        if pull.signed_angle < 0.0:
+            result.pull_left_sumw += entry_weight
+        elif pull.signed_angle > 0.0:
+            result.pull_right_sumw += entry_weight
+        if pull.zero_magnitude:
+            result.zero_pull_jets += 1
+            result.zero_pull_sumw += entry_weight
+
+
+def load_runtime() -> Tuple[Any, Any]:
+    try:
+        import ROOT  # type: ignore
+        import fastjet  # type: ignore
+    except ImportError as error:
+        raise RuntimeError("HwSim analysis requires PyROOT and the FastJet Python bindings") from error
+    ROOT.gROOT.SetBatch(True)
+    return ROOT, fastjet
+
+
+def inspect_sample(ROOT: Any, config: AnalysisConfig, spec: SampleSpec) -> Tuple[int, float, List[Dict[str, Any]]]:
+    total_entries = 0
+    total_sumw = 0.0
+    files: List[Dict[str, Any]] = []
+    for filename in spec.files:
+        path = Path(filename)
+        if not path.is_file():
+            raise FileNotFoundError(f"ROOT input does not exist: {filename}")
+        root_file = ROOT.TFile.Open(str(path), "READ")
+        if not root_file or root_file.IsZombie():
+            raise RuntimeError(f"Unable to open ROOT input: {filename}")
+        tree = root_file.Get(config.tree_name)
+        if tree is None:
+            root_file.Close()
+            raise RuntimeError(f"Tree {config.tree_name!r} not found in {filename}")
+        for branch in ("numparticles", "objects", "evweight"):
+            if tree.GetBranch(branch) is None:
+                root_file.Close()
+                raise RuntimeError(f"Branch {branch!r} not found in {filename}")
+        entries = int(tree.GetEntries())
+        sumw = float(ROOT.RDataFrame(tree).Sum("evweight").GetValue())
+        total_entries += entries
+        total_sumw += sumw
+        files.append(
+            {
+                "path": str(path.resolve()),
+                "entries": entries,
+                "sumw": sumw,
+                "size_bytes": path.stat().st_size,
+                "mtime_utc": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(),
+            }
+        )
+        root_file.Close()
+    if total_sumw == 0.0 or not math.isfinite(total_sumw):
+        raise RuntimeError(f"Sample {spec.name} has an invalid generated sum of weights: {total_sumw}")
+    return total_entries, total_sumw, files
+
+
+def particles_from_root(objects: Any, numparticles: int) -> EventParticles:
+    array = np.asarray(objects)
+    if array.ndim == 1:
+        if array.size % 8 != 0:
+            raise ValueError(f"Unexpected flattened objects size: {array.size}")
+        array = array.reshape((8, array.size // 8))
+    if array.ndim != 2 or array.shape[0] < 5 or numparticles > array.shape[1]:
+        raise ValueError(f"Unexpected objects shape {array.shape} for {numparticles} particles")
+    return EventParticles(
+        array[0, :numparticles],
+        array[1, :numparticles],
+        array[2, :numparticles],
+        array[3, :numparticles],
+        array[4, :numparticles].astype(np.int64, copy=False),
+    )
+
+
+def cluster_selected_jets(
+    particles: EventParticles,
+    excluded_indices: Iterable[int],
+    fastjet: Any,
+    jet_definition: Any,
+) -> Tuple[Any, List[Any]]:
+    excluded = set(int(value) for value in excluded_indices)
+    inputs: List[Any] = []
+    for index in range(len(particles)):
+        if index in excluded or abs(int(particles.pid[index])) in NEUTRINO_IDS:
+            continue
+        values = (
+            float(particles.px[index]),
+            float(particles.py[index]),
+            float(particles.pz[index]),
+            float(particles.energy[index]),
+        )
+        if not all(math.isfinite(value) for value in values) or values[3] <= 0.0:
+            continue
+        pseudojet = fastjet.PseudoJet(values[0], values[1], values[2], values[3])
+        pseudojet.set_user_index(index)
+        inputs.append(pseudojet)
+    cluster = fastjet.ClusterSequence(inputs, jet_definition)
+    jets = fastjet.sorted_by_pt(cluster.inclusive_jets(CUTS["jet_pt_min_gev"]))
+    selected = [
+        jet for jet in jets if abs(_pseudojet_value(jet, "rapidity")) < CUTS["jet_abs_y_max"]
+    ]
+    return cluster, selected
+
+
+def analyze_sample(
+    ROOT: Any,
+    fastjet: Any,
+    config: AnalysisConfig,
+    spec: SampleSpec,
+    max_events: Optional[int],
+    collect_common_events: bool = False,
+) -> SampleResult:
+    total_entries, generated_sumw, file_metadata = inspect_sample(ROOT, config, spec)
+    result = initialize_result(spec, total_entries, generated_sumw)
+    result.files = file_metadata
+    jet_definition = fastjet.JetDefinition(fastjet.antikt_algorithm, CUTS["jet_radius"])
+    common_buffer = (
+        CommonEventBuffer(common_observable_keys(spec.channel))
+        if collect_common_events
+        else None
+    )
+    remaining = max_events
+    started = time.monotonic()
+    logging.info("%s: %d generated events, sumw %.12g", spec.name, total_entries, generated_sumw)
+
+    for source_file_index, filename in enumerate(spec.files):
+        if remaining is not None and remaining <= 0:
+            break
+        root_file = ROOT.TFile.Open(filename, "READ")
+        tree = root_file.Get(config.tree_name)
+        entries = int(tree.GetEntries())
+        to_process = entries if remaining is None else min(entries, remaining)
+        tree.SetBranchStatus("*", 0)
+        for branch in ("numparticles", "objects", "evweight"):
+            tree.SetBranchStatus(branch, 1)
+        report_every = max(1000, to_process // 20) if to_process else 1
+        for entry in range(to_process):
+            tree.GetEntry(entry)
+            event_weight = float(tree.evweight)
+            if not math.isfinite(event_weight):
+                result.invalid_events += 1
+                continue
+            try:
+                particles = particles_from_root(tree.objects, int(tree.numparticles))
+                decision = (
+                    select_higgs_candidate(particles)
+                    if spec.channel == "higgs"
+                    else select_z_candidate(particles)
+                )
+                result.processed_entries += 1
+                result.processed_sumw += event_weight
+                result.cutflow["all_events"].fill(event_weight)
+                fill_cut_steps(result, decision.passed_steps, event_weight)
+                if decision.candidate is None:
+                    continue
+                candidate = decision.candidate
+                cluster, jets = cluster_selected_jets(
+                    particles,
+                    (candidate.leading_index, candidate.subleading_index),
+                    fastjet,
+                    jet_definition,
+                )
+                if len(jets) < 2:
+                    continue
+                result.cutflow["at_least_two_jets"].fill(event_weight)
+                jet1, jet2 = jets[0], jets[1]
+                jet1_y = _pseudojet_value(jet1, "rapidity")
+                jet2_y = _pseudojet_value(jet2, "rapidity")
+                if jet1_y * jet2_y >= 0.0:
+                    continue
+                result.cutflow["opposite_hemispheres"].fill(event_weight)
+                vbf = evaluate_vbf_selection(pseudojet_p4(jet1), pseudojet_p4(jet2), candidate.p4)
+                observable_values = fill_common_histograms(
+                    result, particles, candidate, jets, vbf, event_weight
+                )
+                pulls: Optional[Tuple[PullVector, PullVector]] = None
+                if common_buffer is not None:
+                    pulls = (calculate_pull_vector(jet1), calculate_pull_vector(jet2))
+                    common_buffer.append(
+                        event_weight,
+                        observable_values,
+                        pulls,
+                        source_file_index,
+                        entry,
+                    )
+                fill_cut_steps(result, vbf.passed_steps, event_weight)
+                if len(vbf.passed_steps) != 3:
+                    continue
+                if pulls is None:
+                    pulls = (calculate_pull_vector(jet1), calculate_pull_vector(jet2))
+                fill_pull_histograms(result, pulls, event_weight)
+                del cluster
+            except (ArithmeticError, ValueError, RuntimeError) as error:
+                result.invalid_events += 1
+                logging.debug("%s entry %d rejected as invalid: %s", spec.name, entry, error)
+            finally:
+                if entry and entry % report_every == 0:
+                    logging.info("%s: processed %d/%d entries", spec.name, entry, to_process)
+        root_file.Close()
+        if remaining is not None:
+            remaining -= to_process
+    if common_buffer is not None:
+        result.common_events = common_buffer.finalize()
+        logging.info("%s: retained %d common-selected events for XGBoost", spec.name, len(result.common_events))
+    logging.info(
+        "%s complete: %d processed in %.1f s; final sumw %.12g",
+        spec.name,
+        result.processed_entries,
+        time.monotonic() - started,
+        result.cutflow[cutflow_steps(spec.channel, result.strategy)[-1]].sumw,
+    )
+    return result
+
+
+def analyze_sample_worker(
+    config: AnalysisConfig,
+    spec: SampleSpec,
+    max_events: Optional[int],
+    log_level: str,
+    collect_common_events: bool = False,
+) -> SampleResult:
+    logging.basicConfig(
+        level=getattr(logging, log_level),
+        format="%(asctime)s %(processName)s %(levelname)s %(message)s",
+    )
+    ROOT, fastjet = load_runtime()
+    return analyze_sample(
+        ROOT,
+        fastjet,
+        config,
+        spec,
+        max_events,
+        collect_common_events=collect_common_events,
+    )
+
+
+def _table_pull_vectors(table: CommonEventTable, row: int) -> Tuple[PullVector, PullVector]:
+    vectors: List[PullVector] = []
+    for values in table.pulls[int(row)]:
+        vectors.append(
+            PullVector(
+                t_y=0.0,
+                t_phi=float(values[1]),
+                t_beam=float(values[0]),
+                magnitude=float(values[2]),
+                signed_angle=float(values[3]),
+                zero_magnitude=bool(values[4]),
+            )
+        )
+    return vectors[0], vectors[1]
+
+
+def _copy_common_cutflow(source: SampleResult, destination: SampleResult) -> None:
+    for step in cutflow_steps(source.spec.channel, "cutbased")[:-3]:
+        statistic = source.cutflow[step]
+        destination.cutflow[step] = CutStat(
+            raw_count=statistic.raw_count,
+            sumw=statistic.sumw,
+            sumw2=statistic.sumw2,
+        )
+
+
+def _split_dataset(
+    channel_results: Sequence[SampleResult],
+    splits: Mapping[str, xgbtools.SplitIndices],
+    split_name: str,
+    inverse_probability_correction: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Tuple[SampleResult, np.ndarray, float]]]:
+    feature_parts: List[np.ndarray] = []
+    label_parts: List[np.ndarray] = []
+    weight_parts: List[np.ndarray] = []
+    selections: List[Tuple[SampleResult, np.ndarray, float]] = []
+    for result in channel_results:
+        table = result.common_events
+        if table is None:
+            raise RuntimeError(f"Sample {result.spec.name} has no retained common-event table")
+        indices = splits[result.spec.name].as_dict()[split_name]
+        if len(indices) == 0:
+            raise RuntimeError(f"Sample {result.spec.name} has an empty {split_name} split")
+        correction = (
+            xgbtools.inverse_split_probability(len(table), len(indices))
+            if inverse_probability_correction
+            else 1.0
+        )
+        scale_pb = result.spec.cross_section_pb / result.generated_sumw
+        physical_weights = scale_pb * correction * table.weights[indices]
+        if np.any(physical_weights <= 0.0) or not np.all(np.isfinite(physical_weights)):
+            raise RuntimeError(
+                f"Sample {result.spec.name} has non-positive or non-finite XGBoost weights"
+            )
+        feature_parts.append(table.feature_matrix()[indices])
+        label = 1 if result.spec.role == "signal" else 0
+        label_parts.append(np.full(len(indices), label, dtype=np.int8))
+        weight_parts.append(physical_weights)
+        selections.append((result, indices, correction))
+    return (
+        np.concatenate(feature_parts, axis=0),
+        np.concatenate(label_parts),
+        np.concatenate(weight_parts),
+        selections,
+    )
+
+
+def _all_event_dataset(
+    channel_results: Sequence[SampleResult],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Tuple[SampleResult, np.ndarray, float]]]:
+    feature_parts: List[np.ndarray] = []
+    label_parts: List[np.ndarray] = []
+    weight_parts: List[np.ndarray] = []
+    selections: List[Tuple[SampleResult, np.ndarray, float]] = []
+    for result in channel_results:
+        table = result.common_events
+        if table is None or len(table) == 0:
+            raise RuntimeError(f"Sample {result.spec.name} has no common-selected XGBoost events")
+        indices = np.arange(len(table), dtype=np.int64)
+        scale_pb = result.spec.cross_section_pb / result.generated_sumw
+        weights = scale_pb * table.weights
+        if np.any(weights <= 0.0) or not np.all(np.isfinite(weights)):
+            raise RuntimeError(
+                f"Sample {result.spec.name} has non-positive or non-finite XGBoost weights"
+            )
+        feature_parts.append(table.feature_matrix())
+        label_parts.append(
+            np.full(len(table), 1 if result.spec.role == "signal" else 0, dtype=np.int8)
+        )
+        weight_parts.append(weights)
+        selections.append((result, indices, 1.0))
+    return (
+        np.concatenate(feature_parts, axis=0),
+        np.concatenate(label_parts),
+        np.concatenate(weight_parts),
+        selections,
+    )
+
+
+def _fill_xgboost_sample_result(
+    cut_result: SampleResult,
+    indices: np.ndarray,
+    scores: np.ndarray,
+    threshold: Any,
+    correction: float,
+) -> SampleResult:
+    table = cut_result.common_events
+    if table is None or len(indices) != len(scores):
+        raise RuntimeError("Invalid XGBoost sample application payload")
+    threshold_values = np.asarray(threshold, dtype=np.float64)
+    if threshold_values.ndim == 0:
+        threshold_values = np.full(len(scores), float(threshold_values), dtype=np.float64)
+    if threshold_values.shape != scores.shape or not np.all(np.isfinite(threshold_values)):
+        raise RuntimeError("Invalid XGBoost threshold payload")
+    result = initialize_result(
+        cut_result.spec,
+        cut_result.total_entries,
+        cut_result.generated_sumw,
+        strategy="xgboost",
+    )
+    result.processed_entries = cut_result.processed_entries
+    result.processed_sumw = cut_result.processed_sumw
+    result.invalid_events = cut_result.invalid_events
+    result.files = list(cut_result.files)
+    _copy_common_cutflow(cut_result, result)
+    application = result.cutflow["xgboost_application_sample"]
+    selected = result.cutflow["xgboost_score"]
+    for local_position, source_row in enumerate(indices):
+        corrected_weight = correction * float(table.weights[int(source_row)])
+        application.fill(corrected_weight)
+        if float(scores[local_position]) < float(threshold_values[local_position]):
+            continue
+        selected.fill(corrected_weight)
+        values = {
+            key: float(value)
+            for key, value in zip(
+                table.observable_keys,
+                table.observables[int(source_row)],
+            )
+        }
+        fill_common_histograms_from_values(result, values, corrected_weight)
+        fill_pull_histograms(
+            result,
+            _table_pull_vectors(table, int(source_row)),
+            corrected_weight,
+        )
+    return result
+
+
+def _importance_by_feature(classifier: Any) -> Dict[str, float]:
+    raw = classifier.get_booster().get_score(importance_type="gain")
+    importance: Dict[str, float] = {}
+    for index, name in enumerate(xgbtools.FEATURE_NAMES):
+        importance[name] = float(raw.get(f"f{index}", raw.get(name, 0.0)))
+    return importance
+
+
+def _mean_feature_importance(classifiers: Sequence[Any]) -> Dict[str, float]:
+    if not classifiers:
+        return {name: 0.0 for name in xgbtools.FEATURE_NAMES}
+    per_model = [_importance_by_feature(classifier) for classifier in classifiers]
+    return {
+        name: float(np.mean([values[name] for values in per_model], dtype=np.float64))
+        for name in xgbtools.FEATURE_NAMES
+    }
+
+
+def _weighted_confusion_from_pass_mask(
+    labels: np.ndarray,
+    passed: np.ndarray,
+    weights: np.ndarray,
+) -> np.ndarray:
+    classes = np.asarray(labels, dtype=np.int8)
+    selections = np.asarray(passed, dtype=bool)
+    physical_weights = np.asarray(weights, dtype=np.float64)
+    if classes.shape != selections.shape or classes.shape != physical_weights.shape:
+        raise ValueError("Confusion inputs must have identical one-dimensional shapes")
+    matrix = np.zeros((2, 2), dtype=np.float64)
+    for truth in (0, 1):
+        for prediction in (0, 1):
+            mask = (classes == truth) & (selections == bool(prediction))
+            matrix[truth, prediction] = np.sum(physical_weights[mask], dtype=np.float64)
+    return matrix
+
+
+def _crossfit_split_metadata(
+    channel_results: Sequence[SampleResult],
+    crossfits: Mapping[str, Sequence[xgbtools.CrossFitSplit]],
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {}
+    for result in channel_results:
+        table = result.common_events
+        if table is None:
+            raise RuntimeError(f"Sample {result.spec.name} has no retained common-event table")
+        population = len(table)
+        sample_folds = crossfits[result.spec.name]
+        test_coverage = np.concatenate([split.test for split in sample_folds])
+        validation_coverage = np.concatenate([split.validation for split in sample_folds])
+        train_coverage = np.concatenate([split.train for split in sample_folds])
+        if not np.array_equal(np.sort(test_coverage), np.arange(population)):
+            raise RuntimeError(f"Sample {result.spec.name} cross-fit test coverage is not exhaustive")
+        if not np.array_equal(np.sort(validation_coverage), np.arange(population)):
+            raise RuntimeError(f"Sample {result.spec.name} cross-fit validation coverage is not exhaustive")
+        train_counts = np.bincount(train_coverage, minlength=population)
+        if not np.all(train_counts == xgbtools.CROSS_FIT_FOLDS - 2):
+            raise RuntimeError(f"Sample {result.spec.name} cross-fit training multiplicity is invalid")
+        payload[result.spec.name] = {
+            "population": population,
+            "test_coverage_count": len(test_coverage),
+            "validation_coverage_count": len(validation_coverage),
+            "training_multiplicity": xgbtools.CROSS_FIT_FOLDS - 2,
+            "folds": [
+                {
+                    "fold": split.fold,
+                    "validation_fold": split.validation_fold,
+                    "train_count": len(split.train),
+                    "validation_count": len(split.validation),
+                    "test_count": len(split.test),
+                    "train_fraction": len(split.train) / population,
+                    "validation_fraction": len(split.validation) / population,
+                    "test_fraction": len(split.test) / population,
+                }
+                for split in sample_folds
+            ],
+        }
+    return payload
+
+
+def build_xgboost_results(
+    cut_results: Sequence[SampleResult],
+    run_dir: Path,
+    model_run: Optional[Path] = None,
+) -> Tuple[List[SampleResult], Dict[str, Any], Dict[str, Any]]:
+    """Train/load channel models and build post-score sample results.
+
+    Nominal training uses rotating five-fold cross-fitting.  In each pipeline,
+    three folds train the classifier, a fourth independently fixes its score
+    threshold, and the fifth supplies physics entries.  The five test folds
+    cover every common-selected event exactly once with no inverse-probability
+    correction.  Frozen applications route each independent event through one
+    of the same five saved model/threshold pipelines.
+    """
+    xgboost_results: List[SampleResult] = []
+    metadata: Dict[str, Any] = {
+        "feature_names": list(xgbtools.FEATURE_NAMES),
+        "model_parameters": dict(xgbtools.MODEL_PARAMETERS),
+        "runtime_versions": xgbtools.runtime_versions(),
+        "training_seed": xgbtools.CROSS_FIT_SEED,
+        "cross_fitting": {
+            "folds": xgbtools.CROSS_FIT_FOLDS,
+            "seed": xgbtools.CROSS_FIT_SEED,
+            "scheme": "rotating_nested_60_20_20",
+            "validation_rotation": "(test_fold + 1) modulo folds",
+            "nominal_event_usage": {
+                "physics_test": 1,
+                "validation": 1,
+                "training": xgbtools.CROSS_FIT_FOLDS - 2,
+            },
+        },
+        "channels": {},
+        "source_model_run": str(model_run.resolve()) if model_run is not None else None,
+    }
+    diagnostics: Dict[str, Any] = {}
+    source_metadata: Optional[Mapping[str, Any]] = None
+    if model_run is not None:
+        source_summary_path = model_run.resolve() / "summaries" / "xgboost.json"
+        if not source_summary_path.is_file():
+            raise FileNotFoundError(f"Frozen XGBoost summary does not exist: {source_summary_path}")
+        source_metadata = json.loads(source_summary_path.read_text(encoding="utf-8"))
+        if tuple(source_metadata.get("feature_names", ())) != xgbtools.FEATURE_NAMES:
+            raise ValueError("Frozen model feature order does not match this analysis")
+
+    for channel in ("higgs", "z"):
+        channel_results = [result for result in cut_results if result.spec.channel == channel]
+        roles = {result.spec.role for result in channel_results}
+        if roles != {"signal", "background"}:
+            raise ValueError(f"Channel {channel} requires both signal and background roles")
+        channel_source = source_metadata["channels"][channel] if source_metadata is not None else None
+        source_models = list(channel_source.get("models", ())) if channel_source is not None else []
+        if source_models:
+            source_crossfit = source_metadata.get("cross_fitting", {})
+            if (
+                int(source_crossfit.get("folds", -1)) != xgbtools.CROSS_FIT_FOLDS
+                or int(source_crossfit.get("seed", -1)) != xgbtools.CROSS_FIT_SEED
+            ):
+                raise ValueError(
+                    "Frozen XGBoost ensemble fold count or assignment seed does not match this analysis"
+                )
+        use_crossfit = source_metadata is None or bool(source_models)
+        crossfits: Dict[str, Tuple[xgbtools.CrossFitSplit, ...]] = {}
+        split_metadata: Dict[str, Any] = {}
+        if use_crossfit:
+            crossfits = {
+                result.spec.name: xgbtools.deterministic_crossfit_splits(
+                    len(result.common_events or ()),
+                    result.spec.name,
+                    folds=xgbtools.CROSS_FIT_FOLDS,
+                    seed=xgbtools.CROSS_FIT_SEED,
+                )
+                for result in channel_results
+            }
+            split_metadata = _crossfit_split_metadata(channel_results, crossfits)
+
+        sample_scores = {
+            result.spec.name: np.full(len(result.common_events or ()), np.nan, dtype=np.float64)
+            for result in channel_results
+        }
+        sample_thresholds = {
+            result.spec.name: np.full(len(result.common_events or ()), np.nan, dtype=np.float64)
+            for result in channel_results
+        }
+        sample_fold_ids = {
+            result.spec.name: np.full(len(result.common_events or ()), -1, dtype=np.int8)
+            for result in channel_results
+        }
+        assigned = {
+            result.spec.name: np.zeros(len(result.common_events or ()), dtype=bool)
+            for result in channel_results
+        }
+        classifiers: List[Any] = []
+        model_records: List[Dict[str, Any]] = []
+        fold_optima: List[xgbtools.ThresholdResult] = []
+        training_balances: List[Dict[str, float]] = []
+        train_diagnostic_parts: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        validation_diagnostic_parts: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+
+        def assign_scores(
+            fold: int,
+            scores: np.ndarray,
+            selections: Sequence[Tuple[SampleResult, np.ndarray, float]],
+            threshold: float,
+        ) -> None:
+            offset = 0
+            for cut_result, indices, correction in selections:
+                if correction != 1.0:
+                    raise RuntimeError("Cross-fit physics entries must not use inverse weights")
+                count = len(indices)
+                values = scores[offset : offset + count]
+                offset += count
+                name = cut_result.spec.name
+                if np.any(assigned[name][indices]):
+                    raise RuntimeError(f"Sample {name} received duplicate cross-fit physics scores")
+                sample_scores[name][indices] = values
+                sample_thresholds[name][indices] = float(threshold)
+                sample_fold_ids[name][indices] = int(fold)
+                assigned[name][indices] = True
+            if offset != len(scores):
+                raise RuntimeError("XGBoost per-sample score slicing did not close")
+
+        if source_metadata is None:
+            for fold in range(xgbtools.CROSS_FIT_FOLDS):
+                fold_splits = {
+                    result.spec.name: crossfits[result.spec.name][fold].as_split_indices()
+                    for result in channel_results
+                }
+                train_x, train_y, train_physical_w, _ = _split_dataset(
+                    channel_results, fold_splits, "train"
+                )
+                validation_x, validation_y, validation_w, _ = _split_dataset(
+                    channel_results, fold_splits, "validation"
+                )
+                _, validation_physical_y, validation_physical_w, _ = _split_dataset(
+                    channel_results,
+                    fold_splits,
+                    "validation",
+                    inverse_probability_correction=False,
+                )
+                test_x, test_y, test_w, test_selections = _split_dataset(
+                    channel_results,
+                    fold_splits,
+                    "test",
+                    inverse_probability_correction=False,
+                )
+                balanced_weights, balance = xgbtools.balanced_training_weights(
+                    train_physical_w, train_y
+                )
+                classifier = xgbtools.train_classifier(train_x, train_y, balanced_weights)
+                train_scores = xgbtools.signal_scores(classifier, train_x)
+                validation_scores = xgbtools.signal_scores(classifier, validation_x)
+                test_scores = xgbtools.signal_scores(classifier, test_x)
+                optimum = xgbtools.optimize_significance_threshold(
+                    validation_scores, validation_y, validation_w
+                )
+                assign_scores(fold, test_scores, test_selections, optimum.threshold)
+
+                model_relative = (
+                    Path("models") / "xgboost" / channel / f"fold-{fold + 1}.json"
+                )
+                model_hash = xgbtools.save_classifier(classifier, run_dir / model_relative)
+                reloaded = xgbtools.load_classifier(run_dir / model_relative)
+                reload_probe = test_x[: min(len(test_x), 10000)]
+                reload_identical = np.array_equal(
+                    xgbtools.signal_scores(classifier, reload_probe),
+                    xgbtools.signal_scores(reloaded, reload_probe),
+                )
+                if not reload_identical:
+                    raise RuntimeError(
+                        f"Reloaded {channel} fold {fold + 1} XGBoost model changed its predictions"
+                    )
+                importance = _importance_by_feature(classifier)
+                classifiers.append(classifier)
+                fold_optima.append(optimum)
+                training_balances.append(balance)
+                model_records.append(
+                    {
+                        "fold": fold,
+                        "validation_fold": (fold + 1) % xgbtools.CROSS_FIT_FOLDS,
+                        "model_path": model_relative.as_posix(),
+                        "model_sha256": model_hash,
+                        "reload_predictions_identical": reload_identical,
+                        "score_threshold": optimum.threshold,
+                        "training_balance": balance,
+                        "validation_optimum": {
+                            "significance": optimum.significance,
+                            "signal_cross_section_pb": optimum.signal_weight,
+                            "background_cross_section_pb": optimum.background_weight,
+                            "selected_count": optimum.selected_count,
+                        },
+                        "feature_importance_gain": importance,
+                    }
+                )
+                train_diagnostic_parts.append((train_scores, train_y, train_physical_w))
+                if not np.array_equal(validation_y, validation_physical_y):
+                    raise RuntimeError("Corrected and physical validation labels differ")
+                validation_diagnostic_parts.append(
+                    (validation_scores, validation_y, validation_physical_w)
+                )
+            application_scope = "five_fold_out_of_fold_all_events"
+            validation_signal = float(
+                np.mean([optimum.signal_weight for optimum in fold_optima], dtype=np.float64)
+            )
+            validation_background = float(
+                np.mean([optimum.background_weight for optimum in fold_optima], dtype=np.float64)
+            )
+            validation_significance = (
+                validation_signal / math.sqrt(validation_signal + validation_background)
+                if validation_signal + validation_background > 0.0
+                else 0.0
+            )
+            validation_summary = {
+                "aggregation": "mean cross sections across fold-specific validation optima",
+                "significance": validation_significance,
+                "signal_cross_section_pb": validation_signal,
+                "background_cross_section_pb": validation_background,
+                "mean_selected_count": float(
+                    np.mean([optimum.selected_count for optimum in fold_optima], dtype=np.float64)
+                ),
+            }
+        elif source_models:
+            by_fold = {int(values["fold"]): values for values in source_models}
+            expected_folds = set(range(xgbtools.CROSS_FIT_FOLDS))
+            if set(by_fold) != expected_folds:
+                raise ValueError(
+                    f"Frozen {channel} model ensemble must contain folds {sorted(expected_folds)}"
+                )
+            for fold in range(xgbtools.CROSS_FIT_FOLDS):
+                source_record = by_fold[fold]
+                classifier = xgbtools.load_classifier(
+                    model_run.resolve() / str(source_record["model_path"])
+                )
+                threshold = float(source_record["score_threshold"])
+                fold_splits = {
+                    result.spec.name: crossfits[result.spec.name][fold].as_split_indices()
+                    for result in channel_results
+                }
+                test_x, test_y, test_w, test_selections = _split_dataset(
+                    channel_results,
+                    fold_splits,
+                    "test",
+                    inverse_probability_correction=False,
+                )
+                test_scores = xgbtools.signal_scores(classifier, test_x)
+                assign_scores(fold, test_scores, test_selections, threshold)
+                model_relative = (
+                    Path("models") / "xgboost" / channel / f"fold-{fold + 1}.json"
+                )
+                model_hash = xgbtools.save_classifier(classifier, run_dir / model_relative)
+                reloaded = xgbtools.load_classifier(run_dir / model_relative)
+                reload_probe = test_x[: min(len(test_x), 10000)]
+                reload_identical = np.array_equal(
+                    xgbtools.signal_scores(classifier, reload_probe),
+                    xgbtools.signal_scores(reloaded, reload_probe),
+                )
+                if not reload_identical:
+                    raise RuntimeError(
+                        f"Reloaded frozen {channel} fold {fold + 1} model changed its predictions"
+                    )
+                classifiers.append(classifier)
+                model_records.append(
+                    {
+                        **dict(source_record),
+                        "model_path": model_relative.as_posix(),
+                        "model_sha256": model_hash,
+                        "reload_predictions_identical": reload_identical,
+                    }
+                )
+            training_balances = [
+                dict(values.get("training_balance", {})) for values in model_records
+            ]
+            validation_summary = dict(channel_source["validation_optimum"])
+            application_scope = "five_fold_routed_independent_events"
+        else:
+            # Backward-compatible application of a pre-cross-fit nominal run.
+            classifier = xgbtools.load_classifier(
+                model_run.resolve() / str(channel_source["model_path"])
+            )
+            threshold = float(channel_source["score_threshold"])
+            all_x, all_y, all_w, all_selections = _all_event_dataset(channel_results)
+            all_scores = xgbtools.signal_scores(classifier, all_x)
+            offset = 0
+            for cut_result, indices, correction in all_selections:
+                count = len(indices)
+                name = cut_result.spec.name
+                sample_scores[name][indices] = all_scores[offset : offset + count]
+                sample_thresholds[name][indices] = threshold
+                sample_fold_ids[name][indices] = 0
+                assigned[name][indices] = True
+                offset += count
+            if offset != len(all_scores):
+                raise RuntimeError("Legacy XGBoost application score slicing did not close")
+            model_relative = Path("models") / "xgboost" / f"{channel}.json"
+            model_hash = xgbtools.save_classifier(classifier, run_dir / model_relative)
+            reloaded = xgbtools.load_classifier(run_dir / model_relative)
+            reload_probe = all_x[: min(len(all_x), 10000)]
+            reload_identical = np.array_equal(
+                xgbtools.signal_scores(classifier, reload_probe),
+                xgbtools.signal_scores(reloaded, reload_probe),
+            )
+            if not reload_identical:
+                raise RuntimeError(f"Reloaded legacy {channel} model changed its predictions")
+            classifiers = [classifier]
+            model_records = []
+            validation_summary = dict(channel_source["validation_optimum"])
+            training_balances = [dict(channel_source.get("training_balance", {}))]
+            application_scope = "legacy_single_model_independent_events"
+
+        for result in channel_results:
+            name = result.spec.name
+            if not np.all(assigned[name]):
+                raise RuntimeError(f"Sample {name} did not receive exactly one physics score per event")
+            if not np.all(np.isfinite(sample_scores[name])) or not np.all(
+                np.isfinite(sample_thresholds[name])
+            ):
+                raise RuntimeError(f"Sample {name} received invalid physics scores or thresholds")
+
+        score_parts: List[np.ndarray] = []
+        threshold_parts: List[np.ndarray] = []
+        label_parts: List[np.ndarray] = []
+        weight_parts: List[np.ndarray] = []
+        sample_application: Dict[str, Dict[str, Any]] = {}
+        for cut_result in channel_results:
+            table = cut_result.common_events
+            if table is None:
+                raise RuntimeError(f"Sample {cut_result.spec.name} lost its common-event table")
+            name = cut_result.spec.name
+            indices = np.arange(len(table), dtype=np.int64)
+            scores = sample_scores[name]
+            thresholds = sample_thresholds[name]
+            xgb_result = _fill_xgboost_sample_result(
+                cut_result, indices, scores, thresholds, correction=1.0
+            )
+            xgb_result.application_scope = application_scope
+            xgboost_results.append(xgb_result)
+            passed = scores >= thresholds
+            sample_application[name] = {
+                "input_count": len(indices),
+                "selected_count": xgb_result.cutflow["xgboost_score"].raw_count,
+                "inverse_probability": 1.0,
+                "selected_sumw": xgb_result.cutflow["xgboost_score"].sumw,
+                "fold_input_counts": {
+                    str(fold): int(np.sum(sample_fold_ids[name] == fold))
+                    for fold in sorted(set(int(value) for value in sample_fold_ids[name]))
+                },
+                "fold_selected_counts": {
+                    str(fold): int(np.sum(passed & (sample_fold_ids[name] == fold)))
+                    for fold in sorted(set(int(value) for value in sample_fold_ids[name]))
+                },
+            }
+            scale_pb = cut_result.spec.cross_section_pb / cut_result.generated_sumw
+            score_parts.append(scores)
+            threshold_parts.append(thresholds)
+            label_parts.append(
+                np.full(len(table), 1 if cut_result.spec.role == "signal" else 0, dtype=np.int8)
+            )
+            weight_parts.append(scale_pb * table.weights)
+
+        physics_scores = np.concatenate(score_parts)
+        physics_thresholds = np.concatenate(threshold_parts)
+        physics_y = np.concatenate(label_parts)
+        physics_w = np.concatenate(weight_parts)
+        physics_passed = physics_scores >= physics_thresholds
+        fpr, tpr, _, auc = xgbtools.weighted_roc_curve(
+            physics_y, physics_scores, physics_w
+        )
+        confusion = _weighted_confusion_from_pass_mask(
+            physics_y, physics_passed, physics_w
+        )
+        signal_total = float(np.sum(physics_w[physics_y == 1], dtype=np.float64))
+        background_total = float(np.sum(physics_w[physics_y == 0], dtype=np.float64))
+        signal_selected = float(confusion[1, 1])
+        background_selected = float(confusion[0, 1])
+        physics_significance = signal_selected / math.sqrt(signal_selected + background_selected) \
+            if signal_selected + background_selected > 0.0 else 0.0
+        performance = {
+            "scope": application_scope,
+            "weighted_auc": auc,
+            "signal_efficiency": signal_selected / signal_total if signal_total else None,
+            "background_efficiency": background_selected / background_total if background_total else None,
+            "signal_cross_section_pb": signal_selected,
+            "background_cross_section_pb": background_selected,
+            "significance_per_sqrt_fb": physics_significance * math.sqrt(1000.0),
+            "weighted_confusion_pb": confusion.tolist(),
+        }
+        threshold_list = [float(values["score_threshold"]) for values in model_records]
+        feature_importance = _mean_feature_importance(classifiers)
+        channel_metadata = {
+            "application_scope": application_scope,
+            "crossfit_split": split_metadata,
+            "validation_optimum": validation_summary,
+            "out_of_fold" if source_metadata is None else "application": performance,
+            "feature_importance_gain": feature_importance,
+            "samples": sample_application,
+        }
+        if model_records:
+            channel_metadata.update(
+                {
+                    "models": model_records,
+                    "model_count": len(model_records),
+                    "score_thresholds": threshold_list,
+                    "score_threshold_summary": {
+                        "minimum": min(threshold_list),
+                        "mean": float(np.mean(threshold_list, dtype=np.float64)),
+                        "maximum": max(threshold_list),
+                    },
+                    "reload_predictions_identical": all(
+                        bool(values["reload_predictions_identical"])
+                        for values in model_records
+                    ),
+                    "training_balance_by_fold": training_balances,
+                }
+            )
+        else:
+            channel_metadata.update(
+                {
+                    "model_path": model_relative.as_posix(),
+                    "model_sha256": model_hash,
+                    "score_threshold": threshold,
+                    "reload_predictions_identical": reload_identical,
+                    "training_balance": training_balances[0],
+                }
+            )
+        metadata["channels"][channel] = channel_metadata
+        if source_metadata is None:
+            diagnostic_splits = {
+                "train": {
+                    "scores": np.concatenate([values[0] for values in train_diagnostic_parts]),
+                    "labels": np.concatenate([values[1] for values in train_diagnostic_parts]),
+                    "weights": np.concatenate([values[2] for values in train_diagnostic_parts]),
+                },
+                "validation": {
+                    "scores": np.concatenate([values[0] for values in validation_diagnostic_parts]),
+                    "labels": np.concatenate([values[1] for values in validation_diagnostic_parts]),
+                    "weights": np.concatenate([values[2] for values in validation_diagnostic_parts]),
+                },
+                "out-of-fold": {
+                    "scores": physics_scores,
+                    "labels": physics_y,
+                    "weights": physics_w,
+                },
+            }
+        else:
+            diagnostic_splits = {
+                "application": {
+                    "scores": physics_scores,
+                    "labels": physics_y,
+                    "weights": physics_w,
+                }
+            }
+        diagnostics[channel] = {
+            "thresholds": threshold_list if threshold_list else [float(threshold)],
+            "roc_fpr": fpr,
+            "roc_tpr": tpr,
+            "auc": auc,
+            "roc_label": "Five-fold out-of-fold" if source_metadata is None else "Independent application",
+            "feature_importance": feature_importance,
+            "splits": diagnostic_splits,
+        }
+    return xgboost_results, metadata, diagnostics
+
+
+def _format_luminosity(value: float) -> str:
+    return f"{value:g}fb"
+
+
+def result_summary(result: SampleResult, luminosities: Sequence[float]) -> Dict[str, Any]:
+    last_step = cutflow_steps(result.spec.channel, result.strategy)[-1]
+    selected_sumw = result.cutflow[last_step].sumw
+    signed_hist_integral = result.histograms["signed_pull_angle"].integral
+    folded_hist_integral = result.histograms["folded_pull_angle"].integral
+    pull_match_tolerance = max(1.0e-10, 1.0e-10 * abs(selected_sumw))
+    yields = {}
+    for luminosity in luminosities:
+        factor = normalization_factor(luminosity, result.spec.cross_section_pb, result.generated_sumw)
+        yields[str(luminosity)] = {
+            "inclusive_expected": 1000.0 * luminosity * result.spec.cross_section_pb,
+            "processed_expected": factor * result.processed_sumw,
+            "selected_expected": factor * selected_sumw,
+        }
+    pull_total = result.pull_total_sumw
+    scale_pb = result.spec.cross_section_pb / result.generated_sumw
+    differential = differential_pull_statistics(
+        scale_pb * result.pull_bin_sumw,
+        scale_pb * result.pull_event_second_sumw,
+        scale_pb * scale_pb * result.pull_mc_second_sumw2,
+        luminosities,
+    )
+    return {
+        "strategy": result.strategy,
+        "application_scope": result.application_scope,
+        "sample": asdict(result.spec),
+        "total_entries": result.total_entries,
+        "generated_sumw": result.generated_sumw,
+        "processed_entries": result.processed_entries,
+        "processed_sumw": result.processed_sumw,
+        "processed_fraction": result.processed_entries / result.total_entries if result.total_entries else 0.0,
+        "invalid_events": result.invalid_events,
+        "files": result.files,
+        "cutflow": {step: asdict(stat) for step, stat in result.cutflow.items()},
+        "pull": {
+            "sumw": pull_total,
+            "f_beam": differential["f_beam"],
+            "left_right_asymmetry": (result.pull_right_sumw - result.pull_left_sumw) / pull_total if pull_total else None,
+            "left_sumw": result.pull_left_sumw,
+            "right_sumw": result.pull_right_sumw,
+            "zero_magnitude_jets": result.zero_pull_jets,
+            "zero_magnitude_sumw": result.zero_pull_sumw,
+            "signed_angle_histogram_integral": signed_hist_integral,
+            "folded_angle_histogram_integral": folded_hist_integral,
+            "selected_cutflow_sumw": selected_sumw,
+            "integral_matches_selected": abs(signed_hist_integral - selected_sumw) <= pull_match_tolerance,
+            "folded_integral_matches_selected": abs(folded_hist_integral - selected_sumw) <= pull_match_tolerance,
+            "differential": differential,
+            "moment_model": result.pull_moment_model,
+        },
+        "yields": yields,
+    }
+
+
+def channel_pull_summary(
+    channel: str,
+    results: Sequence[SampleResult],
+    luminosities: Sequence[float],
+    strategy: str = "cutbased",
+) -> Dict[str, Any]:
+    channel_results = [
+        result
+        for result in results
+        if result.spec.channel == channel and result.strategy == strategy
+    ]
+    total_pb = 0.0
+    left_pb = 0.0
+    right_pb = 0.0
+    selected_pb = 0.0
+    bin_cross_sections_pb = np.zeros(PULL_BIN_COUNT, dtype=np.float64)
+    event_second_pb = np.zeros((PULL_BIN_COUNT, PULL_BIN_COUNT), dtype=np.float64)
+    mc_second_pb2 = np.zeros((PULL_BIN_COUNT, PULL_BIN_COUNT), dtype=np.float64)
+    for result in channel_results:
+        scale_pb = result.spec.cross_section_pb / result.generated_sumw
+        total_pb += scale_pb * result.pull_total_sumw
+        left_pb += scale_pb * result.pull_left_sumw
+        right_pb += scale_pb * result.pull_right_sumw
+        selected_pb += scale_pb * result.cutflow[
+            cutflow_steps(channel, strategy)[-1]
+        ].sumw
+        bin_cross_sections_pb += scale_pb * result.pull_bin_sumw
+        event_second_pb += scale_pb * result.pull_event_second_sumw
+        mc_second_pb2 += scale_pb * scale_pb * result.pull_mc_second_sumw2
+    differential = differential_pull_statistics(
+        bin_cross_sections_pb,
+        event_second_pb,
+        mc_second_pb2,
+        luminosities,
+    )
+    f_beam = differential["f_beam"]
+    expected_yields = {
+        str(luminosity): 1000.0 * luminosity * selected_pb for luminosity in luminosities
+    }
+    return {
+        "channel": channel,
+        "strategy": strategy,
+        "selected_cross_section_pb": selected_pb,
+        "pull_histogram_cross_section_pb": total_pb,
+        "integral_matches_selected": math.isclose(total_pb, selected_pb, rel_tol=1.0e-10, abs_tol=1.0e-12),
+        "f_beam": f_beam,
+        "left_right_asymmetry": (right_pb - left_pb) / total_pb if total_pb else None,
+        "expected_selected_yields": expected_yields,
+        "f_beam_statistical_error": differential["f_beam_statistical_error"],
+        "f_beam_mc_statistical_error": differential["f_beam_mc_statistical_error"],
+        "statistical_error_model": "event_level_two_tagging_jet_covariance",
+        "mc_error_model": "event_level_weighted_outer_products",
+        "pull_entries_per_selected_event": 2.0,
+        "differential": differential,
+    }
+
+
+def write_histogram_npz(run_dir: Path, results: Sequence[SampleResult]) -> Path:
+    destination = run_dir / "summaries" / "histograms.npz"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    arrays: Dict[str, np.ndarray] = {}
+    for result in results:
+        result_prefix = f"{result.strategy}__{result.spec.name}"
+        for key, histogram in result.histograms.items():
+            prefix = f"{result_prefix}__{key}"
+            arrays[f"{prefix}__edges"] = histogram.edges
+            arrays[f"{prefix}__sumw"] = histogram.sumw
+            arrays[f"{prefix}__sumw2"] = histogram.sumw2
+        arrays[f"{result_prefix}__pull_bin_sumw"] = result.pull_bin_sumw
+        arrays[f"{result_prefix}__pull_event_second_sumw"] = result.pull_event_second_sumw
+        arrays[f"{result_prefix}__pull_mc_second_sumw2"] = result.pull_mc_second_sumw2
+    with destination.open("xb") as stream:
+        np.savez_compressed(stream, **arrays)
+    return destination
+
+
+def write_cutflow_files(
+    run_dir: Path,
+    channel: str,
+    results: Sequence[SampleResult],
+    luminosities: Sequence[float],
+    strategy: str = "cutbased",
+) -> Tuple[Path, Path]:
+    channel_results = [
+        result
+        for result in results
+        if result.spec.channel == channel and result.strategy == strategy
+    ]
+    csv_path = run_dir / "cutflows" / strategy / f"{channel}.csv"
+    markdown_path = run_dir / "cutflows" / strategy / f"{channel}.md"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    fields = ["strategy", "channel", "cut", "cut_label", "sample", "role", "raw_count", "sumw", "sumw2", "efficiency", "fiducial_cross_section_pb"]
+    fields.extend(f"yield_{_format_luminosity(value)}" for value in luminosities)
+    rows: List[Dict[str, Any]] = []
+    for step in cutflow_steps(channel, strategy):
+        for result in channel_results:
+            stat = result.cutflow[step]
+            all_sumw = result.cutflow["all_events"].sumw
+            row: Dict[str, Any] = {
+                "strategy": strategy,
+                "channel": channel,
+                "cut": step,
+                "cut_label": CUT_LABELS[step],
+                "sample": result.spec.name,
+                "role": result.spec.role,
+                "raw_count": stat.raw_count,
+                "sumw": stat.sumw,
+                "sumw2": stat.sumw2,
+                "efficiency": stat.sumw / all_sumw if all_sumw else math.nan,
+                "fiducial_cross_section_pb": result.spec.cross_section_pb * stat.sumw / result.generated_sumw,
+            }
+            for luminosity in luminosities:
+                row[f"yield_{_format_luminosity(luminosity)}"] = normalization_factor(
+                    luminosity, result.spec.cross_section_pb, result.generated_sumw
+                ) * stat.sumw
+            rows.append(row)
+    with csv_path.open("x", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    header = "| " + " | ".join(fields) + " |"
+    separator = "| " + " | ".join("---" for _ in fields) + " |"
+    lines = [f"# {channel.capitalize()} {strategy} cutflow", "", header, separator]
+    for row in rows:
+        values = []
+        for field_name in fields:
+            value = row[field_name]
+            if isinstance(value, float):
+                values.append(f"{value:.8g}")
+            else:
+                values.append(str(value))
+        lines.append("| " + " | ".join(values) + " |")
+    write_text_exclusive(markdown_path, "\n".join(lines) + "\n")
+    return csv_path, markdown_path
+
+
+def _step_values(values: np.ndarray) -> np.ndarray:
+    return np.r_[values, values[-1]] if len(values) else values
+
+
+def _save_figure_exclusive(figure: Any, path: Path, **kwargs: Any) -> None:
+    if path.exists():
+        raise FileExistsError(f"Refusing to overwrite plot: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path, **kwargs)
+
+
+def generate_plots(
+    run_dir: Path,
+    results: Sequence[SampleResult],
+    luminosities: Sequence[float],
+    partial: bool,
+) -> List[Dict[str, Any]]:
+    matplotlib_config = Path(tempfile.gettempdir()) / "pullpheno-matplotlib"
+    matplotlib_config.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(matplotlib_config))
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import ScalarFormatter
+
+    plt.rcParams.update(
+        {
+            "font.size": 11,
+            "axes.labelsize": 12,
+            "axes.titlesize": 13,
+            "legend.fontsize": 9,
+            "figure.figsize": (7.2, 5.2),
+            "savefig.facecolor": "white",
+        }
+    )
+    plot_records: List[Dict[str, Any]] = []
+    planned_paths = set()
+    registry = plot_registry()
+    strategies = [name for name in ANALYSIS_STRATEGIES if any(r.strategy == name for r in results)]
+    for strategy in strategies:
+        for spec in registry:
+            channel_results = sorted(
+                (
+                    result
+                    for result in results
+                    if result.spec.channel == spec.channel and result.strategy == strategy
+                ),
+                key=lambda result: result.spec.stack_order,
+            )
+            if not channel_results:
+                continue
+            stage = spec.stage if strategy == "cutbased" else "xgboost"
+            display_title = spec.title + (" · XGBoost selection" if strategy == "xgboost" else "")
+            for luminosity in luminosities:
+                lumi_tag = _format_luminosity(luminosity)
+                relative_base = (
+                    Path("plots") / strategy / "yields" / lumi_tag / spec.channel / stage / spec.key
+                )
+                for extension in ("png", "pdf"):
+                    candidate_path = str(relative_base.with_suffix(f".{extension}"))
+                    if candidate_path in planned_paths:
+                        raise RuntimeError(f"Duplicate planned plot path: {candidate_path}")
+                    planned_paths.add(candidate_path)
+                fig, ax = plt.subplots()
+                edges = spec.edges
+                widths = np.diff(edges)
+                bottom = np.zeros(len(edges) - 1)
+                variance = np.zeros_like(bottom)
+                for result in channel_results:
+                    histogram = result.histograms[spec.key]
+                    factor = normalization_factor(
+                        luminosity, result.spec.cross_section_pb, result.generated_sumw
+                    )
+                    values = factor * histogram.sumw
+                    variance += factor * factor * histogram.sumw2
+                    ax.bar(
+                        edges[:-1], values, width=widths, align="edge", bottom=bottom,
+                        color=result.spec.color, edgecolor="none", linewidth=0.0,
+                        label=result.spec.label,
+                    )
+                    bottom += values
+                uncertainty = np.sqrt(np.maximum(variance, 0.0))
+                ax.fill_between(
+                    edges,
+                    _step_values(bottom - uncertainty),
+                    _step_values(bottom + uncertainty),
+                    step="post", color="#20242b", alpha=0.18, linewidth=0.0,
+                    label="MC statistical uncertainty",
+                )
+                ax.set_xlim(edges[0], edges[-1])
+                ax.set_xlabel(spec.xlabel)
+                ax.set_ylabel(rf"Expected events / bin at {luminosity:g} fb$^{{-1}}$")
+                ax.set_title(display_title, loc="left", pad=34, fontweight="semibold")
+                subtitle = "Particle level · Herwig · 13.6 TeV"
+                if strategy == "xgboost":
+                    scopes = {item.application_scope for item in channel_results}
+                    scope_labels = {
+                        "held_out_test_only": "held-out test",
+                        "five_fold_out_of_fold_all_events": "5-fold out-of-fold",
+                        "five_fold_routed_independent_events": "frozen 5-fold ensemble",
+                        "legacy_single_model_independent_events": "legacy frozen model",
+                        "all_independent_events": "independent application",
+                    }
+                    subtitle += " · " + (
+                        scope_labels.get(next(iter(scopes)), "independent application")
+                        if len(scopes) == 1
+                        else "mixed application scopes"
+                    )
+                if partial:
+                    subtitle += " · PARTIAL RUN"
+                ax.text(1.0, 1.015, subtitle, transform=ax.transAxes, fontsize=9,
+                        color="#555b66", ha="right")
+                formatter = ScalarFormatter(useMathText=True)
+                formatter.set_scientific(True)
+                formatter.set_powerlimits((-4, 4))
+                formatter.set_useOffset(False)
+                ax.yaxis.set_major_formatter(formatter)
+                ax.legend(frameon=False)
+                fig.tight_layout()
+                png_path = run_dir / relative_base.with_suffix(".png")
+                pdf_path = run_dir / relative_base.with_suffix(".pdf")
+                _save_figure_exclusive(fig, png_path, dpi=170, bbox_inches="tight")
+                _save_figure_exclusive(fig, pdf_path, bbox_inches="tight")
+                plt.close(fig)
+                plot_records.append({
+                    "strategy": strategy, "observable": spec.key, "title": display_title,
+                    "channel": spec.channel, "stage": stage, "kind": "yield",
+                    "luminosity_fb": luminosity,
+                    "png": png_path.relative_to(run_dir).as_posix(),
+                    "pdf": pdf_path.relative_to(run_dir).as_posix(),
+                })
+
+            relative_base = Path("plots") / strategy / "shapes" / spec.channel / stage / spec.key
+            for extension in ("png", "pdf"):
+                candidate_path = str(relative_base.with_suffix(f".{extension}"))
+                if candidate_path in planned_paths:
+                    raise RuntimeError(f"Duplicate planned plot path: {candidate_path}")
+                planned_paths.add(candidate_path)
+            fig, ax = plt.subplots()
+            for result in channel_results:
+                histogram = result.histograms[spec.key]
+                integral = histogram.integral
+                if integral == 0.0:
+                    continue
+                values = histogram.sumw / integral
+                errors = np.sqrt(np.maximum(histogram.sumw2, 0.0)) / abs(integral)
+                centers = 0.5 * (histogram.edges[:-1] + histogram.edges[1:])
+                ax.stairs(values, histogram.edges, color=result.spec.color, linewidth=1.8,
+                           label=result.spec.label)
+                ax.errorbar(centers, values, yerr=errors, fmt="none", color=result.spec.color,
+                            linewidth=0.8, capsize=1.2)
+            ax.set_xlim(spec.edges[0], spec.edges[-1])
+            ax.set_xlabel(spec.xlabel)
+            ax.set_ylabel("Fraction / bin")
+            ax.set_title(display_title, loc="left", pad=34, fontweight="semibold")
+            ax.text(1.0, 1.015, "Particle level · unit-area process comparison",
+                    transform=ax.transAxes, fontsize=9, color="#555b66", ha="right")
+            ax.legend(frameon=False)
+            fig.tight_layout()
+            png_path = run_dir / relative_base.with_suffix(".png")
+            pdf_path = run_dir / relative_base.with_suffix(".pdf")
+            _save_figure_exclusive(fig, png_path, dpi=170, bbox_inches="tight")
+            _save_figure_exclusive(fig, pdf_path, bbox_inches="tight")
+            plt.close(fig)
+            plot_records.append({
+                "strategy": strategy, "observable": spec.key, "title": display_title,
+                "channel": spec.channel, "stage": stage, "kind": "shape",
+                "luminosity_fb": None,
+                "png": png_path.relative_to(run_dir).as_posix(),
+                "pdf": pdf_path.relative_to(run_dir).as_posix(),
+            })
+    return plot_records
+
+
+def generate_ri_plots(
+    run_dir: Path,
+    results: Sequence[SampleResult],
+    luminosities: Sequence[float],
+    partial: bool,
+) -> List[Dict[str, Any]]:
+    import matplotlib.pyplot as plt
+
+    records: List[Dict[str, Any]] = []
+    centers = 0.5 * (PULL_BIN_EDGES[:-1] + PULL_BIN_EDGES[1:])
+    for strategy in ANALYSIS_STRATEGIES:
+        if not any(result.strategy == strategy for result in results):
+            continue
+        for channel in ("higgs", "z"):
+            channel_results = sorted(
+                (
+                    result for result in results
+                    if result.strategy == strategy and result.spec.channel == channel
+                ),
+                key=lambda result: result.spec.stack_order,
+            )
+            if not channel_results:
+                continue
+            title_suffix = "cuts" if strategy == "cutbased" else "XGBoost"
+            relative_base = (
+                Path("plots") / strategy / "shapes" / channel / "ri" / "ri_processes"
+            )
+            fig, ax = plt.subplots()
+            for result in channel_results:
+                scale_pb = result.spec.cross_section_pb / result.generated_sumw
+                statistics = differential_pull_statistics(
+                    scale_pb * result.pull_bin_sumw,
+                    scale_pb * result.pull_event_second_sumw,
+                    scale_pb * scale_pb * result.pull_mc_second_sumw2,
+                    luminosities,
+                )
+                if statistics["R"] is None:
+                    continue
+                fractions = np.asarray(statistics["R"])
+                errors = np.asarray(statistics["mc_statistical_errors"])
+                ax.errorbar(
+                    centers, fractions, yerr=errors, marker="o", markersize=3.8,
+                    linewidth=1.4, capsize=2.0, color=result.spec.color,
+                    label=result.spec.label,
+                )
+            ax.axvline(0.5 * math.pi, color="#657086", linestyle="--", linewidth=1.0)
+            ax.set_xlim(0.0, math.pi)
+            ax.set_xlabel(r"Folded signed pull angle $|\theta_{\mathrm{signed}}|$ [rad]")
+            ax.set_ylabel(r"$R_i$")
+            ax.set_title(f"Differential pull fractions · {title_suffix}", loc="left", pad=34,
+                         fontweight="semibold")
+            ax.text(1.0, 1.015, "Process comparison · MC errors", transform=ax.transAxes,
+                    fontsize=9, color="#555b66", ha="right")
+            ax.legend(frameon=False)
+            fig.tight_layout()
+            png_path = run_dir / relative_base.with_suffix(".png")
+            pdf_path = run_dir / relative_base.with_suffix(".pdf")
+            _save_figure_exclusive(fig, png_path, dpi=170, bbox_inches="tight")
+            _save_figure_exclusive(fig, pdf_path, bbox_inches="tight")
+            plt.close(fig)
+            records.append({
+                "strategy": strategy, "observable": "R_i", "title": f"Differential R_i · {title_suffix}",
+                "channel": channel, "stage": strategy, "kind": "shape", "luminosity_fb": None,
+                "png": png_path.relative_to(run_dir).as_posix(),
+                "pdf": pdf_path.relative_to(run_dir).as_posix(),
+            })
+
+            total = channel_pull_summary(channel, results, luminosities, strategy)
+            differential = total["differential"]
+            if differential["R"] is None:
+                continue
+            fractions = np.asarray(differential["R"], dtype=np.float64)
+            mc_errors = np.asarray(differential["mc_statistical_errors"], dtype=np.float64)
+            for luminosity in luminosities:
+                key = str(float(luminosity))
+                statistical_errors = np.asarray(
+                    differential["expected_statistical_errors"][key], dtype=np.float64
+                )
+                relative_base = (
+                    Path("plots") / strategy / "yields" / _format_luminosity(luminosity)
+                    / channel / "ri" / "ri_total"
+                )
+                fig, ax = plt.subplots()
+                ax.fill_between(
+                    PULL_BIN_EDGES,
+                    _step_values(fractions - mc_errors),
+                    _step_values(fractions + mc_errors),
+                    step="post", color="#20242b", alpha=0.18, linewidth=0.0,
+                    label="MC statistical uncertainty",
+                )
+                ax.errorbar(
+                    centers, fractions, yerr=statistical_errors, fmt="o", color="#172033",
+                    markersize=4.5, capsize=2.5, linewidth=1.1,
+                    label=rf"Expected statistical uncertainty, {luminosity:g} fb$^{{-1}}$",
+                )
+                ax.stairs(fractions, PULL_BIN_EDGES, color="#275dad", linewidth=1.5,
+                          label="Total prediction")
+                ax.axvline(0.5 * math.pi, color="#657086", linestyle="--", linewidth=1.0)
+                ax.set_xlim(0.0, math.pi)
+                ax.set_xlabel(r"Folded signed pull angle $|\theta_{\mathrm{signed}}|$ [rad]")
+                ax.set_ylabel(r"$R_i$")
+                ax.set_title(f"Total differential pull fractions · {title_suffix}", loc="left",
+                             pad=34, fontweight="semibold")
+                subtitle = "Event-level two-jet covariance"
+                if partial:
+                    subtitle += " · PARTIAL RUN"
+                ax.text(1.0, 1.015, subtitle, transform=ax.transAxes, fontsize=9,
+                        color="#555b66", ha="right")
+                ax.legend(frameon=False)
+                fig.tight_layout()
+                png_path = run_dir / relative_base.with_suffix(".png")
+                pdf_path = run_dir / relative_base.with_suffix(".pdf")
+                _save_figure_exclusive(fig, png_path, dpi=170, bbox_inches="tight")
+                _save_figure_exclusive(fig, pdf_path, bbox_inches="tight")
+                plt.close(fig)
+                records.append({
+                    "strategy": strategy, "observable": "R_i", "title": f"Total differential R_i · {title_suffix}",
+                    "channel": channel, "stage": strategy, "kind": "differential",
+                    "luminosity_fb": luminosity,
+                    "png": png_path.relative_to(run_dir).as_posix(),
+                    "pdf": pdf_path.relative_to(run_dir).as_posix(),
+                })
+    return records
+
+
+def write_ri_artifacts(
+    run_dir: Path,
+    results: Sequence[SampleResult],
+    luminosities: Sequence[float],
+) -> Tuple[Path, Path]:
+    csv_path = run_dir / "summaries" / "ri.csv"
+    npz_path = run_dir / "summaries" / "ri_covariances.npz"
+    rows: List[Dict[str, Any]] = []
+    arrays: Dict[str, np.ndarray] = {}
+    for strategy in ANALYSIS_STRATEGIES:
+        strategy_results = [result for result in results if result.strategy == strategy]
+        if not strategy_results:
+            continue
+        for channel in ("higgs", "z"):
+            scopes: List[Tuple[str, str, Dict[str, Any]]] = []
+            total = channel_pull_summary(channel, results, luminosities, strategy)["differential"]
+            scopes.append(("total", "total", total))
+            for result in strategy_results:
+                if result.spec.channel != channel:
+                    continue
+                scale_pb = result.spec.cross_section_pb / result.generated_sumw
+                scopes.append(("process", result.spec.name, differential_pull_statistics(
+                    scale_pb * result.pull_bin_sumw,
+                    scale_pb * result.pull_event_second_sumw,
+                    scale_pb * scale_pb * result.pull_mc_second_sumw2,
+                    luminosities,
+                )))
+            for scope, name, statistics in scopes:
+                if statistics["R"] is None:
+                    continue
+                prefix = f"{strategy}__{channel}__{scope}__{name}"
+                arrays[f"{prefix}__mc_covariance"] = np.asarray(
+                    statistics["mc_statistical_covariance"], dtype=np.float64
+                )
+                for luminosity in luminosities:
+                    arrays[f"{prefix}__expected_covariance__{_format_luminosity(luminosity)}"] = np.asarray(
+                        statistics["expected_statistical_covariance"][str(float(luminosity))],
+                        dtype=np.float64,
+                    )
+                for index, fraction in enumerate(statistics["R"]):
+                    row: Dict[str, Any] = {
+                        "strategy": strategy, "channel": channel, "scope": scope,
+                        "sample": name, "bin": index + 1,
+                        "low_edge": statistics["bin_edges"][index],
+                        "high_edge": statistics["bin_edges"][index + 1],
+                        "R_i": fraction,
+                        "mc_statistical_error": statistics["mc_statistical_errors"][index],
+                        "f_beam": statistics["f_beam"],
+                    }
+                    for luminosity in luminosities:
+                        row[f"statistical_error_{_format_luminosity(luminosity)}"] = (
+                            statistics["expected_statistical_errors"][str(float(luminosity))][index]
+                        )
+                    rows.append(row)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        raise RuntimeError("No differential R_i rows were produced")
+    with csv_path.open("x", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    with npz_path.open("xb") as stream:
+        np.savez_compressed(stream, **arrays)
+    return csv_path, npz_path
+
+
+def generate_xgboost_diagnostic_plots(
+    run_dir: Path,
+    diagnostics: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    import matplotlib.pyplot as plt
+
+    records: List[Dict[str, Any]] = []
+    for channel, payload in diagnostics.items():
+        base = Path("plots") / "xgboost" / "diagnostics" / channel
+
+        fig, ax = plt.subplots()
+        ax.plot(
+            payload["roc_fpr"],
+            payload["roc_tpr"],
+            color="#275dad",
+            linewidth=2.0,
+            label=f"{payload.get('roc_label', 'Physics application')} AUC = {payload['auc']:.4f}",
+        )
+        ax.plot((0.0, 1.0), (0.0, 1.0), color="#8a93a3", linestyle="--", linewidth=1.0)
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(0.0, 1.0)
+        ax.set_xlabel("Background efficiency")
+        ax.set_ylabel("Signal efficiency")
+        ax.set_title(f"{channel.capitalize()} XGBoost ROC", loc="left", fontweight="semibold")
+        ax.legend(frameon=False, loc="lower right")
+        fig.tight_layout()
+        roc_png = run_dir / base / "roc.png"
+        roc_pdf = run_dir / base / "roc.pdf"
+        _save_figure_exclusive(fig, roc_png, dpi=170, bbox_inches="tight")
+        _save_figure_exclusive(fig, roc_pdf, bbox_inches="tight")
+        plt.close(fig)
+        records.append({
+            "strategy": "xgboost", "observable": "xgboost_roc",
+            "title": f"{channel.capitalize()} XGBoost ROC", "channel": channel,
+            "stage": "diagnostic", "kind": "diagnostic", "luminosity_fb": None,
+            "png": roc_png.relative_to(run_dir).as_posix(),
+            "pdf": roc_pdf.relative_to(run_dir).as_posix(),
+        })
+
+        split_payloads = [
+            (name, values) for name, values in payload["splits"].items()
+            if len(values["scores"])
+        ]
+        fig, axes = plt.subplots(1, len(split_payloads), figsize=(5.2 * len(split_payloads), 4.6),
+                                 squeeze=False)
+        score_edges = np.linspace(0.0, 1.0, 41)
+        for axis, (split_name, values) in zip(axes[0], split_payloads):
+            for label, color, name in ((0, "#4E79A7", "Background"), (1, "#59A14F", "Signal")):
+                mask = values["labels"] == label
+                weights = values["weights"][mask]
+                total = float(np.sum(weights, dtype=np.float64))
+                normalized = weights / total if total > 0.0 else weights
+                axis.hist(values["scores"][mask], bins=score_edges, weights=normalized,
+                          histtype="step", linewidth=1.7, color=color, label=name)
+            thresholds = [float(value) for value in payload.get("thresholds", ())]
+            for threshold_index, threshold in enumerate(thresholds):
+                axis.axvline(
+                    threshold,
+                    color="#b64a3a",
+                    linestyle="--",
+                    linewidth=0.9,
+                    alpha=0.45,
+                    label="Frozen fold cuts" if threshold_index == 0 else None,
+                )
+            axis.set_xlim(0.0, 1.0)
+            axis.set_xlabel("XGBoost signal score")
+            axis.set_ylabel("Weighted fraction / bin")
+            axis.set_title(split_name.capitalize())
+            axis.legend(frameon=False)
+        fig.suptitle(f"{channel.capitalize()} classifier-score distributions", fontweight="semibold")
+        fig.tight_layout()
+        score_png = run_dir / base / "score_distributions.png"
+        score_pdf = run_dir / base / "score_distributions.pdf"
+        _save_figure_exclusive(fig, score_png, dpi=170, bbox_inches="tight")
+        _save_figure_exclusive(fig, score_pdf, bbox_inches="tight")
+        plt.close(fig)
+        records.append({
+            "strategy": "xgboost", "observable": "xgboost_score",
+            "title": f"{channel.capitalize()} score distributions", "channel": channel,
+            "stage": "diagnostic", "kind": "diagnostic", "luminosity_fb": None,
+            "png": score_png.relative_to(run_dir).as_posix(),
+            "pdf": score_pdf.relative_to(run_dir).as_posix(),
+        })
+
+        names = list(xgbtools.FEATURE_NAMES)
+        values = np.asarray([payload["feature_importance"].get(name, 0.0) for name in names])
+        order = np.argsort(values)
+        fig, ax = plt.subplots()
+        ax.barh(np.asarray(names)[order], values[order], color="#275dad")
+        ax.set_xlabel("XGBoost gain")
+        ax.set_title(f"{channel.capitalize()} feature importance", loc="left",
+                     fontweight="semibold")
+        fig.tight_layout()
+        importance_png = run_dir / base / "feature_importance.png"
+        importance_pdf = run_dir / base / "feature_importance.pdf"
+        _save_figure_exclusive(fig, importance_png, dpi=170, bbox_inches="tight")
+        _save_figure_exclusive(fig, importance_pdf, bbox_inches="tight")
+        plt.close(fig)
+        records.append({
+            "strategy": "xgboost", "observable": "xgboost_feature_importance",
+            "title": f"{channel.capitalize()} feature importance", "channel": channel,
+            "stage": "diagnostic", "kind": "diagnostic", "luminosity_fb": None,
+            "png": importance_png.relative_to(run_dir).as_posix(),
+            "pdf": importance_pdf.relative_to(run_dir).as_posix(),
+        })
+    return records
+
+
+def _html_cutflow_tables(
+    results: Sequence[SampleResult], luminosities: Sequence[float]
+) -> str:
+    sections: List[str] = []
+    for strategy in ANALYSIS_STRATEGIES:
+        if not any(result.strategy == strategy for result in results):
+            continue
+        for channel in ("higgs", "z"):
+            channel_results = sorted(
+                (
+                    result for result in results
+                    if result.spec.channel == channel and result.strategy == strategy
+                ),
+                key=lambda result: result.spec.stack_order,
+            )
+            for luminosity in luminosities:
+                header = "".join(
+                    f"<th>{html.escape(result.spec.label)}</th>" for result in channel_results
+                )
+                body_rows = []
+                for step in cutflow_steps(channel, strategy):
+                    cells = []
+                    for result in channel_results:
+                        factor = normalization_factor(
+                            luminosity, result.spec.cross_section_pb, result.generated_sumw
+                        )
+                        cells.append(f"<td>{factor * result.cutflow[step].sumw:,.4g}</td>")
+                    body_rows.append(
+                        f"<tr><th>{html.escape(CUT_LABELS[step])}</th>{''.join(cells)}</tr>"
+                    )
+                sections.append(
+                    f"<details><summary>{strategy.capitalize()} · {channel.capitalize()} cutflow · "
+                    f"{luminosity:g} fb<sup>−1</sup></summary>"
+                    f"<div class=\"table-wrap\"><table><thead><tr><th>Selection</th>{header}</tr></thead>"
+                    f"<tbody>{''.join(body_rows)}</tbody></table></div></details>"
+                )
+    return "".join(sections)
+
+
+def generate_run_index(
+    run_dir: Path,
+    run_metadata: Mapping[str, Any],
+    results: Sequence[SampleResult],
+    summaries: Sequence[Mapping[str, Any]],
+    plot_records: Sequence[Mapping[str, Any]],
+    luminosities: Sequence[float],
+    xgboost_metadata: Optional[Mapping[str, Any]] = None,
+) -> Path:
+    cards: List[str] = []
+    for record in plot_records:
+        lumi = "shape" if record["luminosity_fb"] is None else _format_luminosity(float(record["luminosity_fb"]))
+        strategy = str(record.get("strategy", "cutbased"))
+        alt = f"{record['title']} ({record['channel']}, {record['stage']}, {record['kind']})"
+        cards.append(
+            "<article class=\"plot-card\" "
+            f"data-strategy=\"{html.escape(strategy)}\" "
+            f"data-channel=\"{html.escape(str(record['channel']))}\" "
+            f"data-stage=\"{html.escape(str(record['stage']))}\" "
+            f"data-kind=\"{html.escape(str(record['kind']))}\" "
+            f"data-lumi=\"{html.escape(lumi)}\" "
+            f"data-search=\"{html.escape((str(record['title']) + ' ' + str(record['observable'])).lower())}\">"
+            f"<a class=\"thumb-link\" href=\"{html.escape(str(record['png']))}\"><img loading=\"lazy\" src=\"{html.escape(str(record['png']))}\" alt=\"{html.escape(alt)}\"></a>"
+            "<div class=\"plot-copy\">"
+            f"<div class=\"badges\"><span>{html.escape(strategy)}</span><span>{html.escape(str(record['channel']).upper())}</span><span>{html.escape(str(record['stage']))}</span><span>{html.escape(lumi)}</span></div>"
+            f"<h3>{html.escape(str(record['title']))}</h3>"
+            f"<p><a href=\"{html.escape(str(record['png']))}\">PNG</a><a href=\"{html.escape(str(record['pdf']))}\">PDF</a></p>"
+            "</div></article>"
+        )
+    summary_cards: List[str] = []
+    strategies = [name for name in ANALYSIS_STRATEGIES if any(r.strategy == name for r in results)]
+    for strategy in strategies:
+        for channel in ("higgs", "z"):
+            channel_summary = channel_pull_summary(channel, results, luminosities, strategy)
+            if channel_summary["f_beam"] is None:
+                continue
+            fbeam = f"{channel_summary['f_beam']:.5f}"
+            mc_error = f"±{channel_summary['f_beam_mc_statistical_error']:.4g}"
+            stat_rows = "".join(
+                f"<div><dt>{luminosity:g} fb<sup>−1</sup> data stat.</dt>"
+                f"<dd>±{channel_summary['f_beam_statistical_error'][str(float(luminosity))]:.4g}</dd></div>"
+                for luminosity in luminosities
+            )
+            summary_cards.append(
+                "<article class=\"metric total\">"
+                f"<div class=\"badges\"><span>{strategy}</span><span>{channel}</span></div>"
+                f"<h3>Total {channel.capitalize()} prediction</h3><dl>"
+                f"<div><dt>Selected cross section</dt><dd>{channel_summary['selected_cross_section_pb']:.6g} pb</dd></div>"
+                f"<div><dt>f<sub>beam</sub></dt><dd>{fbeam}</dd></div>"
+                f"<div><dt>MC statistical</dt><dd>{mc_error}</dd></div>{stat_rows}"
+                f"<div><dt>ΣR<sub>i</sub></dt><dd>{channel_summary['differential']['sum_R']:.8f}</dd></div>"
+                f"<div><dt>L/R asymmetry</dt><dd>{channel_summary['left_right_asymmetry']:+.4f}</dd></div>"
+                "</dl></article>"
+            )
+    partial_class = "partial" if run_metadata.get("partial") else "full"
+    if run_metadata.get("derived_from_run"):
+        status_label = f"derived {partial_class} run"
+        derivation_html = (
+            "<br><strong>Derived from:</strong> "
+            f"{html.escape(str(run_metadata['derived_from_run']['run_id']))} "
+            "(stored histogram replot; no event reread)"
+        )
     else:
-        ccount = 0    
-    return color_chosen
+        status_label = f"{partial_class} run"
+        derivation_html = ""
+    cutflow_html = _html_cutflow_tables(results, luminosities)
+    cutflow_links = " · ".join(
+        f'<a href="cutflows/{strategy}/{channel}.csv">{strategy} {channel} CSV</a>'
+        for strategy in strategies for channel in ("higgs", "z")
+    )
+    xgb_html = ""
+    if xgboost_metadata:
+        rows = []
+        xgb_scopes = {
+            str(values.get("application_scope", ""))
+            for values in xgboost_metadata.get("channels", {}).values()
+        }
+        for channel, values in xgboost_metadata.get("channels", {}).items():
+            performance = values.get(
+                "out_of_fold", values.get("application", values.get("test", {}))
+            )
+            if values.get("models"):
+                threshold_summary = values["score_threshold_summary"]
+                threshold_text = (
+                    f"{threshold_summary['minimum']:.4g}–{threshold_summary['maximum']:.4g} "
+                    f"(mean {threshold_summary['mean']:.4g})"
+                )
+                model_links = " ".join(
+                    f'<a href="{html.escape(str(model["model_path"]))}">fold {int(model["fold"]) + 1}</a>'
+                    for model in values["models"]
+                )
+            else:
+                threshold_text = f"{values['score_threshold']:.6g}"
+                model_links = f'<a href="{html.escape(values["model_path"])}">model</a>'
+            rows.append(
+                f"<tr><th>{html.escape(channel.capitalize())}</th>"
+                f"<td>{threshold_text}</td>"
+                f"<td>{values['validation_optimum']['significance']:.5g}</td>"
+                f"<td>{performance['weighted_auc']:.5f}</td>"
+                f"<td>{performance['signal_efficiency']:.5f}</td>"
+                f"<td>{performance['background_efficiency']:.5f}</td>"
+                f"<td>{model_links}</td></tr>"
+            )
+        if xgb_scopes == {"five_fold_out_of_fold_all_events"}:
+            application_description = (
+                "Nominal physics plots use rotating five-fold out-of-fold predictions: every "
+                "event is tested once by a model and threshold that used neither that event nor "
+                "its fold."
+            )
+        elif xgb_scopes == {"five_fold_routed_independent_events"}:
+            application_description = (
+                "Independent events are deterministically routed once through the frozen "
+                "five-model, five-threshold nominal ensemble."
+            )
+        elif xgb_scopes == {"held_out_test_only"}:
+            application_description = (
+                "This legacy nominal run uses only its held-out test subset with inverse weights."
+            )
+        else:
+            application_description = "The complete application scope is recorded in the metadata."
+        xgb_html = (
+            '<section class="panel"><h2>XGBoost models</h2>'
+            '<p>Features: <code>' + html.escape(", ".join(xgboost_metadata["feature_names"])) + '</code>. '
+            + application_description + '</p>'
+            '<div class="table-wrap"><table><thead><tr><th>Channel</th><th>Score cut</th>'
+            '<th>Validation S/√(S+B)</th><th>Physics AUC</th><th>Signal eff.</th><th>Background eff.</th><th>Artifacts</th>'
+            '</tr></thead><tbody>' + "".join(rows) + '</tbody></table></div>'
+            '<p><a href="summaries/xgboost.json">Complete XGBoost metadata</a></p></section>'
+        )
+    document = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PullPheno · {html.escape(str(run_metadata['run_id']))}</title>
+<style>
+:root{{--ink:#172033;--muted:#657086;--line:#dce2eb;--paper:#fff;--wash:#f3f6fa;--accent:#275dad;--accent2:#0d8274}}
+*{{box-sizing:border-box}} body{{margin:0;background:var(--wash);color:var(--ink);font:15px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}
+a{{color:var(--accent);text-decoration:none}} a:hover,a:focus-visible{{text-decoration:underline}} header{{background:linear-gradient(125deg,#12213c,#244b78 62%,#11776d);color:white;padding:3.2rem max(1.2rem,calc((100vw - 1280px)/2)) 2.8rem}}
+header p{{max-width:70rem;color:#dce9f8}} .eyebrow{{font-size:.76rem;letter-spacing:.12em;text-transform:uppercase;font-weight:750}} h1{{font-size:clamp(2rem,5vw,4rem);line-height:1.04;margin:.35rem 0}} main{{max-width:1320px;margin:auto;padding:1.5rem}}
+.status{{display:inline-flex;border:1px solid #ffffff55;border-radius:999px;padding:.3rem .7rem;font-weight:700;text-transform:uppercase;font-size:.72rem}} .status.partial{{background:#9b5d08}} .status.full{{background:#087568}}
+.metrics{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:1rem;margin:1.5rem 0}} .metric,.panel,.plot-card{{background:var(--paper);border:1px solid var(--line);border-radius:14px;box-shadow:0 5px 18px #2435510c}}
+.metric{{padding:1rem}} .metric h3{{margin:.1rem 0 .8rem}} dl{{margin:0}} dl div{{display:flex;justify-content:space-between;gap:1rem;border-top:1px solid var(--line);padding:.38rem 0}} dt{{color:var(--muted)}} dd{{font-variant-numeric:tabular-nums;margin:0;font-weight:700}}
+.panel{{padding:1rem;margin:1rem 0}} details{{border-top:1px solid var(--line);padding:.75rem 0}} summary{{cursor:pointer;font-weight:750}} .table-wrap{{overflow:auto;margin-top:.7rem}} table{{border-collapse:collapse;width:100%;font-size:.86rem}} th,td{{border-bottom:1px solid var(--line);padding:.48rem .6rem;text-align:right;white-space:nowrap}} th:first-child{{text-align:left;position:sticky;left:0;background:white}}
+.controls{{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:.7rem;position:sticky;top:0;background:#f3f6faed;backdrop-filter:blur(8px);padding:.9rem 0;z-index:2}} label{{font-size:.78rem;color:var(--muted);font-weight:700}} select,input{{display:block;width:100%;margin-top:.2rem;border:1px solid #bfc8d5;border-radius:8px;background:white;padding:.55rem;color:var(--ink)}}
+.gallery{{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:1rem}} .plot-card{{overflow:hidden}} .plot-card[hidden]{{display:none}} .thumb-link{{display:block;background:#e9edf3;aspect-ratio:1.38;overflow:hidden}} .thumb-link img{{width:100%;height:100%;object-fit:contain;background:white;transition:transform .18s ease}} .thumb-link:hover img{{transform:scale(1.012)}} .plot-copy{{padding:.9rem}} .plot-copy h3{{margin:.5rem 0 .25rem;font-size:1rem}} .plot-copy p{{margin:0;display:flex;gap:1rem}} .badges{{display:flex;gap:.35rem;flex-wrap:wrap}} .badges span{{font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;border-radius:999px;background:#e7eef8;color:#274b79;padding:.18rem .45rem;font-weight:750}} #empty{{padding:2rem;text-align:center;color:var(--muted)}} footer{{padding:2.5rem 1.5rem;text-align:center;color:var(--muted)}}
+@media(max-width:760px){{.controls{{grid-template-columns:1fr 1fr;position:static}}.controls label:last-child{{grid-column:1/-1}}}}
+@media print{{header{{background:white;color:black;padding:1rem}}.controls{{display:none}}.plot-card{{break-inside:avoid}}body{{background:white}}}}
+</style>
+</head>
+<body>
+<header><div class="eyebrow">PullPheno particle-level analysis</div><h1>Signed pull-angle results</h1>
+<span class="status {partial_class}">{status_label}</span>
+<p><strong>Run:</strong> {html.escape(str(run_metadata['run_id']))}<br><strong>Completed:</strong> {html.escape(str(run_metadata['completed_utc']))}{derivation_html}<br><strong>Configuration:</strong> anti-kT R=0.4, leading-pT tagging jets; cut-based and XGBoost branches share the common selection.</p></header>
+<main>
+<section><h2>Numerical summary</h2><div class="metrics">{''.join(summary_cards)}</div>
+<p class="method-note"><strong>Uncertainties:</strong> both projected-data and current-MC errors use event-level six-bin covariance matrices, retaining the correlation between the two tagging jets. The MC term does not decrease with displayed luminosity.
+<strong>Zero-|t| jets:</strong> raw tagging jets whose pull-vector magnitude is exactly zero. Their angle is undefined, so this analysis maps it to zero and reports the count explicitly.</p></section>
+{xgb_html}
+<section class="panel"><h2>Cutflows and data</h2>{cutflow_html}<p>{cutflow_links} · <a href="summaries/analysis.json">Complete JSON summary</a> · <a href="summaries/histograms.npz">Histogram arrays</a> · <a href="summaries/ri.csv">R<sub>i</sub> CSV</a> · <a href="summaries/ri_covariances.npz">R<sub>i</sub> covariances</a></p></section>
+<section><h2>Plot gallery</h2><div class="controls">
+<label>Analysis<select id="strategy"><option value="all">All</option>{''.join(f'<option value="{name}">{name}</option>' for name in strategies)}</select></label>
+<label>Channel<select id="channel"><option value="all">All</option><option value="higgs">Higgs</option><option value="z">Z</option></select></label>
+<label>Stage<select id="stage"><option value="all">All</option><option value="common">Common</option><option value="vbf">VBF cuts</option><option value="xgboost">XGBoost</option><option value="diagnostic">Diagnostic</option><option value="cutbased">Cut based</option></select></label>
+<label>Kind<select id="kind"><option value="all">All</option><option value="yield">Expected yields</option><option value="shape">Unit-area shapes</option><option value="differential">Differential Rᵢ</option><option value="diagnostic">Diagnostics</option></select></label>
+<label>Luminosity<select id="lumi"><option value="all">All</option>{''.join(f'<option value="{_format_luminosity(value)}">{value:g} fb⁻¹</option>' for value in luminosities)}<option value="shape">Shapes</option></select></label>
+<label>Search<input id="search" type="search" placeholder="mjj, pull, photon…"></label>
+</div><div class="gallery">{''.join(cards)}</div><p id="empty" hidden>No plots match these filters.</p></section>
+</main><footer>Self-contained PullPheno result bundle · existing run artifacts are immutable.</footer>
+<script>
+const controls=["strategy","channel","stage","kind","lumi"].map(id=>document.getElementById(id));const search=document.getElementById("search");const cards=[...document.querySelectorAll(".plot-card")];const empty=document.getElementById("empty");function applyFilters(){{const values=Object.fromEntries(controls.map(el=>[el.id,el.value]));const query=search.value.trim().toLowerCase();let shown=0;for(const card of cards){{const match=(values.strategy==="all"||card.dataset.strategy===values.strategy)&&(values.channel==="all"||card.dataset.channel===values.channel)&&(values.stage==="all"||card.dataset.stage===values.stage)&&(values.kind==="all"||card.dataset.kind===values.kind)&&(values.lumi==="all"||card.dataset.lumi===values.lumi)&&(!query||card.dataset.search.includes(query));card.hidden=!match;if(match)shown++;}}empty.hidden=shown!==0;}}controls.forEach(el=>el.addEventListener("change",applyFilters));search.addEventListener("input",applyFilters);
+</script></body></html>
+"""
+    destination = run_dir / "index.html"
+    write_text_exclusive(destination, document)
+    return destination
 
-# do not increment colour in this case:
-def same_color():
-    global ccount
-    colors = ['green', 'orange', 'red', 'blue', 'black', 'cyan', 'magenta', 'brown', 'violet'] # 9 colours
-    color_chosen = colors[ccount-1]
-    return color_chosen
 
-# reset the color counter:
-def reset_color():
-    global ccount
-    ccount = 0
+class _LinkCollector(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.links: List[str] = []
 
-# get momentum of ith particle in format
-# E, px, py, pz, id
-def ith_momentum(obj, ith):
-    if newroot is True:
-        return (obj[0][ith],obj[1][ith],obj[2][ith],obj[3][ith],int(obj[4][ith]))
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        attribute_name = "src" if tag in ("img", "script") else "href"
+        for key, value in attrs:
+            if key == attribute_name and value:
+                self.links.append(value)
+
+
+def validate_html_links(index_path: Path) -> None:
+    parser = _LinkCollector()
+    parser.feed(index_path.read_text(encoding="utf-8"))
+    missing = []
+    for link in parser.links:
+        if link.startswith(("#", "http://", "https://", "mailto:", "javascript:")):
+            continue
+        target = (index_path.parent / link.split("#", 1)[0]).resolve()
+        if not target.exists():
+            missing.append(link)
+    if missing:
+        raise RuntimeError(f"HTML index contains missing relative links: {missing}")
+
+
+def _top_level_document(runs: Sequence[Mapping[str, Any]]) -> str:
+    cards = []
+    for run in runs:
+        badge = "partial" if run.get("partial") else "full"
+        badge_label = f"derived {badge}" if run.get("derived_from_run") else badge
+        name = html.escape(str(run.get("run_name") or "unnamed"))
+        cards.append(
+            "<article>"
+            f"<div><span class=\"badge {badge}\">{badge_label}</span><span class=\"name\">{name}</span></div>"
+            f"<h2><a href=\"runs/{html.escape(str(run['run_id']))}/index.html\">{html.escape(str(run['run_id']))}</a></h2>"
+            f"<p>Completed {html.escape(str(run.get('completed_utc', 'unknown')))} · {len(run.get('samples', []))} samples · "
+            f"{html.escape(', '.join(run.get('analyses', ['cutbased'])))}</p>"
+            f"<p><a href=\"runs/{html.escape(str(run['run_id']))}/index.html\">Open plots and cutflows →</a></p>"
+            "</article>"
+        )
+    if not cards:
+        cards.append("<article><h2>No completed runs yet</h2><p>Incomplete runs are intentionally omitted.</p></article>")
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PullPheno result runs</title><style>
+:root{{--ink:#172033;--muted:#657086;--line:#dce2eb;--paper:#fff;--wash:#f3f6fa;--accent:#275dad}}*{{box-sizing:border-box}}body{{margin:0;background:var(--wash);color:var(--ink);font:15px/1.5 Inter,system-ui,sans-serif}}header{{padding:3rem max(1rem,calc((100vw - 1100px)/2));background:#142844;color:white}}main{{max-width:1130px;margin:auto;padding:1.5rem;display:grid;gap:1rem}}article{{background:white;border:1px solid var(--line);border-radius:14px;padding:1.2rem;box-shadow:0 5px 18px #2435510c}}h1{{font-size:clamp(2rem,5vw,3.8rem);margin:.2rem 0}}h2{{font-size:1.05rem;overflow-wrap:anywhere}}a{{color:var(--accent);text-decoration:none}}a:hover,a:focus-visible{{text-decoration:underline}}.badge{{font-size:.7rem;text-transform:uppercase;font-weight:800;border-radius:999px;padding:.2rem .5rem;background:#087568;color:white}}.badge.partial{{background:#9b5d08}}.name{{margin-left:.5rem;color:var(--muted);font-weight:700}}p{{color:var(--muted)}}
+</style></head><body><header><div>PullPheno</div><h1>Versioned analysis runs</h1><p>Completed runs are immutable and listed newest first.</p></header><main>{''.join(cards)}</main></body></html>"""
+
+
+def update_top_level_catalog(output_root: Path) -> Tuple[Path, Path]:
+    runs_root = output_root / "runs"
+    runs: List[Dict[str, Any]] = []
+    if runs_root.exists():
+        for child in runs_root.iterdir():
+            if not child.is_dir() or child.name.startswith("."):
+                continue
+            metadata_path = child / "run.json"
+            index_path = child / "index.html"
+            if not metadata_path.is_file() or not index_path.is_file():
+                continue
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if metadata.get("status") != "complete":
+                continue
+            runs.append(metadata)
+    runs.sort(key=lambda item: str(item.get("completed_utc", "")), reverse=True)
+    runs_json = output_root / "runs.json"
+    top_index = output_root / "index.html"
+    atomic_write_text(runs_json, json.dumps(runs, indent=2, sort_keys=True, allow_nan=False) + "\n")
+    atomic_write_text(top_index, _top_level_document(runs))
+    validate_html_links(top_index)
+    return top_index, runs_json
+
+
+def validate_results(results: Sequence[SampleResult], partial: bool) -> Dict[str, Any]:
+    checks: List[Dict[str, Any]] = []
+    failures = []
+    for result in results:
+        steps = cutflow_steps(result.spec.channel, result.strategy)
+        cut_values = [result.cutflow[step].sumw for step in steps]
+        positive_weights = all(stat.sumw2 >= 0.0 for stat in result.cutflow.values())
+        if result.strategy == "xgboost":
+            monotonic = (
+                all(first + 1.0e-9 >= second for first, second in zip(cut_values[:-2], cut_values[1:-2]))
+                and cut_values[-2] + 1.0e-9 >= cut_values[-1]
+            )
+        else:
+            monotonic = all(
+                first + 1.0e-9 >= second for first, second in zip(cut_values, cut_values[1:])
+            )
+        finite = all(
+            np.all(np.isfinite(hist.sumw)) and np.all(np.isfinite(hist.sumw2))
+            for hist in result.histograms.values()
+        )
+        selected = result.cutflow[steps[-1]].sumw
+        pull_integral = result.histograms["signed_pull_angle"].integral
+        folded_pull_integral = result.histograms["folded_pull_angle"].integral
+        integral_match = math.isclose(selected, pull_integral, rel_tol=1.0e-10, abs_tol=1.0e-10)
+        folded_integral_match = math.isclose(
+            selected, folded_pull_integral, rel_tol=1.0e-10, abs_tol=1.0e-10
+        )
+        bin_integral_match = math.isclose(
+            selected,
+            float(np.sum(result.pull_bin_sumw, dtype=np.float64)),
+            rel_tol=1.0e-10,
+            abs_tol=1.0e-10,
+        )
+        differential = differential_pull_statistics(
+            result.pull_bin_sumw,
+            result.pull_event_second_sumw,
+            result.pull_mc_second_sumw2,
+            (300.0,),
+        )
+        ri_closure = differential["R"] is None or (
+            math.isclose(differential["sum_R"], 1.0, rel_tol=0.0, abs_tol=1.0e-12)
+            and math.isclose(
+                differential["f_beam"],
+                float(np.sum(np.asarray(differential["R"])[:3])),
+                rel_tol=0.0,
+                abs_tol=1.0e-12,
+            )
+        )
+        covariance_valid = True
+        if differential["R"] is not None:
+            covariances = [np.asarray(differential["mc_statistical_covariance"])]
+            covariances.extend(
+                np.asarray(value)
+                for value in differential["expected_statistical_covariance"].values()
+            )
+            covariance_valid = all(
+                np.all(np.isfinite(covariance))
+                and np.allclose(covariance, covariance.T, rtol=0.0, atol=1.0e-12)
+                and np.allclose(np.sum(covariance, axis=1), 0.0, rtol=0.0, atol=1.0e-10)
+                and float(np.min(np.linalg.eigvalsh(covariance))) >= -1.0e-10
+                for covariance in covariances
+            )
+        generated_match = partial or math.isclose(result.processed_sumw, result.generated_sumw, rel_tol=1.0e-10, abs_tol=1.0e-8)
+        full_xgboost_application = True
+        if result.strategy == "xgboost" and result.application_scope in {
+            "five_fold_out_of_fold_all_events",
+            "five_fold_routed_independent_events",
+            "legacy_single_model_independent_events",
+            "all_independent_events",
+        }:
+            common = result.cutflow["opposite_hemispheres"]
+            application = result.cutflow["xgboost_application_sample"]
+            full_xgboost_application = (
+                common.raw_count == application.raw_count
+                and math.isclose(common.sumw, application.sumw, rel_tol=1.0e-12, abs_tol=1.0e-10)
+                and math.isclose(common.sumw2, application.sumw2, rel_tol=1.0e-12, abs_tol=1.0e-10)
+            )
+        item = {
+            "sample": result.spec.name,
+            "strategy": result.strategy,
+            "no_invalid_events": result.invalid_events == 0,
+            "monotonic_cutflow": monotonic,
+            "finite_histograms": finite,
+            "pull_integral_matches_selected": integral_match,
+            "folded_pull_integral_matches_selected": folded_integral_match,
+            "ri_integral_matches_selected": bin_integral_match,
+            "ri_and_fbeam_closure": ri_closure,
+            "covariances_valid": covariance_valid,
+            "processed_sumw_matches_generated": generated_match,
+            "nonnegative_sumw2": positive_weights,
+            "xgboost_application_uses_all_common_events": full_xgboost_application,
+        }
+        checks.append(item)
+        if not all(value for key, value in item.items() if key not in ("sample", "strategy")):
+            failures.append(item)
+    if failures:
+        raise RuntimeError(f"Analysis validation failed: {failures}")
+    return {"status": "passed", "checks": checks}
+
+
+def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--samples", type=Path, help="JSON sample manifest")
+    source.add_argument(
+        "--from-run",
+        type=Path,
+        help="Completed run to replot from stored histograms without rereading ROOT events",
+    )
+    parser.add_argument("--output-root", type=Path, default=Path("results"), help="Root directory containing immutable runs")
+    parser.add_argument("--run-name", help="Optional human-readable label included in the unique run ID")
+    parser.add_argument(
+        "--analyses",
+        nargs="+",
+        choices=ANALYSIS_STRATEGIES,
+        default=("cutbased",),
+        help="Analysis branches to produce in one immutable run (default: cutbased)",
+    )
+    parser.add_argument(
+        "--xgb-model-run",
+        type=Path,
+        help="Completed nominal run supplying frozen XGBoost models and thresholds",
+    )
+    parser.add_argument("--max-events", type=int, help="Maximum events per sample (marks the run as partial)")
+    parser.add_argument("--luminosities", type=float, nargs="+", help="Override manifest luminosities in fb^-1")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Samples to process concurrently; each worker opens its own ROOT file (default: 1)",
+    )
+    parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
+    args = parser.parse_args(argv)
+    if args.max_events is not None and args.max_events <= 0:
+        parser.error("--max-events must be positive")
+    if args.from_run is not None and args.max_events is not None:
+        parser.error("--max-events cannot be combined with --from-run")
+    if len(set(args.analyses)) != len(args.analyses):
+        parser.error("--analyses contains a duplicate strategy")
+    if args.xgb_model_run is not None and "xgboost" not in args.analyses:
+        parser.error("--xgb-model-run requires --analyses to include xgboost")
+    if args.from_run is not None and args.xgb_model_run is not None:
+        parser.error("--xgb-model-run cannot be combined with --from-run")
+    if args.workers <= 0:
+        parser.error("--workers must be positive")
+    return args
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_arguments(argv)
+    logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(message)s")
+    started = datetime.now(timezone.utc)
+    source_metadata: Optional[Dict[str, Any]] = None
+    preloaded_results: Optional[List[SampleResult]] = None
+    xgboost_metadata: Optional[Dict[str, Any]] = None
+    xgboost_diagnostics: Dict[str, Any] = {}
+    if args.from_run is not None:
+        config, preloaded_results, source_metadata = load_completed_run(args.from_run, args.luminosities)
+        effective_max_events = source_metadata.get("max_events_per_sample")
+        analyses = tuple(
+            strategy for strategy in ANALYSIS_STRATEGIES
+            if any(result.strategy == strategy for result in preloaded_results)
+        )
+        source_xgb_summary = args.from_run.resolve() / "summaries" / "xgboost.json"
+        if source_xgb_summary.is_file():
+            xgboost_metadata = json.loads(source_xgb_summary.read_text(encoding="utf-8"))
     else:
-        return (obj[0*10000+ith],obj[1*10000+ith],obj[2*10000+ith],obj[3*10000+ith],int(obj[4*10000+ith]))
-
-# get all the momenta given the HwSim object
-def get_momenta(obj, numprtcl):
-    mom = []
-    for i in range(0,numprtcl):
-        mom.append(ith_momentum(obj, i))
-    return np.array(mom, dtype=[('E', 'f8'), ('px', 'f8'), ('py', 'f8'), ('pz', 'f8'), ('id', 'int')])
-
-
-# calculate the transverse momentum from a particle's list (not pseudojet)
-def perp(p):
-    pt = math.sqrt( p[1]**2 + p[2]**2 )
-    return pt
-
-# calculate the rapidity from a particle's list (not pseudojet)
-def rapidity(p):
-    rapd = 0.5 * math.log( (p[0] + p[3]) / (p[0] - p[3]) )
-    return rapd
-
-# calculate the pseudorapidity from a particle's list (not pseudojet)
-def pseudorapidity(p):
-    pt = perp(p)
-    theta = np.arctan(pt/p[3])
-    if theta < 0:
-       theta += np.pi
-    return -np.log(np.tan(theta/2));
-
-# calculate the phi of a particle from list:
-def phi(p):
-    if p[1] == 0 and p[2] == 0:
+        config = read_manifest(args.samples, args.luminosities)
+        effective_max_events = args.max_events
+        analyses = tuple(
+            strategy for strategy in ANALYSIS_STRATEGIES if strategy in args.analyses
+        )
+    if "xgboost" in analyses:
+        for channel in ("higgs", "z"):
+            roles = {sample.role for sample in config.samples if sample.channel == channel}
+            if roles != {"signal", "background"}:
+                raise ValueError(
+                    f"XGBoost channel {channel} requires manifest signal and background roles"
+                )
+    payload = resolved_config_payload(
+        config, effective_max_events, analyses, args.xgb_model_run
+    )
+    if source_metadata is not None:
+        payload["derived_from_run_id"] = source_metadata["run_id"]
+        payload["event_source"] = "stored_histograms"
+    base_run_id = make_run_id(payload, args.run_name, started)
+    reservation = reserve_run_directory(args.output_root, base_run_id)
+    logging.info("Reserved immutable run %s", reservation.run_id)
+    try:
+        if preloaded_results is not None:
+            results = preloaded_results
+            worker_count = 0
+            partial = bool(source_metadata and source_metadata.get("partial"))
+            logging.info("Replotting stored histograms from completed run %s", source_metadata["run_id"])
+            if xgboost_metadata is not None:
+                for values in xgboost_metadata.get("channels", {}).values():
+                    relative_models = (
+                        [Path(str(model["model_path"])) for model in values["models"]]
+                        if values.get("models")
+                        else [Path(str(values["model_path"]))]
+                    )
+                    for relative_model in relative_models:
+                        source_model = args.from_run.resolve() / relative_model
+                        destination_model = reservation.incomplete_dir / relative_model
+                        if not source_model.is_file():
+                            raise FileNotFoundError(
+                                f"Source model artifact is missing: {source_model}"
+                            )
+                        destination_model.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(source_model, destination_model)
+        else:
+            worker_count = min(args.workers, len(config.samples))
+            partial = args.max_events is not None
+            collect_common_events = "xgboost" in analyses
+        if preloaded_results is None and worker_count == 1:
+            ROOT, fastjet = load_runtime()
+            cut_results = [
+                analyze_sample(
+                    ROOT, fastjet, config, spec, args.max_events,
+                    collect_common_events=collect_common_events,
+                )
+                for spec in config.samples
+            ]
+        elif preloaded_results is None:
+            logging.info("Processing %d samples with %d independent workers", len(config.samples), worker_count)
+            context = multiprocessing.get_context("spawn")
+            by_name: Dict[str, SampleResult] = {}
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=context,
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        analyze_sample_worker,
+                        config,
+                        spec,
+                        args.max_events,
+                        args.log_level,
+                        collect_common_events,
+                    ): spec.name
+                    for spec in config.samples
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    name = futures[future]
+                    by_name[name] = future.result()
+                    logging.info("Collected completed sample %s", name)
+            cut_results = [by_name[spec.name] for spec in config.samples]
+        if preloaded_results is None:
+            results = list(cut_results) if "cutbased" in analyses else []
+            if "xgboost" in analyses:
+                xgb_results, xgboost_metadata, xgboost_diagnostics = build_xgboost_results(
+                    cut_results,
+                    reservation.incomplete_dir,
+                    model_run=args.xgb_model_run,
+                )
+                results.extend(xgb_results)
+                for result in cut_results:
+                    result.common_events = None
+        summaries = [result_summary(result, config.luminosities_fb) for result in results]
+        validation = validate_results(results, partial)
+        summary_payload = {
+            "analysis_version": ANALYSIS_VERSION,
+            "partial": partial,
+            "luminosities_fb": list(config.luminosities_fb),
+            "samples": summaries,
+            "channels": {
+                strategy: {
+                    channel: channel_pull_summary(
+                        channel, results, config.luminosities_fb, strategy
+                    )
+                    for channel in ("higgs", "z")
+                }
+                for strategy in analyses
+            },
+            "validation": validation,
+        }
+        if source_metadata is not None:
+            summary_payload["derived_from_run_id"] = source_metadata["run_id"]
+        write_json_exclusive(reservation.incomplete_dir / "summaries" / "analysis.json", summary_payload)
+        if xgboost_metadata is not None:
+            write_json_exclusive(
+                reservation.incomplete_dir / "summaries" / "xgboost.json",
+                xgboost_metadata,
+            )
+        write_histogram_npz(reservation.incomplete_dir, results)
+        write_ri_artifacts(reservation.incomplete_dir, results, config.luminosities_fb)
+        for strategy in analyses:
+            for channel in ("higgs", "z"):
+                write_cutflow_files(
+                    reservation.incomplete_dir,
+                    channel,
+                    results,
+                    config.luminosities_fb,
+                    strategy,
+                )
+        plot_records = generate_plots(reservation.incomplete_dir, results, config.luminosities_fb, partial)
+        plot_records.extend(
+            generate_ri_plots(
+                reservation.incomplete_dir, results, config.luminosities_fb, partial
+            )
+        )
+        if xgboost_diagnostics:
+            plot_records.extend(
+                generate_xgboost_diagnostic_plots(
+                    reservation.incomplete_dir, xgboost_diagnostics
+                )
+            )
+        write_json_exclusive(reservation.incomplete_dir / "summaries" / "plots.json", plot_records)
+        completed = datetime.now(timezone.utc)
+        run_metadata = {
+            "status": "complete",
+            "run_id": reservation.run_id,
+            "run_name": sanitize_run_name(args.run_name),
+            "analysis_version": ANALYSIS_VERSION,
+            "started_utc": started.isoformat(),
+            "completed_utc": completed.isoformat(),
+            "duration_seconds": (completed - started).total_seconds(),
+            "partial": partial,
+            "max_events_per_sample": effective_max_events,
+            "workers": worker_count,
+            "analyses": list(analyses),
+            "configuration_hash": config_digest(payload),
+            "configuration": payload,
+            "git": git_provenance(Path(__file__).resolve().parent),
+            "samples": [
+                {
+                    "name": next(result for result in results if result.spec.name == spec.name).spec.name,
+                    "channel": spec.channel,
+                    "role": spec.role,
+                    "cross_section_pb": spec.cross_section_pb,
+                    "total_entries": next(result for result in results if result.spec.name == spec.name).total_entries,
+                    "processed_entries": next(result for result in results if result.spec.name == spec.name).processed_entries,
+                    "generated_sumw": next(result for result in results if result.spec.name == spec.name).generated_sumw,
+                    "processed_sumw": next(result for result in results if result.spec.name == spec.name).processed_sumw,
+                    "files": next(result for result in results if result.spec.name == spec.name).files,
+                }
+                for spec in config.samples
+            ],
+            "artifacts": {
+                "plots": len(plot_records),
+                "summary": "summaries/analysis.json",
+                "histograms": "summaries/histograms.npz",
+                "ri_csv": "summaries/ri.csv",
+                "ri_covariances": "summaries/ri_covariances.npz",
+                "cutflows": [
+                    f"cutflows/{strategy}/{channel}.csv"
+                    for strategy in analyses for channel in ("higgs", "z")
+                ],
+            },
+            "validation": validation,
+        }
+        if source_metadata is not None:
+            run_metadata["derived_from_run"] = {
+                "run_id": source_metadata["run_id"],
+                "configuration_hash": source_metadata.get("configuration_hash"),
+                "analysis_version": source_metadata.get("analysis_version"),
+            }
+            run_metadata["event_processing"] = "reused_stored_histograms"
+        generate_run_index(
+            reservation.incomplete_dir,
+            run_metadata,
+            results,
+            summaries,
+            plot_records,
+            config.luminosities_fb,
+            xgboost_metadata,
+        )
+        write_json_exclusive(reservation.incomplete_dir / "run.json", run_metadata)
+        validate_html_links(reservation.incomplete_dir / "index.html")
+        reservation.incomplete_dir.rename(reservation.final_dir)
+        update_top_level_catalog(reservation.output_root)
+        logging.info("Completed run: %s", reservation.final_dir)
+        print(reservation.final_dir)
         return 0
-    else:
-        return np.arctan2(p[2],p[1])
+    except Exception:
+        logging.exception("Run failed; partial artifacts remain in %s", reservation.incomplete_dir)
+        return 1
 
 
-# convert a pseudojet to a list
-def convert_to_array(pseudojet):
-    return [pseudojet.e, pseudojet.px, pseudojet.py, pseudojet.pz]
-
-# add four momenta coming from lists
-def add_4momenta(p1, p2):
-    summedvec = []
-    for (item1, item2) in zip(p1, p2):
-        summedvec.append(item1 + item2)
-    return summedvec
-
-# calculate the invariant mass of a particle's list (not pseudojet)
-def invmass(fourvector):
-    return math.sqrt(fourvector[0]**2 - fourvector[1]**2 - fourvector[2]**2 - fourvector[3]**2)
-
-# plot histogram of a single observable contained in DATA given by plotname
-def histogram(DATA, plotname, xlabel, nbins=50):
-    print('---')
-    print('plotting')
-
-    # plot settings ########
-    plot_type = plotname # the name of the plot
-    # the following labels are in LaTeX, but instead of a single slash, two "\\" are required.
-    ylab = 'fraction/bin' # the ylabel
-    xlab = xlabel # the x label
-    # log scale?
-    ylog = False # whether to plot y in log scale
-    xlog = False # whether to plot x in log scale
-
-    # construct the axes for the plot
-    # no need to modify this if you just need one plot
-    gs = gridspec.GridSpec(4, 4)
-    fig = plt.figure()
-    ax = fig.add_subplot(111)
-    ax.grid(False)
-
-    #print('len(DATA)=', len(DATA))
-    bins, edges = np.histogram(np.array(DATA), bins=nbins)
-    #print(bins)
-    errors = np.divide(np.sqrt(bins), bins, out=np.zeros_like(np.sqrt(bins)), where=bins!=0.)
-    #print errors
-    bins = bins/float(len(DATA))
-    errors = bins*errors
-    print(bins)
-    print(errors)
-    left,right = edges[:-1],edges[1:]
-    X = np.array([left,right]).T.flatten()
-    Y = np.array([bins,bins]).T.flatten()
-    #print('X=',X)
-    #print('Y=',Y)
-    plt.plot(X,Y, label='', color='red', lw=1)
-    center = (edges[:-1] + edges[1:]) / 2
-    plt.errorbar(center, bins, yerr=errors, color='red', lw=0, elinewidth=1, capsize=1)
-    
-
-    # set the ticks, labels and limits etc.
-    ax.set_ylabel(ylab, fontsize=20)
-    ax.set_xlabel(xlab, fontsize=20)
-    
-    # choose x and y log scales
-    if ylog:
-        ax.set_yscale('log')
-    else:
-        ax.set_yscale('linear')
-    if xlog:
-        ax.set_xscale('log')
-    else:
-        ax.set_xscale('linear')
-
-    # set the limits on the x and y axes if required below:
-    #xmin = 0.
-    #xmax = 1500.
-    #ymin = 0.
-    #ymax = 0.09
-    #plt.xlim([0,180])
-    #plt.ylim([0.08,0.12])
-
-    # create legend and plot/font size
-    #ax.legend()
-    #ax.legend(loc="upper right", numpoints=1, frameon=False, prop={'size':8})
-
-    # save the figure
-    print('saving the figure')
-    # save the figure in PDF format
-    infile = plot_type + '.dat'
-    print('output in', infile.replace('.dat','.pdf'))
-    plt.savefig(infile.replace('.dat','.pdf'), bbox_inches='tight')
-    plt.close(fig)
-
-
-# plot histogram of a single observable given by plotname: DATA_array contains results from several root files and plot_type defines the plot type
-def histogram_multi(DATA_array, plot_type, plotnames_multi, xlabel, nbins=50, xmin=0, xmax=180, ymin=0.06, ymax=0.15):
-    print('---')
-    print('plotting')
-
-    # plot settings ########
-    # the following labels are in LaTeX, but instead of a single slash, two "\\" are required.
-    ylab = 'fraction/bin' # the ylabel
-    xlab = xlabel # the x label
-    # log scale?
-    ylog = False # whether to plot y in log scale
-    xlog = False # whether to plot x in log scale
-
-    # construct the axes for the plot
-    # no need to modify this if you just need one plot
-    gs = gridspec.GridSpec(4, 4)
-    fig = plt.figure()
-    ax = fig.add_subplot(111)
-    ax.grid(False)
-
-    #print('len(DATA)=', len(DATA))
-    dd = 0
-    for DATA in DATA_array:
-        bins, edges = np.histogram(np.array(DATA), bins=nbins)
-        #print(bins)
-        errors = np.divide(np.sqrt(bins), bins, out=np.zeros_like(np.sqrt(bins)), where=bins!=0.)
-        #print errors
-        bins = bins/float(len(DATA))
-        errors = bins*errors
-        print(bins)
-        print(errors)
-        left,right = edges[:-1],edges[1:]
-        X = np.array([left,right]).T.flatten()
-        Y = np.array([bins,bins]).T.flatten()
-        #print('X=',X)
-        #print('Y=',Y)
-        plt.plot(X,Y, label=plotnames_multi[dd], color=next_color(), lw=1)
-        center = (edges[:-1] + edges[1:]) / 2
-        plt.errorbar(center, bins, yerr=errors, color=same_color(), lw=0, elinewidth=1, capsize=1)
-        dd = dd+1
-    
-
-    # set the ticks, labels and limits etc.
-    ax.set_ylabel(ylab, fontsize=20)
-    ax.set_xlabel(xlab, fontsize=20)
-    
-    # choose x and y log scales
-    if ylog:
-        ax.set_yscale('log')
-    else:
-        ax.set_yscale('linear')
-    if xlog:
-        ax.set_xscale('log')
-    else:
-        ax.set_xscale('linear')
-
-    # set the limits on the x and y axes if required below:
-    #xmin = 0.
-    #xmax = 1500.
-    #ymin = 0.
-    #ymax = 0.09
-    plt.xlim([xmin,xmax])
-    plt.ylim([ymin,ymax])
-
-    # create legend and plot/font size
-    ax.legend()
-    ax.legend(loc="upper right", numpoints=1, frameon=False, prop={'size':8})
-
-    # save the figure
-    print('saving the figure')
-    # save the figure in PDF format
-    infile = plot_type + '.dat'
-    print('output in', infile.replace('.dat','.pdf'))
-    plt.savefig(infile.replace('.dat','.pdf'), bbox_inches='tight')
-    plt.close(fig)
-    reset_color()
-
-# grab the events and their matching weights from the ROOT file
-def get_events(treein, filename, maxevents=1000000):
-    if maxevents > treein.GetEntries():
-        maxevents = treein.GetEntries()
-    print('Getting', maxevents, 'events from', filename)
-    events = []
-    event_weights = []
-    for entryNum in tqdm(range(0,maxevents)):
-        # get the entry from the tree
-        treein.GetEntry(entryNum)
-        event_weights.append(float(getattr(treein, "evweight")))
-        # get the number of particles in the event
-        # and the objects array
-        numevents = getattr(treein,"numparticles")
-        #print(numevents)
-        objects = getattr(treein,"objects")
-        if newroot is True:
-            objects = np.asarray(objects).reshape((8, 10000))        
-        # convert the objects array to the right format
-        momenta = get_momenta(objects, numevents)
-        events.append(momenta)
-    return events, event_weights
-
-# convert to fastjet, but only if the pt is > minptc
-def convert_tofj(momin, minptc, maxrapc):
-    arrayout = []
-    for mm in range(len(momin)):
-        #print(momin[mm][1], momin[mm][2], momin[mm][3], momin[mm][0])
-        fj = fastjet.PseudoJet(momin[mm][1], momin[mm][2], momin[mm][3], momin[mm][0])
-        if fj.perp() > minptc and abs(fj.eta()) < maxrapc:
-            arrayout.append(fj)
-        fj.set_user_index(int(momin[mm][4]))
-    return arrayout
-
-def get_reconstructed(events, filename, jetalgo, jetR, maxevents=100000):
-    if maxevents > len(events):
-        maxevents = len(events)
-    print('Analyzing', maxevents, 'events from', filename)
-    # put the Higgs momenta into an array:
-    higgs = []
-    # return the cluster:
-    clusters_jets = []
-    # return the unclustered objects:
-    electrons_reco = []
-    positrons_reco = []
-    muons_reco = []
-    antimuons_reco = []
-    photons_reco = []
-    # jet algorithm
-    jetdef = fastjet.JetDefinition(jetalgo, jetR)
-    # loop over events and analyze:
-    for yy in tqdm(range(0,maxevents)):
-        # put the momenta for clustering into array:
-        momtocluster = []
-        # and the rest into other arrays:
-        electrons = []
-        positrons = []
-        muons = []
-        antimuons = []
-        photons = []
-        # all the momenta from this event
-        momenta = events[yy]
-        #print(momenta)jcEtaMax
-        for mm in range(0,len(momenta)):
-            pt = perp(momenta[mm])
-            eta = pseudorapidity(momenta[mm])
-            ph = phi(momenta[mm])
-            #print(pt, eta, ph)
-            if abs(momenta[mm][4]) == 11 and pt > electronPtMin and abs(eta) < electronEtaMax:
-                if momenta[mm][4] > 0:
-                    electrons.append(momenta[mm])
-                else:
-                    positrons.append(momenta[mm])
-            elif abs(momenta[mm][4]) == 13 and pt > muonPtMin and abs(eta) < muonEtaMax:
-                if momenta[mm][4] > 0:
-                    muons.append(momenta[mm])
-                else:
-                    antimuons.append(momenta[mm])
-            elif momenta[mm][4] == 22 and pt > photonPtMin and abs(eta) < photonEtaMax:
-                 photons.append(momenta[mm])
-            else: # if not electron/muon (or anti) or muon, put into jet clustering 
-                momtocluster.append(momenta[mm])
-
-        # convert to fastjet:
-        momfj_electrons = convert_tofj(electrons, electronPtMin, electronEtaMax)
-        momfj_positrons = convert_tofj(positrons, electronPtMin, electronEtaMax)
-        momfj_muons = convert_tofj(muons, muonPtMin, muonEtaMax)
-        momfj_antimuons = convert_tofj(antimuons, electronPtMin,electronEtaMax)
-        momfj_photons = convert_tofj(photons, photonPtMin, photonEtaMax)
-        electrons_reco.append(momfj_electrons)
-        positrons_reco.append(momfj_positrons)
-        muons_reco.append(momfj_muons)
-        antimuons_reco.append(momfj_antimuons)
-        photons_reco.append(momfj_photons)
-        # get the jets and push to bigger array:
-        momfj = convert_tofj(momtocluster, jcPtMin,jcEtaMax) # convert to fastjet
-        cluster = fastjet.ClusterSequence(momfj, jetdef)
-        clusters_jets.append(cluster)
-        
-    return clusters_jets, electrons_reco, positrons_reco, muons_reco, antimuons_reco, photons_reco
-
-
-# from https://gitlab.cern.ch/cms-sw/cmssw/blob/e303d9f2c3d4f25397db5feb7ad59d2f20c842f2/PhysicsTools/HeppyCore/python/utils/deltar.py
-def deltaPhi( p1, p2):
-    '''Computes delta phi, handling periodic limit conditions.'''
-    res = p1 - p2
-    while res > np.pi:
-        res -= 2*np.pi
-    while res < -np.pi:
-        res += 2*np.pi
-    return res
-
-##########################
-# MAIN ANALYSIS FUNCTION #
-##########################
-def analyze(clusters_jets, electrons, positrons, muons, antimuons, photons):
-    # define dictionary with data to return at the end of the analysis
-    DATA = {}
-    # example variables:
-    DATA['ptleptons'] = []
-    DATA['ptjets'] = []
-    passed = 0
-    # loop over events
-    for ee in tqdm(range(0,len(clusters_jets))):
-        # sort the jets, with jet pt minimum jetPtMin
-        events_jets = fastjet.sorted_by_pt(clusters_jets[ee].inclusive_jets(jetPtMin))
-        for jet in events_jets:
-            if abs(jet.eta()) < jetEtaMax:
-                DATA['ptjets'].append(jet.perp())
-        for electron in electrons[ee]:
-            DATA['ptleptons'].append(electron.perp())
-        for muon in muons[ee]:
-            DATA['ptleptons'].append(muon.perp())
-        for positron in positrons[ee]:
-            DATA['ptleptons'].append(electron.perp())
-        for antimuon in antimuons[ee]:
-            DATA['ptleptons'].append(antimuon.perp())
-        passed = passed + 1
-    print('Passed cuts fraction =', passed/len(clusters_jets))
-    return DATA
-    #histogram(relpull_array, 'relpull_' + plotname, 'Relative pull angle $\\theta_{12}$ (degrees)', nbins=10)
-
-###########################
-# MAIN PROGRAM
-###########################
-
-if len(sys.argv) < 2:
-    print("USAGE: %s <input ROOT file(s)>"%(sys.argv[0]))
-    sys.exit(1)
-
-inFileName = sys.argv[1]
-plotnames_multi = []
-plotnames_multi.append(inFileName)
-
-# read the ROOT file and get the data
-inFile = ROOT.TFile.Open(inFileName ,"READ")
-tree = inFile.Get("Data")
-
-# analyze
-print("Analyzing", inFileName)
-print(inFileName, "contains:", tree.GetEntries(), "events")
-
-# maximum number of events to analyze:
-Nmax = 100000
-
-# get all the event momenta from the root file:
-events, event_weights = get_events(tree, inFileName, maxevents=Nmax)
-print("Sum of event weights:", sum(event_weights))
-
-# convert to jets
-# in this case we ignore the (stable) Higgs boson and neutrinos
-cluster_jets, electrons, positrons, muons, antimuons, photons =  get_reconstructed(events, inFileName, fastjet.antikt_algorithm, R, maxevents=Nmax)
-
-
-# analyze the jets in the events
-OUTPUT = analyze(cluster_jets, electrons, positrons, muons, antimuons, photons)
-
-# histogram: 
-histogram(OUTPUT['ptleptons'], 'ptleptons', '$p_T$ of leptons [GeV]', nbins=10)
-histogram(OUTPUT['ptjets'], 'ptjets', '$p_T$ of jets [GeV]', nbins=10)
+if __name__ == "__main__":
+    sys.exit(main())

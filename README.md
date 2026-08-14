@@ -8,6 +8,198 @@ The purpose of this project is to determine whether this difference remains obse
 
 The concrete nominal event-generation setup used to start this programme is recorded in [PILOT_GENERATION.md](PILOT_GENERATION.md).
 
+## Running the particle-level analyses
+
+`HwSimPythonAnalysis.py` reads the merged HwSim ROOT event records, applies the
+Higgs or Z object selection, reclusters anti-$k_T$ $R=0.4$ jets, applies the
+cut-based VBF selection and calculates the beam-signed pull vector of both
+tagging jets.  It can also train separate Higgs and Z XGBoost classifiers that
+replace the three VBF cuts while sharing exactly the same common selection.
+ROOT, the FastJet Python bindings, NumPy and Matplotlib must be available.  The
+preliminary files on Timur are configured in `samples_preliminary_timur.json`.
+
+Cut-based runs remain the backward-compatible default:
+
+```bash
+python3 HwSimPythonAnalysis.py \
+  --samples samples_preliminary_timur.json \
+  --output-root results \
+  --run-name nominal \
+  --workers 5
+```
+
+For a combined cut-based and XGBoost run on Timur, first create the isolated
+runtime once and then request both branches:
+
+```bash
+python3 -m venv --system-site-packages .venv-xgboost
+.venv-xgboost/bin/python -m pip install -r requirements-xgboost.txt
+.venv-xgboost/bin/python HwSimPythonAnalysis.py \
+  --samples samples_preliminary_timur.json \
+  --analyses cutbased xgboost \
+  --output-root results \
+  --run-name nominal-cutbased-xgboost \
+  --workers 5
+```
+
+### Odysseus campaign 3
+
+The complete `summer2026` campaign-3 samples on Odysseus are configured in
+three manifests, keeping each generator setup separate:
+
+- `samples_odysseus_campaign00003_herwig.json`: nominal Herwig;
+- `samples_odysseus_campaign00003_herwig_preco.json`: Herwig with
+  `pReco=0.25`;
+- `samples_odysseus_campaign00003_mg5_pythia.json`: MG5_aMC plus Pythia 8.
+
+The event disk is mounted as `/micron` (not `/micro`).  The manifests point to
+the immutable merged files under
+`/micron/Projects/PullPheno/campaigns/campaign-00003/merged/`.  Run only after
+the campaign dashboard reports the selected job as complete; never analyze a
+hidden `.partial` merge product.
+
+Create the Odysseus runtime once:
+
+```bash
+source /home/apapaefs/Projects/root/root_v6.40.02/bin/thisroot.sh
+python3 -m venv --system-site-packages .venv-odysseus
+.venv-odysseus/bin/python -m pip install -r requirements-odysseus.txt
+```
+
+Source ROOT in each new shell, then run a low-statistics smoke test before the
+full sample:
+
+```bash
+source /home/apapaefs/Projects/root/root_v6.40.02/bin/thisroot.sh
+.venv-odysseus/bin/python HwSimPythonAnalysis.py \
+  --samples samples_odysseus_campaign00003_herwig.json \
+  --analyses cutbased xgboost \
+  --output-root /micron/Projects/PullPheno/analysis-results \
+  --run-name campaign00003-herwig-smoke \
+  --workers 5 \
+  --max-events 1000
+```
+
+Remove `--max-events 1000` and change the run name only after the smoke output
+has been checked.  Each manifest records both the generator cross section and
+the final-state cross section consumed by the analysis.  The latter includes
+one factor of `BR(H to gamma gamma)=0.002270` for `VBFH` and `QCDHjj`; no extra
+branching factor is applied to `aajj` or the decay-inclusive Z samples.
+
+The manifest assigns each process an XGBoost `role` of `signal` or
+`background`.  The classifiers use only $m_{jj}$,
+$|\Delta y_{jj}|$, the two tagging-jet transverse momenta, boson $p_T$ and
+$z^*$.  Nominal training uses five rotating, deterministic pipelines.  For
+each pipeline, three folds train the classifier, one separate fold fixes that
+pipeline's score cut by maximising $S/\sqrt{S+B}$, and the remaining fold is
+used only for physics application.  Across all five pipelines every event is
+physics-tested exactly once, validation-tested exactly once, and used for
+training three times.  The post-XGBoost physics plots therefore use the full
+common-selected Monte Carlo sample with unit event weights; no event is scored
+by a model or threshold that used its own fold, and no inverse 20% sampling
+correction is applied.
+
+Each channel saves five model/threshold pairs beneath
+`models/xgboost/<channel>/`.  Application to an independent CR manifest routes
+every event deterministically through one frozen pair, so the new sample is
+also used exactly once and no model or threshold is retrained.
+
+To apply already frozen models and score cuts to independent CR samples, use:
+
+```bash
+.venv-xgboost/bin/python HwSimPythonAnalysis.py \
+  --samples <variation-manifest.json> \
+  --analyses xgboost \
+  --xgb-model-run results/runs/<nominal-combined-run-id> \
+  --output-root results \
+  --run-name <variation-name>
+```
+
+For a non-physical smoke test, use `--max-events N`.  Such output is visibly
+marked as partial and retains the full generated sum of weights in its
+normalisation metadata.  The default luminosities are $300$ and
+$3000\,\mathrm{fb}^{-1}$; they may be replaced with
+`--luminosities L1 L2 ...`.  `--workers N` processes independent samples in
+separate processes; one worker remains the conservative default.
+
+Every invocation creates a new immutable directory beneath `results/runs/`.
+The run identifier contains a UTC timestamp, the optional run name and a hash
+of the resolved analysis configuration.  Existing runs and plots are never
+overwritten.  A completed run contains:
+
+- expected-yield and unit-area PNG/PDF plots;
+- differential $R_i$ plots with separate projected-data and MC uncertainties;
+- saved Higgs and Z models, frozen thresholds and classifier diagnostics;
+- long-form CSV and Markdown cutflows;
+- JSON summaries and compressed NumPy histogram arrays;
+- a self-contained `index.html` with plot filters, cutflows and numerical
+  summaries.
+
+The top-level `results/index.html` is an atomically regenerated catalogue of
+all completed runs.  Directories prefixed with `.incomplete-` record failed or
+interrupted runs and are deliberately excluded from that catalogue.
+
+Plot-only revisions can reuse the stored histogram arrays without reopening
+the ROOT events.  The command still creates a new immutable run and records
+the parent run explicitly:
+
+```bash
+python3 HwSimPythonAnalysis.py \
+  --from-run results/runs/<completed-run-id> \
+  --output-root results \
+  --run-name folded-angle
+```
+
+The manifest uses final-state cross sections in pb.  No Higgs or Z branching
+fraction is applied in the analysis code.  For every sample and luminosity the
+normalisation is
+
+```text
+1000 * luminosity_fb * cross_section_pb / sum_generated_evweight.
+```
+
+Each selected event fills the signed-pull histograms twice, once per tagging
+jet, with half of the event weight.  Consequently the signed-angle histogram
+integral is checked against the expected selected-event yield.  The signed
+angle is defined through
+
+```text
+t_beam       = sign(y_jet) * t_y
+signed_angle = atan2(t_phi, t_beam)
+```
+
+and uses twelve equal bins on $[-\pi,+\pi]$.
+
+The analysis also stores a folded presentation,
+
+```text
+folded_angle = abs(signed_angle),
+```
+
+using six equal bins on $[0,\pi]$.  Each negative-angle bin is summed with
+its positive-angle partner, including the corresponding `sumw2`, so the
+folded histogram has exactly the same expected-yield integral as the signed
+histogram.  The signed distribution is retained to expose possible
+left--right implementation asymmetries.
+
+The normalized differential observable is
+
+```text
+R_i = N_i / sum_j N_j,
+f_beam = R_1 + R_2 + R_3.
+```
+
+Thus all six $R_i$ values sum to one; their average is identically $1/6$ and
+is not $f_{\rm beam}$.
+
+For each selected event the code forms a six-component vector from its two
+half-weight tagging-jet entries.  Event-level first and second moments retain
+the within-event jet correlation.  The HTML, JSON, CSV and NPZ artifacts store
+the full six-bin covariance for both the expected counting uncertainty at each
+luminosity and the current weighted-MC uncertainty.  The latter is fixed by the
+generated samples and does not scale with displayed luminosity.  Detector and
+physics-modelling systematic uncertainties are not yet included.
+
 ## Executive recommendation
 
 We propose a two-tier analysis programme:

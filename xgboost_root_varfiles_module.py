@@ -1,298 +1,368 @@
-import numpy as np
-import random
+"""Small, import-safe XGBoost helpers for the PullPheno analysis.
+
+ROOT event reconstruction intentionally lives in :mod:`HwSimPythonAnalysis`.
+This module only accepts NumPy arrays, which keeps splitting, weighting and
+threshold selection independently testable even when XGBoost is unavailable.
+"""
+
+from __future__ import annotations
+
+import hashlib
 import math
-import matplotlib.pyplot as plt 
-# import xgboost and sklearn stuff:
-import xgboost as xgb
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
-from sklearn.metrics import confusion_matrix
-from sklearn.metrics import RocCurveDisplay
-import pickle
-from tqdm.auto import tqdm
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Mapping, Sequence, Tuple
 
-# functions to load root varfiles from HwSim
-from read_root_varfiles import *
-    
-###############
-# FUNCTIONS   #
-###############
-
-# main training function (June 12, 2025: in progress!)
-def train_xgboost(signal_SM_file, Backgrounds, Background_files, Backgrounds_xsec, xsS, initial_S, sig_factors, initial_B, idB, bkg_factors, Luminosity, Energy, seed): 
-
-    # load signal and backgrounds
-    # NOTE THAT: the weights will also be multiplied by the total cross section for the process! 
-
-    # load signal:
-    idS=0 # id number for signal
-    S, LS, wS = read_ROOT_varfile(signal_SM_file, idS, xsS)
-    Sweight = Luminosity * np.sum(wS)/initial_S * sig_factors # calculate total expected number of events
-    print('Signal pre-efficiency=', np.sum(wS)/initial_S/xsS)
-    
-    # initial values for arrays used in training: 
-    X = S
-    L = LS
-    W = wS
-
-    Bweight = 0
-    initial_NB = {}
-    for bkg in Backgrounds:
-        xsB=Backgrounds_xsec[(Energy, bkg)] # background cross sections (fb)
-        B, LB, wB =  read_ROOT_varfile(Background_files[(Energy, bkg)], idB[bkg], Backgrounds_xsec[(Energy, bkg)])
-        initial_NB[bkg] =  Luminosity * np.sum(wB)/initial_B[bkg] * bkg_factors # calculate total expected number of events in each background
-        Bweight += initial_NB[bkg] # incremenet to total expected number of events
-        print('Background pre-efficiency', bkg, np.sum(wB)/initial_B[bkg]/Backgrounds_xsec[(Energy, bkg)])
-        # concatenate lists:
-        X = X + B
-        L = L + LB
-        W = W + wB
-
-    # convert to numpy arrays: 
-    X = np.array(X)
-    L = np.array(L)
-    W = np.array(W)
-
-    # create testing and training samples:
-    print("Splitting samples into testing and training")
-    X_train, X_test, y_train, y_test, w_train, w_test = train_test_split(X, L, W, test_size=0.5,random_state=seed)
-
-    # train XGBoost model:
-    print("Training the model")
-    model = xgb.XGBClassifier()
-    model.fit(X_train, y_train,sample_weight=w_train, verbose=3)
-    print("Done training the model")
-    return model
-
-# apply the given model
-def apply_xgboost(model, signal_SM_file, Backgrounds, Background_files, Backgrounds_xsec, xsS, initial_S, sig_factors, initial_B, idB, bkg_factors, Luminosity, Energy, seed):
-
-    # load signal:
-    idS=0 # id number for signal
-    S, LS, wS = read_ROOT_varfile(signal_SM_file, idS, xsS)
-    Sweight = Luminosity * np.sum(wS)/initial_S * sig_factors # calculate total expected number of events
-    print('Signal pre-efficiency=', np.sum(wS)/initial_S/xsS)
-    
-    # initial values for arrays used in training: 
-    X = S
-    L = LS
-    W = wS
-    
-    #print(model)
-    Bweight = 0
-    initial_NB = {}
-    for bkg in Backgrounds:
-        xsB=Backgrounds_xsec[(Energy, bkg)] # background cross sections (fb)
-        print(Background_files[(Energy, bkg)])
-        B, LB, wB =  read_ROOT_varfile(Background_files[(Energy, bkg)], idB[bkg], Backgrounds_xsec[(Energy, bkg)])
-        initial_NB[bkg] =  Luminosity * np.sum(wB)/initial_B[bkg] * bkg_factors # calculate total expected number of events in each background
-        Bweight += initial_NB[bkg] # incremenet to total expected number of events
-        print('Background pre-efficiency', bkg, np.sum(wB)/initial_B[bkg]/Backgrounds_xsec[(Energy, bkg)])
-        # concatenate lists:
-        X = X + B
-        L = L + LB
-        W = W + wB
+import numpy as np
 
 
-    # create testing and training samples:
-    print("Splitting samples into testing and training")
-    X_train, X_test, y_train, y_test, w_train, w_test = train_test_split(X, L, W, test_size=0.5,random_state=seed)
+FEATURE_NAMES: Tuple[str, ...] = (
+    "mjj",
+    "abs_delta_yjj",
+    "leading_jet_pt",
+    "subleading_jet_pt",
+    "boson_pt",
+    "zstar",
+)
 
-    # make predictions for test data
-    y_pred = model.predict(X_test)
-    predictions = [round(value) for value in y_pred]
-    
-    # evaluate predictions
-    accuracy = accuracy_score(y_test, predictions)
-    print("Accuracy: %.2f%%" % (accuracy * 100.0))
+MODEL_PARAMETERS: Dict[str, Any] = {
+    "n_estimators": 200,
+    "max_depth": 3,
+    "learning_rate": 0.05,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "eval_metric": "logloss",
+    "random_state": 1,
+    "n_jobs": 1,
+}
 
-    # Confusion matrix whose i-th row and j-th column entry indicates the number of samples with true label being i-th class and predicted label being j-th class.
-    # in this case signal = 0, backgrounds = i = 1, 2,...
-    # (0,0): signal-as-signal -> True positive
-    # (i,0): background-as-signal (mis-id) -> False positive
-    confmatrix = confusion_matrix(y_test, predictions)
-    print('confusion matrix:')
-    print(confmatrix)
-    # signal efficiency:
-    total_S = 0
-    for j in range(len(Backgrounds)+1):
-        total_S += confmatrix[0][j]
-    eff_S = confmatrix[0][0]/total_S # signal identified as signal divided by total number of signal events
-    # background effiencies:
-    eff_B = {}
-    for bkg in Backgrounds:
-        total_B = 0
-        for j in range(len(Backgrounds)+1):
-            total_B += confmatrix[idB[bkg]][j]
-        eff_B[bkg] = confmatrix[idB[bkg]][0]/total_B
-        print(bkg, confmatrix[idB[bkg]][0], total_B)
-
-    print('Luminosity=', Luminosity)
-        
-    # initial cross sections into final state:
-    print('Initial signal cross section=', Sweight/Luminosity)
-    print('Initial background cross section=', Bweight/Luminosity)
-    print('-')
-    # calculate "significance"
-    print('Initial significance=', Sweight/np.sqrt(Bweight))
-    print('-')
-    # print analysis efficiencies
-    print('Signal efficiency (xgboost only)=', eff_S)
-    print('Signal efficiency full=', eff_S * np.sum(wS)/initial_S/xsS)
-    print('Background Efficiencies (xgboost only)=', eff_B)
-    print('-')
-    print('Final signal cross section=', xsS *eff_S * np.sum(wS)/initial_S )
-    # calculate the number of events for the background after the analysis:
-    final_NB = {}
-    final_NB_total = 0
-    for bkg in Backgrounds:
-        final_NB[bkg] = initial_NB[bkg] * eff_B[bkg]
-        #print('\tNumber of events in', bkg,final_NB[bkg], 'after analysis')
-        final_NB_total += final_NB[bkg]
-    print('Final background cross section=', final_NB_total/Luminosity)
-    print('Final significance=', Sweight*eff_S/np.sqrt(final_NB_total))
-    print('-')
-    # calculate 95% C.L. limit on expected number of events: 
-    S2sigma = np.sqrt(final_NB_total) * 2
-    print('95% C.L. limit on number of signal events=', S2sigma)
-    print('95% C.L. limit on signal cross section in given final state=', S2sigma/Luminosity, 'fb')
+CROSS_FIT_FOLDS = 5
+CROSS_FIT_SEED = 1
 
 
-# save the model:
-def save_model(model, filename):
-    model.save_model(str(filename))
-    #with open(filename,'wb') as f:
-    #    pickle.dump(model,f)
+@dataclass(frozen=True)
+class SplitIndices:
+    train: np.ndarray
+    validation: np.ndarray
+    test: np.ndarray
 
-# load the model:
-def load_model(filename):
-    model = xgb.XGBClassifier()
-    model.load_model(filename)
-    #with open(filename, 'rb') as f:
-    #    model = pickle.load(f)
-    return model
-
-# apply the given model
-def apply_xgboost_write(modelfile, signal_file, Backgrounds, Background_files, Backgrounds_xsec, xsS, initial_S, sig_factors, initial_B, idB, bkg_factors, Luminosity, Energy, seed, smeartag):
-    print('loading', modelfile)
-    model = xgb.XGBClassifier()
-    model.load_model(modelfile)
-    print('model loaded')
-    
-    # load signal:
-    idS=0 # id number for signal
-    S, LS, wS = read_ROOT_varfile(signal_file, idS, xsS)
-    Sweight = Luminosity * np.sum(wS)/initial_S * sig_factors # calculate total expected number of events
-    #print('Signal pre-efficiency=', np.sum(wS)/initial_S/xsS)
-    
-    # initial values for arrays used in training: 
-    X = S
-    L = LS
-    W = wS
-    
-    #print(model)
-    Bweight = 0
-    initial_NB = {}
-    preeff_B = {}
-    for bkg in Backgrounds:
-        xsB=Backgrounds_xsec[(Energy, bkg)] # background cross sections (fb)
-        B, LB, wB =  read_ROOT_varfile(Background_files[(Energy, bkg)], idB[bkg], Backgrounds_xsec[(Energy, bkg)])
-        preeff_B[bkg] = np.sum(wB)/initial_B[bkg]/Backgrounds_xsec[(Energy, bkg)]
-        initial_NB[bkg] =  Luminosity * np.sum(wB)/initial_B[bkg] * bkg_factors # calculate total expected number of events in each background
-        Bweight += initial_NB[bkg] # incremenet to total expected number of events
-        #print('Background pre-efficiency', bkg, np.sum(wB)/initial_B[bkg]/Backgrounds_xsec[(Energy, bkg)])
-        # concatenate lists:
-        X = X + B
-        L = L + LB
-        W = W + wB
+    def as_dict(self) -> Dict[str, np.ndarray]:
+        return {
+            "train": self.train,
+            "validation": self.validation,
+            "test": self.test,
+        }
 
 
-    # create testing and training samples:
-    #print("Splitting samples into testing and training")
-    X_train, X_test, y_train, y_test, w_train, w_test = train_test_split(X, L, W, test_size=0.99,random_state=seed)
+@dataclass(frozen=True)
+class CrossFitSplit:
+    """One leakage-free outer-fold pipeline.
 
-    # make predictions for test data
-    y_pred = model.predict(X_test)
-    predictions = [round(value) for value in y_pred]
-    
-    # evaluate predictions
-    accuracy = accuracy_score(y_test, predictions)
-    print("Accuracy: %.2f%%" % (accuracy * 100.0))
+    ``test`` is the physics-application fold, ``validation`` fixes this
+    pipeline's score threshold, and ``train`` contains the remaining folds.
+    """
 
-    # Confusion matrix whose i-th row and j-th column entry indicates the number of samples with true label being i-th class and predicted label being j-th class.
-    # in this case signal = 0, backgrounds = i = 1, 2,...
-    # (0,0): signal-as-signal -> True positive
-    # (i,0): background-as-signal (mis-id) -> False positive
-    confmatrix = confusion_matrix(y_test, predictions)
-    #print('confusion matrix:')
-    #print(confmatrix)
-    # signal efficiency:
-    total_S = 0
-    for j in range(len(Backgrounds)+1):
-        total_S += confmatrix[0][j]
-    eff_S = confmatrix[0][0]/total_S # signal identified as signal divided by total number of signal events
-    # background effiencies:
-    eff_B = {}
-    for bkg in Backgrounds:
-        total_B = 0
-        for j in range(len(Backgrounds)+1):
-            total_B += confmatrix[idB[bkg]][j]
-        eff_B[bkg] = confmatrix[idB[bkg]][0]/total_B
-        print(bkg, confmatrix[idB[bkg]][0], total_B)
+    fold: int
+    validation_fold: int
+    train: np.ndarray
+    validation: np.ndarray
+    test: np.ndarray
 
-    #print('Luminosity=', Luminosity)
-        
-    # initial cross sections into final state:
-    #print('Initial signal cross section=', Sweight/Luminosity)
-    #print('Initial background cross section=', Bweight/Luminosity)
-    #print('-')
-    # calculate "significance"
-    #print('Initial significance=', Sweight/np.sqrt(Bweight))
-    #print('-')
-    # print analysis efficiencies
-    #print('Signal efficiency=', eff_S)
-    #print('Background Efficiencies=', eff_B)
-    #print('-')
-    #print('Final signal cross section=', Sweight/Luminosity*eff_S)
-    # calculate the number of events for the background after the analysis:
-    final_NB = {}
-    final_NB_total = 0
-    for bkg in Backgrounds:
-        final_NB[bkg] = initial_NB[bkg] * eff_B[bkg]
-        #print('\tNumber of events in', bkg,final_NB[bkg], 'after analysis')
-        final_NB_total += final_NB[bkg]
-    #print('Final background cross section=', final_NB_total/Luminosity)
-    #print('Final significance=', Sweight*eff_S/np.sqrt(final_NB_total))
-    #print('-')
-    # calculate 95% C.L. limit on expected number of events: 
-    S2sigma = np.sqrt(final_NB_total) * 2
-    #print('95% C.L. limit on number of signal events=', S2sigma)
-    #print('95% C.L. limit on signal cross section in given final state=', S2sigma/Luminosity, 'fb')
-
-    # open files and write all the efficiencies calculated:
-    # total efficiency (including what is called "pre-efficiency"
-    
-    total_eff_S = eff_S*np.sum(wS)/initial_S/xsS
-    filestream = open(signal_file.replace('_var.smear' + smeartag + '.root',  smeartag + '.XGBOOST.dat') ,'w')
-    filestream.write(str(total_eff_S))
-    filestream.close()
-    for bkg in Backgrounds:
-        filestream = open(Background_files[(Energy, bkg)].replace('_var.smear' + smeartag + '.root',  smeartag + '.XGBOOST.dat') ,'w')
-        filestream.write(str(preeff_B[bkg]*eff_B[bkg]))
-        filestream.close()
+    def as_split_indices(self) -> SplitIndices:
+        return SplitIndices(
+            train=self.train,
+            validation=self.validation,
+            test=self.test,
+        )
 
 
+@dataclass(frozen=True)
+class ThresholdResult:
+    threshold: float
+    significance: float
+    signal_weight: float
+    background_weight: float
+    selected_count: int
 
 
-#########################
-# Testing starts here   #
-#########################
+def _sample_seed(sample_key: str, seed: int) -> int:
+    digest = hashlib.sha256(f"{int(seed)}:{sample_key}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "little", signed=False)
 
-# train the model:
-#trained_model, Sweight, Bweight, X_test, y_test = train_xgboost()
-# save the model:
-#save_model(trained_model, 'trained_model.pkl')
-# laod the model: 
-#trained_model_test = load_model('trained_model.pkl')
-# apply the model:
-#apply_xgboost(trained_model_test, Sweight, Bweight, X_test, y_test)
+
+def deterministic_split(
+    number_of_events: int,
+    sample_key: str,
+    seed: int = 1,
+) -> SplitIndices:
+    """Return an exact, deterministic 60/20/20 split for one process."""
+    number_of_events = int(number_of_events)
+    if number_of_events < 0:
+        raise ValueError("number_of_events must be non-negative")
+    generator = np.random.default_rng(_sample_seed(sample_key, seed))
+    permutation = generator.permutation(number_of_events).astype(np.int64, copy=False)
+    train_end = int(math.floor(0.60 * number_of_events))
+    validation_end = train_end + int(math.floor(0.20 * number_of_events))
+    return SplitIndices(
+        train=permutation[:train_end],
+        validation=permutation[train_end:validation_end],
+        test=permutation[validation_end:],
+    )
+
+
+def deterministic_crossfit_splits(
+    number_of_events: int,
+    sample_key: str,
+    folds: int = CROSS_FIT_FOLDS,
+    seed: int = CROSS_FIT_SEED,
+) -> Tuple[CrossFitSplit, ...]:
+    """Return rotating, deterministic train/validation/test fold pipelines.
+
+    The shuffled population is partitioned exactly once into ``folds`` outer
+    folds.  For pipeline ``k``, fold ``k`` is used only for physics testing,
+    fold ``(k + 1) % folds`` fixes the score threshold, and every other fold
+    trains the classifier.  Consequently each event is tested once,
+    validated once and trained on ``folds - 2`` times.  With five folds this
+    is the requested rotating 60/20/20 construction, up to unavoidable
+    one-event differences when the population is not divisible by five.
+    """
+    number_of_events = int(number_of_events)
+    folds = int(folds)
+    if number_of_events < 0:
+        raise ValueError("number_of_events must be non-negative")
+    if folds < 3:
+        raise ValueError("Cross-fitting requires at least three folds")
+    if number_of_events < folds:
+        raise ValueError(
+            f"Cross-fitting {number_of_events} events into {folds} folds would create an empty fold"
+        )
+    generator = np.random.default_rng(_sample_seed(sample_key, seed))
+    permutation = generator.permutation(number_of_events).astype(np.int64, copy=False)
+    partitions = tuple(
+        np.asarray(values, dtype=np.int64)
+        for values in np.array_split(permutation, folds)
+    )
+    pipelines = []
+    for test_fold in range(folds):
+        validation_fold = (test_fold + 1) % folds
+        training_folds = [
+            partitions[index]
+            for index in range(folds)
+            if index not in (test_fold, validation_fold)
+        ]
+        pipelines.append(
+            CrossFitSplit(
+                fold=test_fold,
+                validation_fold=validation_fold,
+                train=np.concatenate(training_folds).astype(np.int64, copy=False),
+                validation=partitions[validation_fold],
+                test=partitions[test_fold],
+            )
+        )
+    return tuple(pipelines)
+
+
+def inverse_split_probability(number_of_events: int, selected_count: int) -> float:
+    """Horvitz--Thompson correction for an exact random subset."""
+    number_of_events = int(number_of_events)
+    selected_count = int(selected_count)
+    if number_of_events <= 0 or selected_count <= 0 or selected_count > number_of_events:
+        raise ValueError("Invalid split population or subset size")
+    return number_of_events / selected_count
+
+
+def balanced_training_weights(
+    physical_weights: Sequence[float],
+    labels: Sequence[int],
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    """Balance signal/background totals while retaining within-class weights.
+
+    The balanced weights have mean one and each class carries half of the
+    total weight.  Keeping the absolute total near the event count avoids
+    changing XGBoost regularisation scales such as ``min_child_weight``.
+    """
+    weights = np.asarray(physical_weights, dtype=np.float64)
+    classes = np.asarray(labels, dtype=np.int8)
+    if weights.ndim != 1 or classes.shape != weights.shape:
+        raise ValueError("Weights and labels must be one-dimensional arrays of equal length")
+    if len(weights) == 0 or not np.all(np.isfinite(weights)) or np.any(weights <= 0.0):
+        raise ValueError("XGBoost training weights must be finite and strictly positive")
+    if not np.all(np.isin(classes, (0, 1))):
+        raise ValueError("Labels must be binary with signal=1 and background=0")
+    signal = classes == 1
+    background = ~signal
+    signal_total = float(np.sum(weights[signal], dtype=np.float64))
+    background_total = float(np.sum(weights[background], dtype=np.float64))
+    if signal_total <= 0.0 or background_total <= 0.0:
+        raise ValueError("Both signal and background are required for training")
+    target = 0.5 * len(weights)
+    signal_factor = target / signal_total
+    background_factor = target / background_total
+    balanced = weights.copy()
+    balanced[signal] *= signal_factor
+    balanced[background] *= background_factor
+    return balanced, {
+        "signal_factor": signal_factor,
+        "background_factor": background_factor,
+        "signal_sum": float(np.sum(balanced[signal], dtype=np.float64)),
+        "background_sum": float(np.sum(balanced[background], dtype=np.float64)),
+        "total_sum": float(np.sum(balanced, dtype=np.float64)),
+    }
+
+
+def optimize_significance_threshold(
+    scores: Sequence[float],
+    labels: Sequence[int],
+    physical_weights: Sequence[float],
+) -> ThresholdResult:
+    """Maximise S/sqrt(S+B) over distinct score thresholds.
+
+    Events pass when ``score >= threshold``.  Since scores are traversed from
+    high to low, ``argmax`` resolves exact ties in favour of the tighter cut.
+    """
+    score_array = np.asarray(scores, dtype=np.float64)
+    classes = np.asarray(labels, dtype=np.int8)
+    weights = np.asarray(physical_weights, dtype=np.float64)
+    if score_array.ndim != 1 or classes.shape != score_array.shape or weights.shape != score_array.shape:
+        raise ValueError("Scores, labels and weights must be equal-length one-dimensional arrays")
+    if len(scores) == 0:
+        raise ValueError("Cannot optimise a threshold on an empty validation sample")
+    if not np.all(np.isfinite(score_array)) or not np.all(np.isfinite(weights)) or np.any(weights < 0.0):
+        raise ValueError("Validation scores and weights must be finite with non-negative weights")
+    if not np.all(np.isin(classes, (0, 1))) or not np.any(classes == 1) or not np.any(classes == 0):
+        raise ValueError("Validation data must contain signal and background")
+
+    order = np.argsort(-score_array, kind="mergesort")
+    ordered_scores = score_array[order]
+    ordered_labels = classes[order]
+    ordered_weights = weights[order]
+    cumulative_signal = np.cumsum(ordered_weights * (ordered_labels == 1), dtype=np.float64)
+    cumulative_background = np.cumsum(ordered_weights * (ordered_labels == 0), dtype=np.float64)
+    group_ends = np.r_[np.flatnonzero(np.diff(ordered_scores) != 0.0), len(ordered_scores) - 1]
+    signal = cumulative_signal[group_ends]
+    background = cumulative_background[group_ends]
+    denominator = np.sqrt(np.maximum(signal + background, 0.0))
+    significance = np.divide(signal, denominator, out=np.zeros_like(signal), where=denominator > 0.0)
+    best = int(np.argmax(significance))
+    end = int(group_ends[best])
+    return ThresholdResult(
+        threshold=float(ordered_scores[end]),
+        significance=float(significance[best]),
+        signal_weight=float(signal[best]),
+        background_weight=float(background[best]),
+        selected_count=end + 1,
+    )
+
+
+def weighted_roc_curve(
+    labels: Sequence[int],
+    scores: Sequence[float],
+    weights: Sequence[float],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Return a physical-weight ROC curve and trapezoidal AUC."""
+    classes = np.asarray(labels, dtype=np.int8)
+    score_array = np.asarray(scores, dtype=np.float64)
+    weight_array = np.asarray(weights, dtype=np.float64)
+    if classes.shape != score_array.shape or classes.shape != weight_array.shape or classes.ndim != 1:
+        raise ValueError("ROC inputs must be equal-length one-dimensional arrays")
+    positive_total = float(np.sum(weight_array[classes == 1], dtype=np.float64))
+    negative_total = float(np.sum(weight_array[classes == 0], dtype=np.float64))
+    if positive_total <= 0.0 or negative_total <= 0.0:
+        raise ValueError("ROC data must contain positive-weight signal and background")
+    order = np.argsort(-score_array, kind="mergesort")
+    ordered_scores = score_array[order]
+    ordered_labels = classes[order]
+    ordered_weights = weight_array[order]
+    cumulative_positive = np.cumsum(ordered_weights * (ordered_labels == 1), dtype=np.float64)
+    cumulative_negative = np.cumsum(ordered_weights * (ordered_labels == 0), dtype=np.float64)
+    group_ends = np.r_[np.flatnonzero(np.diff(ordered_scores) != 0.0), len(ordered_scores) - 1]
+    tpr = np.r_[0.0, cumulative_positive[group_ends] / positive_total]
+    fpr = np.r_[0.0, cumulative_negative[group_ends] / negative_total]
+    thresholds = np.r_[math.inf, ordered_scores[group_ends]]
+    auc = float(np.sum(np.diff(fpr) * 0.5 * (tpr[:-1] + tpr[1:]), dtype=np.float64))
+    return fpr, tpr, thresholds, auc
+
+
+def weighted_confusion(
+    labels: Sequence[int],
+    scores: Sequence[float],
+    weights: Sequence[float],
+    threshold: float,
+) -> np.ndarray:
+    classes = np.asarray(labels, dtype=np.int8)
+    predictions = np.asarray(scores, dtype=np.float64) >= float(threshold)
+    weight_array = np.asarray(weights, dtype=np.float64)
+    matrix = np.zeros((2, 2), dtype=np.float64)
+    for truth in (0, 1):
+        for prediction in (0, 1):
+            mask = (classes == truth) & (predictions == bool(prediction))
+            matrix[truth, prediction] = np.sum(weight_array[mask], dtype=np.float64)
+    return matrix
+
+
+def create_classifier(parameters: Mapping[str, Any] | None = None) -> Any:
+    try:
+        import xgboost as xgb  # type: ignore
+    except ImportError as error:
+        raise RuntimeError(
+            "XGBoost analysis requested but xgboost is unavailable; install requirements-xgboost.txt"
+        ) from error
+    settings = dict(MODEL_PARAMETERS)
+    if parameters:
+        settings.update(parameters)
+    return xgb.XGBClassifier(**settings)
+
+
+def train_classifier(features: np.ndarray, labels: np.ndarray, weights: np.ndarray) -> Any:
+    matrix = np.asarray(features, dtype=np.float64)
+    classes = np.asarray(labels, dtype=np.int8)
+    sample_weights = np.asarray(weights, dtype=np.float64)
+    if matrix.ndim != 2 or matrix.shape[1] != len(FEATURE_NAMES):
+        raise ValueError(f"Training matrix must have {len(FEATURE_NAMES)} columns in the fixed feature order")
+    if len(matrix) != len(classes) or len(matrix) != len(sample_weights):
+        raise ValueError("Training feature, label and weight lengths differ")
+    classifier = create_classifier()
+    classifier.fit(matrix, classes, sample_weight=sample_weights, verbose=False)
+    return classifier
+
+
+def signal_scores(classifier: Any, features: np.ndarray) -> np.ndarray:
+    matrix = np.asarray(features, dtype=np.float64)
+    probabilities = np.asarray(classifier.predict_proba(matrix), dtype=np.float64)
+    if probabilities.shape != (len(matrix), 2):
+        raise RuntimeError(f"Unexpected XGBoost probability shape: {probabilities.shape}")
+    scores = probabilities[:, 1]
+    if not np.all(np.isfinite(scores)) or np.any((scores < 0.0) | (scores > 1.0)):
+        raise RuntimeError("XGBoost returned invalid signal probabilities")
+    return scores
+
+
+def save_classifier(classifier: Any, destination: Path) -> str:
+    destination = Path(destination)
+    if destination.exists():
+        raise FileExistsError(f"Refusing to overwrite model: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    classifier.save_model(str(destination))
+    digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+    return digest
+
+
+def load_classifier(source: Path) -> Any:
+    source = Path(source)
+    if not source.is_file():
+        raise FileNotFoundError(f"XGBoost model does not exist: {source}")
+    classifier = create_classifier()
+    classifier.load_model(str(source))
+    return classifier
+
+
+def runtime_versions() -> Dict[str, str]:
+    import numpy
+
+    try:
+        import xgboost  # type: ignore
+
+        xgboost_version = str(xgboost.__version__)
+    except ImportError:
+        xgboost_version = "unavailable"
+    return {"numpy": str(numpy.__version__), "xgboost": xgboost_version}

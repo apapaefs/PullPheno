@@ -37,7 +37,7 @@ import numpy as np
 import xgboost_root_varfiles_module as xgbtools
 
 
-ANALYSIS_VERSION = "2.2.0"
+ANALYSIS_VERSION = "2.2.1"
 MZ_GEV = 91.1876
 NEUTRINO_IDS = frozenset((12, 14, 16))
 ANALYSIS_STRATEGIES = ("cutbased", "xgboost")
@@ -3405,6 +3405,58 @@ def _save_figure_exclusive(figure: Any, path: Path, **kwargs: Any) -> None:
     figure.savefig(path, **kwargs)
 
 
+def _place_plot_legend(
+    axis: Any,
+    *,
+    outside: bool = True,
+    location: str = "best",
+    columns: int = 1,
+) -> Any:
+    """Draw a high-contrast legend without obscuring physics distributions."""
+    handles, labels = axis.get_legend_handles_labels()
+    if not handles:
+        return None
+    common = {
+        "handles": handles,
+        "labels": labels,
+        "ncol": max(1, int(columns)),
+        "frameon": True,
+        "framealpha": 1.0,
+        "facecolor": "#f8fafc",
+        "edgecolor": "#aeb8c6",
+        "labelcolor": "#172033",
+        "fancybox": True,
+        "borderpad": 0.65,
+        "handlelength": 2.2,
+        "handletextpad": 0.65,
+    }
+    if outside:
+        legend = axis.legend(
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1.0),
+            borderaxespad=0.0,
+            **common,
+        )
+    else:
+        legend = axis.legend(loc=location, **common)
+    legend.set_zorder(20)
+    legend_handles = getattr(
+        legend,
+        "legend_handles",
+        getattr(legend, "legendHandles", ()),
+    )
+    for handle in legend_handles:
+        if hasattr(handle, "set_markeredgecolor"):
+            handle.set_markeredgecolor("#172033")
+        if hasattr(handle, "set_markeredgewidth"):
+            handle.set_markeredgewidth(0.6)
+        if hasattr(handle, "set_edgecolor"):
+            handle.set_edgecolor("#172033")
+        if hasattr(handle, "set_linewidth") and handle.__class__.__name__ != "Line2D":
+            handle.set_linewidth(0.6)
+    return legend
+
+
 def generate_plots(
     run_dir: Path,
     results: Sequence[SampleResult],
@@ -3512,7 +3564,7 @@ def generate_plots(
                 formatter.set_powerlimits((-4, 4))
                 formatter.set_useOffset(False)
                 ax.yaxis.set_major_formatter(formatter)
-                ax.legend(frameon=False)
+                _place_plot_legend(ax)
                 fig.tight_layout()
                 png_path = run_dir / relative_base.with_suffix(".png")
                 pdf_path = run_dir / relative_base.with_suffix(".pdf")
@@ -3552,7 +3604,7 @@ def generate_plots(
             ax.set_title(display_title, loc="left", pad=34, fontweight="semibold")
             ax.text(1.0, 1.015, "Particle level · unit-area process comparison",
                     transform=ax.transAxes, fontsize=9, color="#555b66", ha="right")
-            ax.legend(frameon=False)
+            _place_plot_legend(ax)
             fig.tight_layout()
             png_path = run_dir / relative_base.with_suffix(".png")
             pdf_path = run_dir / relative_base.with_suffix(".pdf")
@@ -3622,7 +3674,7 @@ def generate_ri_plots(
                          fontweight="semibold")
             ax.text(1.0, 1.015, "Process comparison · MC errors", transform=ax.transAxes,
                     fontsize=9, color="#555b66", ha="right")
-            ax.legend(frameon=False)
+            _place_plot_legend(ax)
             fig.tight_layout()
             png_path = run_dir / relative_base.with_suffix(".png")
             pdf_path = run_dir / relative_base.with_suffix(".pdf")
@@ -3677,7 +3729,7 @@ def generate_ri_plots(
                     subtitle += " · PARTIAL RUN"
                 ax.text(1.0, 1.015, subtitle, transform=ax.transAxes, fontsize=9,
                         color="#555b66", ha="right")
-                ax.legend(frameon=False)
+                _place_plot_legend(ax)
                 fig.tight_layout()
                 png_path = run_dir / relative_base.with_suffix(".png")
                 pdf_path = run_dir / relative_base.with_suffix(".pdf")
@@ -3854,7 +3906,7 @@ def generate_comparison_plots(
                         axis.yaxis.get_offset_text().set_y(1.01)
                         axis.grid(False)
                         ratio_axis.grid(False)
-                        axis.legend(frameon=False, ncol=min(3, len(sources)))
+                        _place_plot_legend(axis)
                         ratio_axis.axhline(1.0, color="#657086", linewidth=1.0)
                         ratio_axis.set_ylabel("Scenario / ref.")
                         ratio_axis.set_xlabel(plot_spec.xlabel)
@@ -3982,7 +4034,7 @@ def generate_xgboost_diagnostic_plots(
         ax.set_xlabel("Background efficiency")
         ax.set_ylabel("Signal efficiency")
         ax.set_title(f"{channel.capitalize()} XGBoost ROC", loc="left", fontweight="semibold")
-        ax.legend(frameon=False, loc="lower right")
+        _place_plot_legend(ax, outside=False, location="lower right")
         fig.tight_layout()
         roc_png = run_dir / base / "roc.png"
         roc_pdf = run_dir / base / "roc.pdf"
@@ -4026,7 +4078,7 @@ def generate_xgboost_diagnostic_plots(
             axis.set_xlabel("XGBoost signal score")
             axis.set_ylabel("Weighted fraction / bin")
             axis.set_title(split_name.capitalize())
-            axis.legend(frameon=False)
+            _place_plot_legend(axis, outside=False, location="upper right")
         fig.suptitle(f"{channel.capitalize()} classifier-score distributions", fontweight="semibold")
         fig.tight_layout()
         score_png = run_dir / base / "score_distributions.png"

@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import tempfile
 import unittest
 from unittest import mock
@@ -281,6 +282,27 @@ class PullAndWeightTests(unittest.TestCase):
 
 
 class RunManagementTests(unittest.TestCase):
+    def test_physics_legend_is_opaque_and_outside_data_axes(self):
+        os.environ.setdefault(
+            "MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "pullpheno-matplotlib-tests")
+        )
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        figure, axis = plt.subplots()
+        axis.plot([0.0, 1.0], [1.0, 0.0], color="#275DAD", label="Nominal")
+        legend = analysis._place_plot_legend(axis)
+        self.assertIsNotNone(legend)
+        self.assertEqual(legend.get_frame().get_alpha(), 1.0)
+        self.assertGreater(legend.get_bbox_to_anchor()._bbox.x0, 1.0)
+        np.testing.assert_allclose(
+            matplotlib.colors.to_rgba(legend.get_texts()[0].get_color()),
+            matplotlib.colors.to_rgba("#172033"),
+        )
+        plt.close(figure)
+
     def test_run_id_and_collision_suffix_are_non_overwriting(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

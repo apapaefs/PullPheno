@@ -282,7 +282,7 @@ class PullAndWeightTests(unittest.TestCase):
 
 
 class RunManagementTests(unittest.TestCase):
-    def test_physics_legend_is_opaque_and_outside_data_axes(self):
+    def test_physics_legend_is_opaque_and_inside_data_axes(self):
         os.environ.setdefault(
             "MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "pullpheno-matplotlib-tests")
         )
@@ -296,7 +296,13 @@ class RunManagementTests(unittest.TestCase):
         legend = analysis._place_plot_legend(axis)
         self.assertIsNotNone(legend)
         self.assertEqual(legend.get_frame().get_alpha(), 1.0)
-        self.assertGreater(legend.get_bbox_to_anchor()._bbox.x0, 1.0)
+        figure.canvas.draw()
+        legend_bounds = legend.get_window_extent(figure.canvas.get_renderer())
+        axis_bounds = axis.get_window_extent(figure.canvas.get_renderer())
+        self.assertGreaterEqual(legend_bounds.x0, axis_bounds.x0)
+        self.assertLessEqual(legend_bounds.x1, axis_bounds.x1)
+        self.assertGreaterEqual(legend_bounds.y0, axis_bounds.y0)
+        self.assertLessEqual(legend_bounds.y1, axis_bounds.y1)
         np.testing.assert_allclose(
             matplotlib.colors.to_rgba(legend.get_texts()[0].get_color()),
             matplotlib.colors.to_rgba("#172033"),

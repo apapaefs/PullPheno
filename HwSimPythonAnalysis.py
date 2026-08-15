@@ -3408,11 +3408,11 @@ def _save_figure_exclusive(figure: Any, path: Path, **kwargs: Any) -> None:
 def _place_plot_legend(
     axis: Any,
     *,
-    outside: bool = True,
+    outside: bool = False,
     location: str = "best",
     columns: int = 1,
 ) -> Any:
-    """Draw a high-contrast legend without obscuring physics distributions."""
+    """Draw a high-contrast legend inside the data panel by default."""
     handles, labels = axis.get_legend_handles_labels()
     if not handles:
         return None

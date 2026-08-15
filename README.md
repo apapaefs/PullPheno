@@ -86,6 +86,67 @@ the final-state cross section consumed by the analysis.  The latter includes
 one factor of `BR(H to gamma gamma)=0.002270` for `VBFH` and `QCDHjj`; no extra
 branching factor is applied to `aajj` or the decay-inclusive Z samples.
 
+### Odysseus campaign 4: independent CR scenarios
+
+Campaign 4 provides two complete, statistically independent five-process
+Herwig sets with one million events per process:
+
+- `samples_odysseus_campaign00004_herwig.json`: default Herwig;
+- `samples_odysseus_campaign00004_herwig_preco025.json`: all five processes
+  generated with `ReconnectionProbability=0.25`.
+
+Both manifests deliberately use the campaign-4 nominal final-state cross
+sections.  The pReco manifest separately records its own generator cross-section
+estimates and uncertainties as provenance; those estimates do not alter its
+normalisation.  Before production, run both scenario commands with the same
+`--max-events 1000` and `-smoke` run-name suffix, using the partial nominal run
+as the pReco smoke-test model.  Never reuse a partial model run for the full
+production sample.  The production nominal command, which trains and freezes
+the five-fold XGBoost ensemble, is:
+
+```bash
+source /home/apapaefs/Projects/root/root_v6.40.02/bin/thisroot.sh
+.venv-odysseus/bin/python HwSimPythonAnalysis.py \
+  --samples samples_odysseus_campaign00004_herwig.json \
+  --analyses cutbased xgboost \
+  --output-root /micron/Projects/PullPheno/analysis-results \
+  --run-name campaign00004-herwig \
+  --workers 5
+```
+
+Use the completed path printed by that command as `NOMINAL_RUN`, and apply the
+frozen ensemble to the independent pReco set:
+
+```bash
+.venv-odysseus/bin/python HwSimPythonAnalysis.py \
+  --samples samples_odysseus_campaign00004_herwig_preco025.json \
+  --analyses cutbased xgboost \
+  --xgb-model-run NOMINAL_RUN \
+  --output-root /micron/Projects/PullPheno/analysis-results \
+  --run-name campaign00004-herwig-preco025 \
+  --workers 5
+```
+
+With `PRECO_RUN` set to the second completed path, construct the comparison
+without reopening a ROOT file:
+
+```bash
+.venv-odysseus/bin/python HwSimPythonAnalysis.py \
+  --compare-runs NOMINAL_RUN PRECO_RUN \
+  --analyses cutbased xgboost \
+  --output-root /micron/Projects/PullPheno/analysis-results \
+  --run-name campaign00004-cr-comparison
+```
+
+The comparison run sums all processes within each scenario and produces
+non-stacked error-bar plots for the five pull observables, separately for
+projected counting and finite-MC uncertainties.  Its lower panels show each
+scenario relative to the first run.  It also stores full covariance matrices,
+$R_i$, $f_{\rm beam}$, differences, directional $f_{\rm beam}$ sensitivities
+and six-bin Mahalanobis $D^2$.  To add another complete CR scenario, analyze it
+with the same `NOMINAL_RUN` models and append its completed path to
+`--compare-runs`; the existing source runs remain untouched.
+
 The manifest assigns each process an XGBoost `role` of `signal` or
 `background`.  The classifiers use only $m_{jj}$,
 $|\Delta y_{jj}|$, the two tagging-jet transverse momenta, boson $p_T$ and

@@ -226,6 +226,52 @@ class PullAndWeightTests(unittest.TestCase):
         np.testing.assert_allclose(split, [0.5, 0.0, 0.0, 0.0, 0.0, 0.5])
         np.testing.assert_allclose(np.outer(split, split)[0, 5], 0.25)
 
+    def test_all_pull_observables_store_same_event_jet_correlations(self):
+        moments = analysis.PullObservableMoments(np.asarray([0.0, 1.0, 2.0]))
+        moments.fill((0.2, 1.2), 2.0)
+        np.testing.assert_allclose(moments.bin_sumw, [1.0, 1.0])
+        np.testing.assert_allclose(
+            moments.event_second_sumw, [[0.5, 0.5], [0.5, 0.5]]
+        )
+        np.testing.assert_allclose(
+            moments.mc_second_sumw2, [[1.0, 1.0], [1.0, 1.0]]
+        )
+
+    def test_total_observable_uses_reference_cross_section_and_covariance_scaling(self):
+        spec = analysis.SampleSpec(
+            "VBFH", "higgs", ("unused.root",), 99.0, "VBF H", "#000000", 0
+        )
+        result = analysis.initialize_result(spec, 10, 10.0)
+        beam = analysis.PullVector(0.01, 0.0, 0.01, 0.01, 0.0, False)
+        side = analysis.PullVector(0.0, 0.01, 0.0, 0.01, math.pi / 2.0, False)
+        result.cutflow["boson_centrality"].fill(2.0)
+        analysis.fill_pull_histograms(result, (beam, side), 2.0)
+        low = analysis.total_pull_observable_statistics(
+            "higgs", "cutbased", "folded_pull_angle", (result,), 300.0, {"VBFH": 2.0}
+        )
+        high = analysis.total_pull_observable_statistics(
+            "higgs", "cutbased", "folded_pull_angle", (result,), 3000.0, {"VBFH": 2.0}
+        )
+        self.assertAlmostEqual(np.sum(low["yield"]), 120000.0)
+        np.testing.assert_allclose(high["data_covariance"], 10.0 * low["data_covariance"])
+        np.testing.assert_allclose(high["mc_covariance"], 100.0 * low["mc_covariance"])
+
+    def test_independent_ratio_error_and_mahalanobis_rank(self):
+        numerator = np.asarray([12.0, 8.0])
+        reference = np.asarray([10.0, 0.0])
+        covariance = np.diag([4.0, 1.0])
+        ratios, errors = analysis.propagated_independent_ratio_errors(
+            numerator, covariance, reference, covariance, include_reference=True
+        )
+        self.assertAlmostEqual(ratios[0], 1.2)
+        self.assertTrue(math.isnan(ratios[1]))
+        self.assertAlmostEqual(errors[0] ** 2, 4.0 / 100.0 + 144.0 * 4.0 / 10000.0)
+        distance = analysis.mahalanobis_distance(
+            np.asarray([1.0, -1.0]), np.asarray([[1.0, -1.0], [-1.0, 1.0]])
+        )
+        self.assertEqual(distance["covariance_rank"], 1)
+        self.assertAlmostEqual(distance["D2"], 1.0)
+
     def test_histogram_folds_underflow_and_overflow_and_tracks_sumw2(self):
         histogram = analysis.WeightedHistogram(np.asarray([0.0, 1.0, 2.0]))
         histogram.fill(-4.0, 2.0)
@@ -280,6 +326,243 @@ class RunManagementTests(unittest.TestCase):
             catalog = json.loads(runs_json.read_text())
             self.assertEqual([item["run_id"] for item in catalog], ["complete-run"])
             self.assertIn("runs/complete-run/index.html", index.read_text())
+
+    def test_campaign4_manifest_records_scenario_and_generator_provenance(self):
+        manifest = Path(__file__).resolve().parents[1] / (
+            "samples_odysseus_campaign00004_herwig_preco025.json"
+        )
+        config = analysis.read_manifest(manifest)
+        self.assertEqual(config.scenario.identifier, "herwig-preco025")
+        self.assertEqual(config.scenario.parameters["ReconnectionProbability"], 0.25)
+        samples = {sample.name: sample for sample in config.samples}
+        self.assertAlmostEqual(samples["QCDZjj"].cross_section_pb, 92.84)
+        self.assertAlmostEqual(samples["QCDZjj"].generator_cross_section_pb, 92.66)
+        self.assertIsNotNone(samples["QCDZjj"].generator_cross_section_unc_pb)
+
+    def test_histogram_archive_contains_each_pull_observable_moment(self):
+        spec = analysis.SampleSpec(
+            "VBFH", "higgs", ("unused.root",), 1.0, "VBF H", "#000000", 0
+        )
+        result = analysis.initialize_result(spec, 1, 1.0)
+        pull = analysis.PullVector(0.01, 0.02, 0.01, math.hypot(0.01, 0.02), 0.2, False)
+        analysis.fill_pull_histograms(result, (pull, pull), 1.0)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = analysis.write_histogram_npz(Path(temporary), (result,))
+            with np.load(path) as archive:
+                for observable in analysis.PULL_OBSERVABLE_KEYS:
+                    prefix = f"cutbased__VBFH__pull_moment__{observable}"
+                    self.assertIn(f"{prefix}__edges", archive.files)
+                    self.assertIn(f"{prefix}__event_second_sumw", archive.files)
+
+    def test_compare_runs_parser_requires_two_sources(self):
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            analysis.parse_arguments(["--compare-runs", "only-one"])
+        parsed = analysis.parse_arguments(
+            ["--compare-runs", "nominal", "variation", "--analyses", "cutbased"]
+        )
+        self.assertEqual(len(parsed.compare_runs), 2)
+
+    def test_comparison_statistics_support_independent_scenarios(self):
+        def make_source(root, run_id, scenario, angle):
+            specs = (
+                analysis.SampleSpec(
+                    "VBFH", "higgs", (f"{run_id}-h.root",), 2.0,
+                    "VBF H", "#000000", 0, "signal"
+                ),
+                analysis.SampleSpec(
+                    "VBFZ", "z", (f"{run_id}-z.root",), 3.0,
+                    "VBF Z", "#111111", 0, "signal"
+                ),
+            )
+            results = []
+            for spec in specs:
+                result = analysis.initialize_result(spec, 2, 2.0)
+                result.cutflow[analysis.cutflow_steps(spec.channel)[-1]].fill(1.0)
+                pull = analysis.PullVector(
+                    math.cos(angle) * 0.01,
+                    math.sin(angle) * 0.01,
+                    math.cos(angle) * 0.01,
+                    0.01,
+                    angle,
+                    False,
+                )
+                analysis.fill_pull_histograms(result, (pull, pull), 1.0)
+                results.append(result)
+            config = analysis.AnalysisConfig(
+                "Data", (300.0,), specs, f"{run_id}.json", scenario
+            )
+            metadata = {
+                "status": "complete",
+                "run_id": run_id,
+                "run_name": run_id,
+                "partial": False,
+                "max_events_per_sample": None,
+                "configuration": {"cuts": dict(analysis.CUTS)},
+            }
+            return analysis.ComparisonSource(
+                root / run_id, config, tuple(results), metadata, scenario
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            nominal = make_source(
+                root,
+                "nominal",
+                analysis.ScenarioSpec("nominal", "Nominal", "#123456"),
+                0.1,
+            )
+            variation = make_source(
+                root,
+                "variation",
+                analysis.ScenarioSpec("variation", "Variation", "#654321"),
+                2.7,
+            )
+            cross_sections = analysis.validate_comparison_sources(
+                (nominal, variation), ("cutbased",)
+            )
+            payload, numerical = analysis.build_comparison_statistics(
+                (nominal, variation), ("cutbased",), (300.0,), cross_sections
+            )
+        self.assertEqual(
+            set(payload["analyses"]["cutbased"]["higgs"]["observables"]),
+            set(analysis.PULL_OBSERVABLE_KEYS),
+        )
+        difference = payload["analyses"]["cutbased"]["higgs"][
+            "differences_from_reference"
+        ]["variation"]
+        self.assertNotEqual(difference["delta_f_beam"], 0.0)
+        self.assertEqual(
+            len(difference["independent_mc_difference_covariance"]),
+            analysis.PULL_BIN_COUNT,
+        )
+        scenario_values = payload["analyses"]["cutbased"]["higgs"]["scenarios"]
+        np.testing.assert_allclose(
+            difference["independent_mc_difference_covariance"],
+            np.asarray(scenario_values["nominal"]["mc_statistical_covariance"])
+            + np.asarray(scenario_values["variation"]["mc_statistical_covariance"]),
+        )
+        key = ("cutbased", "higgs", 300.0, "signed_pull_angle", "variation")
+        self.assertIn(key, numerical)
+
+    def test_comparison_mode_creates_immutable_catalogued_run_without_root_io(self):
+        def write_source(output_root, run_id, scenario, beam_events):
+            run_dir = output_root / "runs" / run_id
+            run_dir.mkdir(parents=True)
+            specs = (
+                analysis.SampleSpec(
+                    "VBFH", "higgs", (f"{run_id}-h.root",), 2.0,
+                    "VBF H", "#000000", 0, "signal"
+                ),
+                analysis.SampleSpec(
+                    "VBFZ", "z", (f"{run_id}-z.root",), 3.0,
+                    "VBF Z", "#111111", 0, "signal"
+                ),
+            )
+            results = []
+            for spec in specs:
+                result = analysis.initialize_result(spec, 4, 4.0)
+                result.processed_entries = 4
+                result.processed_sumw = 4.0
+                for event_index in range(4):
+                    for step in analysis.cutflow_steps(spec.channel):
+                        result.cutflow[step].fill(1.0)
+                    angle = 0.1 if event_index < beam_events else 2.8
+                    pull = analysis.PullVector(
+                        math.cos(angle) * 0.01,
+                        math.sin(angle) * 0.01,
+                        math.cos(angle) * 0.01,
+                        0.01,
+                        angle,
+                        False,
+                    )
+                    analysis.fill_pull_histograms(result, (pull, pull), 1.0)
+                results.append(result)
+            configuration = {
+                "analysis_version": analysis.ANALYSIS_VERSION,
+                "tree_name": "Data",
+                "luminosities_fb": [300.0],
+                "samples": [analysis.asdict(spec) for spec in specs],
+                "scenario": analysis.asdict(scenario),
+                "cuts": dict(analysis.CUTS),
+                "source_manifest": f"{run_id}.json",
+                "analyses": ["cutbased"],
+            }
+            analysis.write_json_exclusive(
+                run_dir / "summaries" / "analysis.json",
+                {
+                    "analysis_version": analysis.ANALYSIS_VERSION,
+                    "partial": False,
+                    "luminosities_fb": [300.0],
+                    "samples": [analysis.result_summary(result, (300.0,)) for result in results],
+                },
+            )
+            analysis.write_histogram_npz(run_dir, results)
+            analysis.write_json_exclusive(
+                run_dir / "run.json",
+                {
+                    "status": "complete",
+                    "run_type": "analysis",
+                    "run_id": run_id,
+                    "run_name": run_id,
+                    "analysis_version": analysis.ANALYSIS_VERSION,
+                    "completed_utc": "2026-08-15T00:00:00+00:00",
+                    "partial": False,
+                    "max_events_per_sample": None,
+                    "analyses": ["cutbased"],
+                    "configuration_hash": run_id,
+                    "configuration": configuration,
+                    "scenario": analysis.asdict(scenario),
+                    "samples": [],
+                },
+            )
+            (run_dir / "index.html").write_text(
+                "<!doctype html><title>source</title>", encoding="utf-8"
+            )
+            return run_dir
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output_root = Path(temporary)
+            nominal = write_source(
+                output_root,
+                "nominal-run",
+                analysis.ScenarioSpec("nominal", "Nominal", "#123456"),
+                3,
+            )
+            variation = write_source(
+                output_root,
+                "variation-run",
+                analysis.ScenarioSpec("variation", "Variation", "#654321"),
+                1,
+            )
+            args = analysis.parse_arguments(
+                [
+                    "--compare-runs", str(nominal), str(variation),
+                    "--analyses", "cutbased",
+                    "--output-root", str(output_root),
+                    "--run-name", "synthetic-comparison",
+                ]
+            )
+            with mock.patch("sys.stdout"):
+                status = analysis.run_comparison(
+                    args, datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc)
+                )
+            completed = [
+                path for path in (output_root / "runs").iterdir()
+                if path.name not in {"nominal-run", "variation-run"}
+            ]
+            self.assertEqual(status, 0)
+            self.assertEqual(len(completed), 1)
+            comparison = json.loads(
+                (completed[0] / "summaries" / "comparison.json").read_text()
+            )
+            self.assertEqual(comparison["reference_run_id"], "nominal-run")
+            self.assertTrue((completed[0] / "summaries" / "comparison.csv").is_file())
+            self.assertTrue((completed[0] / "summaries" / "comparison.npz").is_file())
+            plots = json.loads((completed[0] / "summaries" / "plots.json").read_text())
+            self.assertEqual(len(plots), 20)
+            analysis.validate_html_links(completed[0] / "index.html")
+            catalog = json.loads((output_root / "runs.json").read_text())
+            self.assertEqual(catalog[0]["run_type"], "comparison")
 
 
 class XGBoostHelperTests(unittest.TestCase):

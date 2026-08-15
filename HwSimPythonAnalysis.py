@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Particle-level cut-based pull-angle analysis for HwSim ROOT events.
+"""Particle-level cut-based, XGBoost and CR-comparison analysis for HwSim events.
 
 The module is deliberately import-safe: ROOT, FastJet and Matplotlib are loaded
 only by the command-line execution path.  This keeps the object selection,
@@ -37,13 +37,33 @@ import numpy as np
 import xgboost_root_varfiles_module as xgbtools
 
 
-ANALYSIS_VERSION = "2.1.0"
+ANALYSIS_VERSION = "2.2.0"
 MZ_GEV = 91.1876
 NEUTRINO_IDS = frozenset((12, 14, 16))
 ANALYSIS_STRATEGIES = ("cutbased", "xgboost")
 PULL_BIN_COUNT = 6
 PULL_BIN_EDGES = np.linspace(0.0, math.pi, PULL_BIN_COUNT + 1, dtype=np.float64)
 PULL_VALUE_NAMES = ("t_beam", "t_phi", "magnitude", "signed_angle", "zero_magnitude")
+PULL_OBSERVABLE_KEYS = (
+    "pull_t_beam",
+    "pull_t_phi",
+    "pull_magnitude",
+    "signed_pull_angle",
+    "folded_pull_angle",
+)
+PULL_MOMENT_MODEL = "event_level_two_tagging_jet_all_pull_observables"
+COMPARISON_PINV_RCOND = 1.0e-12
+COMPARISON_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "*", "<", ">")
+COMPARISON_COLORS = (
+    "#275DAD",
+    "#D05A47",
+    "#0D8274",
+    "#8A5FBF",
+    "#D18B20",
+    "#4F6D7A",
+    "#B64E75",
+    "#4E8A3A",
+)
 
 CUTS: Dict[str, float] = {
     "photon_pt_lead_min_gev": 40.0,
@@ -271,6 +291,18 @@ class SampleSpec:
     color: str
     stack_order: int
     role: str = "background"
+    generator_cross_section_pb: Optional[float] = None
+    generator_cross_section_unc_pb: Optional[float] = None
+    cross_section_unc_pb: Optional[float] = None
+    cross_section_source: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ScenarioSpec:
+    identifier: str
+    label: str
+    color: Optional[str] = None
+    parameters: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -279,6 +311,7 @@ class AnalysisConfig:
     luminosities_fb: Tuple[float, ...]
     samples: Tuple[SampleSpec, ...]
     source_manifest: str
+    scenario: Optional[ScenarioSpec] = None
 
 
 @dataclass(frozen=True)
@@ -334,6 +367,31 @@ class CutStat:
 
 
 @dataclass
+class PullObservableMoments:
+    edges: np.ndarray
+    bin_sumw: np.ndarray = field(init=False)
+    event_second_sumw: np.ndarray = field(init=False)
+    mc_second_sumw2: np.ndarray = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.edges = np.asarray(self.edges, dtype=np.float64)
+        if self.edges.ndim != 1 or len(self.edges) < 2 or np.any(np.diff(self.edges) <= 0.0):
+            raise ValueError("Pull-observable moment edges must be strictly increasing")
+        bins = len(self.edges) - 1
+        self.bin_sumw = np.zeros(bins, dtype=np.float64)
+        self.event_second_sumw = np.zeros((bins, bins), dtype=np.float64)
+        self.mc_second_sumw2 = np.zeros((bins, bins), dtype=np.float64)
+
+    def fill(self, values: Sequence[float], event_weight: float) -> None:
+        q_vector = event_histogram_bin_vector(self.edges, values)
+        weight = float(event_weight)
+        self.bin_sumw += weight * q_vector
+        outer = np.outer(q_vector, q_vector)
+        self.event_second_sumw += weight * outer
+        self.mc_second_sumw2 += weight * weight * outer
+
+
+@dataclass
 class SampleResult:
     spec: SampleSpec
     total_entries: int
@@ -359,7 +417,10 @@ class SampleResult:
     pull_mc_second_sumw2: np.ndarray = field(
         default_factory=lambda: np.zeros((PULL_BIN_COUNT, PULL_BIN_COUNT), dtype=np.float64)
     )
-    pull_moment_model: str = "event_level_two_jet"
+    pull_observable_moments: MutableMapping[str, PullObservableMoments] = field(
+        default_factory=dict
+    )
+    pull_moment_model: str = PULL_MOMENT_MODEL
     invalid_events: int = 0
     files: List[Dict[str, Any]] = field(default_factory=list)
     common_events: Optional["CommonEventTable"] = None
@@ -459,6 +520,16 @@ class RunReservation:
     final_dir: Path
 
 
+@dataclass(frozen=True)
+class ComparisonSource:
+    run_dir: Path
+    config: AnalysisConfig
+    results: Tuple[SampleResult, ...]
+    metadata: Mapping[str, Any]
+    scenario: ScenarioSpec
+    xgboost_metadata: Optional[Mapping[str, Any]] = None
+
+
 def _grow_array(array: np.ndarray, new_capacity: int) -> np.ndarray:
     shape = (int(new_capacity),) + array.shape[1:]
     grown = np.empty(shape, dtype=array.dtype)
@@ -471,14 +542,24 @@ def histogram_bin_index(edges: np.ndarray, value: float) -> int:
     return min(max(index, 0), len(edges) - 2)
 
 
+def event_histogram_bin_vector(edges: np.ndarray, values: Sequence[float]) -> np.ndarray:
+    """Represent two tagging-jet entries as one half-weight event vector."""
+    if len(values) != 2:
+        raise ValueError("Exactly two tagging-jet observable values are required")
+    bin_edges = np.asarray(edges, dtype=np.float64)
+    vector = np.zeros(len(bin_edges) - 1, dtype=np.float64)
+    for value in values:
+        vector[histogram_bin_index(bin_edges, float(value))] += 0.5
+    return vector
+
+
 def pull_event_bin_vector(signed_angles: Sequence[float]) -> np.ndarray:
     if len(signed_angles) != 2:
         raise ValueError("Exactly two tagging-jet pull angles are required")
-    vector = np.zeros(PULL_BIN_COUNT, dtype=np.float64)
-    for angle in signed_angles:
-        folded = fold_signed_pull_angle(float(angle))
-        vector[histogram_bin_index(PULL_BIN_EDGES, folded)] += 0.5
-    return vector
+    return event_histogram_bin_vector(
+        PULL_BIN_EDGES,
+        [fold_signed_pull_angle(float(angle)) for angle in signed_angles],
+    )
 
 
 def normalized_fraction_covariance(
@@ -880,6 +961,37 @@ def read_manifest(path: Path, luminosity_override: Optional[Sequence[float]] = N
     luminosities = tuple(float(value) for value in (luminosity_override or payload.get("luminosities_fb", (300.0, 3000.0))))
     if not luminosities or any(value <= 0.0 or not math.isfinite(value) for value in luminosities):
         raise ValueError("Luminosities must be finite positive values")
+    scenario: Optional[ScenarioSpec] = None
+    raw_scenario = payload.get("scenario")
+    if raw_scenario is not None:
+        if not isinstance(raw_scenario, Mapping):
+            raise ValueError("Manifest scenario metadata must be an object")
+        identifier = str(raw_scenario.get("id", "")).strip()
+        label = str(raw_scenario.get("label", "")).strip()
+        if not identifier or sanitize_run_name(identifier) != identifier:
+            raise ValueError("Scenario id must be a non-empty sanitized identifier")
+        if not label:
+            raise ValueError("Scenario label must be non-empty")
+        parameters = raw_scenario.get("parameters", {})
+        if not isinstance(parameters, Mapping):
+            raise ValueError("Scenario parameters must be an object")
+        color_value = raw_scenario.get("color")
+        scenario = ScenarioSpec(
+            identifier=identifier,
+            label=label,
+            color=None if color_value is None else str(color_value),
+            parameters=dict(parameters),
+        )
+
+    def optional_number(raw: Mapping[str, Any], key: str) -> Optional[float]:
+        value = raw.get(key)
+        if value is None:
+            return None
+        parsed = float(value)
+        if parsed < 0.0 or not math.isfinite(parsed):
+            raise ValueError(f"Sample metadata {key} must be finite and non-negative")
+        return parsed
+
     samples: List[SampleSpec] = []
     seen_names = set()
     for raw in payload.get("samples", []):
@@ -912,6 +1024,16 @@ def read_manifest(path: Path, luminosity_override: Optional[Sequence[float]] = N
                 label=str(raw.get("label", name)),
                 color=str(raw.get("color", "#4C78A8")),
                 stack_order=int(raw.get("stack_order", 0)),
+                generator_cross_section_pb=optional_number(raw, "generator_cross_section_pb"),
+                generator_cross_section_unc_pb=optional_number(
+                    raw, "generator_cross_section_unc_pb"
+                ),
+                cross_section_unc_pb=optional_number(raw, "cross_section_unc_pb"),
+                cross_section_source=(
+                    None
+                    if raw.get("cross_section_source") is None
+                    else str(raw["cross_section_source"])
+                ),
             )
         )
     if not samples:
@@ -919,7 +1041,7 @@ def read_manifest(path: Path, luminosity_override: Optional[Sequence[float]] = N
     for channel in ("higgs", "z"):
         if not any(sample.channel == channel for sample in samples):
             raise ValueError(f"Manifest contains no {channel} samples")
-    return AnalysisConfig(tree_name, luminosities, tuple(samples), str(path))
+    return AnalysisConfig(tree_name, luminosities, tuple(samples), str(path), scenario)
 
 
 def resolved_config_payload(
@@ -933,6 +1055,7 @@ def resolved_config_payload(
         "tree_name": config.tree_name,
         "luminosities_fb": list(config.luminosities_fb),
         "samples": [asdict(sample) for sample in config.samples],
+        "scenario": None if config.scenario is None else asdict(config.scenario),
         "cuts": dict(CUTS),
         "max_events_per_sample": max_events,
         "source_manifest": config.source_manifest,
@@ -1060,6 +1183,21 @@ def initialize_result(
         (step, CutStat()) for step in cutflow_steps(spec.channel, strategy)
     )
     result.histograms = {item.key: WeightedHistogram(item.edges.copy()) for item in relevant_specs}
+    pull_specs = {
+        item.key: item
+        for item in relevant_specs
+        if item.key in PULL_OBSERVABLE_KEYS
+    }
+    if set(pull_specs) != set(PULL_OBSERVABLE_KEYS):
+        raise RuntimeError(f"Incomplete pull-observable registry for {spec.channel}")
+    result.pull_observable_moments = {
+        key: PullObservableMoments(pull_specs[key].edges.copy())
+        for key in PULL_OBSERVABLE_KEYS
+    }
+    folded = result.pull_observable_moments["folded_pull_angle"]
+    result.pull_bin_sumw = folded.bin_sumw
+    result.pull_event_second_sumw = folded.event_second_sumw
+    result.pull_mc_second_sumw2 = folded.mc_second_sumw2
     return result
 
 
@@ -1093,14 +1231,48 @@ def load_completed_run(
             color=str(raw["color"]),
             stack_order=int(raw["stack_order"]),
             role=str(raw.get("role", "background")),
+            generator_cross_section_pb=(
+                None
+                if raw.get("generator_cross_section_pb") is None
+                else float(raw["generator_cross_section_pb"])
+            ),
+            generator_cross_section_unc_pb=(
+                None
+                if raw.get("generator_cross_section_unc_pb") is None
+                else float(raw["generator_cross_section_unc_pb"])
+            ),
+            cross_section_unc_pb=(
+                None
+                if raw.get("cross_section_unc_pb") is None
+                else float(raw["cross_section_unc_pb"])
+            ),
+            cross_section_source=(
+                None
+                if raw.get("cross_section_source") is None
+                else str(raw["cross_section_source"])
+            ),
         )
         for raw in configuration["samples"]
+    )
+    raw_scenario = configuration.get("scenario")
+    scenario = (
+        None
+        if raw_scenario is None
+        else ScenarioSpec(
+            identifier=str(raw_scenario["identifier"]),
+            label=str(raw_scenario["label"]),
+            color=(
+                None if raw_scenario.get("color") is None else str(raw_scenario["color"])
+            ),
+            parameters=dict(raw_scenario.get("parameters", {})),
+        )
     )
     config = AnalysisConfig(
         tree_name=str(configuration.get("tree_name", "Data")),
         luminosities_fb=luminosities,
         samples=samples,
         source_manifest=str(configuration.get("source_manifest", metadata_path)),
+        scenario=scenario,
     )
     specs_by_name = {sample.name: sample for sample in samples}
     results: List[SampleResult] = []
@@ -1174,29 +1346,74 @@ def load_completed_run(
             result.zero_pull_jets = int(pull.get("zero_magnitude_jets", 0))
             result.zero_pull_sumw = float(pull.get("zero_magnitude_sumw", 0.0))
             result_prefix = f"{strategy}__{spec.name}"
-            moment_keys = {
+            legacy_moment_keys = {
                 "bin": f"{result_prefix}__pull_bin_sumw",
                 "event": f"{result_prefix}__pull_event_second_sumw",
                 "mc": f"{result_prefix}__pull_mc_second_sumw2",
             }
-            if all(key in available for key in moment_keys.values()):
-                result.pull_bin_sumw = np.asarray(arrays[moment_keys["bin"]], dtype=np.float64).copy()
-                result.pull_event_second_sumw = np.asarray(
-                    arrays[moment_keys["event"]], dtype=np.float64
+            exact_observables = True
+            loaded_moments: Dict[str, PullObservableMoments] = {}
+            for observable in PULL_OBSERVABLE_KEYS:
+                prefix = f"{result_prefix}__pull_moment__{observable}"
+                moment_keys = {
+                    "edges": f"{prefix}__edges",
+                    "bin": f"{prefix}__bin_sumw",
+                    "event": f"{prefix}__event_second_sumw",
+                    "mc": f"{prefix}__mc_second_sumw2",
+                }
+                histogram = result.histograms[observable]
+                moments = PullObservableMoments(histogram.edges.copy())
+                if all(key in available for key in moment_keys.values()):
+                    stored_edges = np.asarray(arrays[moment_keys["edges"]], dtype=np.float64)
+                    if not np.array_equal(stored_edges, histogram.edges):
+                        raise ValueError(
+                            f"Stored pull-moment edges differ for {spec.name} {observable}"
+                        )
+                    moments.bin_sumw = np.asarray(
+                        arrays[moment_keys["bin"]], dtype=np.float64
+                    ).copy()
+                    moments.event_second_sumw = np.asarray(
+                        arrays[moment_keys["event"]], dtype=np.float64
+                    ).copy()
+                    moments.mc_second_sumw2 = np.asarray(
+                        arrays[moment_keys["mc"]], dtype=np.float64
+                    ).copy()
+                else:
+                    exact_observables = False
+                    moments.bin_sumw = histogram.sumw.copy()
+                    total = float(np.sum(histogram.sumw, dtype=np.float64))
+                    fractions = (
+                        histogram.sumw / total
+                        if total
+                        else np.zeros(len(histogram.sumw), dtype=np.float64)
+                    )
+                    moments.event_second_sumw = total * (
+                        0.5 * np.diag(fractions) + 0.5 * np.outer(fractions, fractions)
+                    )
+                    moments.mc_second_sumw2 = np.diag(histogram.sumw2)
+                loaded_moments[observable] = moments
+
+            if all(key in available for key in legacy_moment_keys.values()):
+                folded_moments = loaded_moments["folded_pull_angle"]
+                folded_moments.bin_sumw = np.asarray(
+                    arrays[legacy_moment_keys["bin"]], dtype=np.float64
                 ).copy()
-                result.pull_mc_second_sumw2 = np.asarray(
-                    arrays[moment_keys["mc"]], dtype=np.float64
+                folded_moments.event_second_sumw = np.asarray(
+                    arrays[legacy_moment_keys["event"]], dtype=np.float64
                 ).copy()
-                result.pull_moment_model = str(pull.get("moment_model", "event_level_two_jet"))
-            else:
-                result.pull_bin_sumw = folded.sumw.copy()
-                total = float(np.sum(folded.sumw, dtype=np.float64))
-                fractions = folded.sumw / total if total else np.zeros(PULL_BIN_COUNT)
-                result.pull_event_second_sumw = total * (
-                    0.5 * np.diag(fractions) + 0.5 * np.outer(fractions, fractions)
-                )
-                result.pull_mc_second_sumw2 = np.diag(folded.sumw2)
-                result.pull_moment_model = "legacy_independent_jet_reconstruction"
+                folded_moments.mc_second_sumw2 = np.asarray(
+                    arrays[legacy_moment_keys["mc"]], dtype=np.float64
+                ).copy()
+            result.pull_observable_moments = loaded_moments
+            folded_moments = loaded_moments["folded_pull_angle"]
+            result.pull_bin_sumw = folded_moments.bin_sumw
+            result.pull_event_second_sumw = folded_moments.event_second_sumw
+            result.pull_mc_second_sumw2 = folded_moments.mc_second_sumw2
+            result.pull_moment_model = (
+                str(pull.get("moment_model", PULL_MOMENT_MODEL))
+                if exact_observables
+                else "legacy_folded_only_or_independent_jet_reconstruction"
+            )
             results.append(result)
     return config, results, metadata
 
@@ -1278,10 +1495,17 @@ def fill_common_histograms(
 def fill_pull_histograms(result: SampleResult, pulls: Sequence[PullVector], event_weight: float) -> None:
     if len(pulls) != 2:
         raise ValueError("Exactly two tagging-jet pulls are required per selected event")
-    q_vector = pull_event_bin_vector([pull.signed_angle for pull in pulls])
-    result.pull_bin_sumw += float(event_weight) * q_vector
-    result.pull_event_second_sumw += float(event_weight) * np.outer(q_vector, q_vector)
-    result.pull_mc_second_sumw2 += float(event_weight) ** 2 * np.outer(q_vector, q_vector)
+    observable_values = {
+        "pull_t_beam": [pull.t_beam for pull in pulls],
+        "pull_t_phi": [pull.t_phi for pull in pulls],
+        "pull_magnitude": [pull.magnitude for pull in pulls],
+        "signed_pull_angle": [pull.signed_angle for pull in pulls],
+        "folded_pull_angle": [
+            fold_signed_pull_angle(pull.signed_angle) for pull in pulls
+        ],
+    }
+    for key, values in observable_values.items():
+        result.pull_observable_moments[key].fill(values, event_weight)
     for pull in pulls:
         entry_weight = 0.5 * float(event_weight)
         result.histograms["pull_t_beam"].fill(pull.t_beam, entry_weight)
@@ -2338,6 +2562,751 @@ def channel_pull_summary(
     }
 
 
+def total_pull_observable_statistics(
+    channel: str,
+    strategy: str,
+    observable: str,
+    results: Sequence[SampleResult],
+    luminosity_fb: float,
+    reference_cross_sections_pb: Mapping[str, float],
+) -> Dict[str, np.ndarray]:
+    """Combine process moments using one reference cross-section convention."""
+    if observable not in PULL_OBSERVABLE_KEYS:
+        raise ValueError(f"Unsupported pull observable: {observable}")
+    selected = [
+        result
+        for result in results
+        if result.spec.channel == channel and result.strategy == strategy
+    ]
+    if not selected:
+        raise ValueError(f"No {channel} {strategy} results are available")
+    edges = selected[0].pull_observable_moments[observable].edges
+    bin_cross_sections_pb = np.zeros(len(edges) - 1, dtype=np.float64)
+    event_second_pb = np.zeros((len(edges) - 1, len(edges) - 1), dtype=np.float64)
+    mc_second_pb2 = np.zeros_like(event_second_pb)
+    selected_cross_section_pb = 0.0
+    for result in selected:
+        if result.pull_moment_model != PULL_MOMENT_MODEL:
+            raise ValueError(
+                f"Run lacks exact all-observable event moments for "
+                f"{result.spec.name} {strategy}: {result.pull_moment_model}"
+            )
+        moments = result.pull_observable_moments[observable]
+        if not np.array_equal(moments.edges, edges):
+            raise ValueError(f"Inconsistent {observable} binning in {channel} {strategy}")
+        if result.spec.name not in reference_cross_sections_pb:
+            raise ValueError(f"Reference cross section is missing for {result.spec.name}")
+        reference_cross_section = float(reference_cross_sections_pb[result.spec.name])
+        scale_pb = reference_cross_section / result.generated_sumw
+        bin_cross_sections_pb += scale_pb * moments.bin_sumw
+        event_second_pb += scale_pb * moments.event_second_sumw
+        mc_second_pb2 += scale_pb * scale_pb * moments.mc_second_sumw2
+        final_step = cutflow_steps(channel, strategy)[-1]
+        selected_cross_section_pb += scale_pb * result.cutflow[final_step].sumw
+    if not np.all(np.isfinite(bin_cross_sections_pb)):
+        raise ValueError(f"Non-finite total {observable} prediction")
+    if not math.isclose(
+        float(np.sum(bin_cross_sections_pb, dtype=np.float64)),
+        selected_cross_section_pb,
+        rel_tol=1.0e-10,
+        abs_tol=1.0e-12,
+    ):
+        raise RuntimeError(
+            f"{channel} {strategy} {observable} integral does not match selected yield"
+        )
+    luminosity_scale = 1000.0 * float(luminosity_fb)
+    return {
+        "edges": edges.copy(),
+        "bin_cross_sections_pb": bin_cross_sections_pb,
+        "event_second_pb": event_second_pb,
+        "mc_second_pb2": mc_second_pb2,
+        "yield": luminosity_scale * bin_cross_sections_pb,
+        "data_covariance": luminosity_scale * event_second_pb,
+        "mc_covariance": luminosity_scale * luminosity_scale * mc_second_pb2,
+        "selected_cross_section_pb": np.asarray(selected_cross_section_pb),
+    }
+
+
+def propagated_independent_ratio_errors(
+    numerator: np.ndarray,
+    numerator_covariance: np.ndarray,
+    reference: np.ndarray,
+    reference_covariance: np.ndarray,
+    *,
+    include_reference: bool,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return central ratios and delta-method errors, masking zero reference bins."""
+    numerator = np.asarray(numerator, dtype=np.float64)
+    reference = np.asarray(reference, dtype=np.float64)
+    numerator_covariance = np.asarray(numerator_covariance, dtype=np.float64)
+    reference_covariance = np.asarray(reference_covariance, dtype=np.float64)
+    if numerator.shape != reference.shape:
+        raise ValueError("Ratio numerator and reference shapes differ")
+    ratios = np.full(numerator.shape, np.nan, dtype=np.float64)
+    errors = np.full(numerator.shape, np.nan, dtype=np.float64)
+    mask = reference != 0.0
+    ratios[mask] = numerator[mask] / reference[mask]
+    variance = np.zeros_like(numerator)
+    variance[mask] = np.diag(numerator_covariance)[mask] / np.square(reference[mask])
+    if include_reference:
+        variance[mask] += (
+            np.square(numerator[mask])
+            * np.diag(reference_covariance)[mask]
+            / np.power(reference[mask], 4)
+        )
+    errors[mask] = np.sqrt(np.maximum(variance[mask], 0.0))
+    return ratios, errors
+
+
+def mahalanobis_distance(
+    difference: np.ndarray,
+    covariance: np.ndarray,
+    rcond: float = COMPARISON_PINV_RCOND,
+) -> Dict[str, Any]:
+    """Evaluate D^2 in the supported covariance subspace."""
+    delta = np.asarray(difference, dtype=np.float64)
+    matrix = np.asarray(covariance, dtype=np.float64)
+    if matrix.shape != (len(delta), len(delta)):
+        raise ValueError("Mahalanobis covariance shape differs from the vector")
+    matrix = 0.5 * (matrix + matrix.T)
+    eigenvalues, eigenvectors = np.linalg.eigh(matrix)
+    maximum = max(float(np.max(np.abs(eigenvalues))), 0.0)
+    tolerance = max(float(rcond) * maximum, np.finfo(np.float64).eps)
+    supported = eigenvalues > tolerance
+    rank = int(np.count_nonzero(supported))
+    if rank:
+        projection = eigenvectors[:, supported].T @ delta
+        d_squared = float(np.sum(np.square(projection) / eigenvalues[supported]))
+    else:
+        d_squared = 0.0
+    return {
+        "D2": max(d_squared, 0.0),
+        "mahalanobis_separation": math.sqrt(max(d_squared, 0.0)),
+        "covariance_rank": rank,
+        "pseudoinverse_tolerance": tolerance,
+        "pseudoinverse_rcond": float(rcond),
+    }
+
+
+def _xgboost_model_signature(metadata: Mapping[str, Any]) -> Dict[str, Any]:
+    signature: Dict[str, Any] = {"feature_names": list(metadata.get("feature_names", ())), "channels": {}}
+    for channel, values in metadata.get("channels", {}).items():
+        if values.get("models"):
+            models = sorted(values["models"], key=lambda item: int(item["fold"]))
+            channel_signature = [
+                {
+                    "fold": int(item["fold"]),
+                    "model_sha256": str(item["model_sha256"]),
+                    "score_threshold": float(item["score_threshold"]),
+                }
+                for item in models
+            ]
+        else:
+            channel_signature = [
+                {
+                    "fold": 0,
+                    "model_sha256": str(values["model_sha256"]),
+                    "score_threshold": float(values["score_threshold"]),
+                }
+            ]
+        signature["channels"][str(channel)] = channel_signature
+    return signature
+
+
+def _scenario_from_run(
+    run_dir: Path,
+    config: AnalysisConfig,
+    metadata: Mapping[str, Any],
+    index: int,
+) -> ScenarioSpec:
+    if config.scenario is not None:
+        scenario = config.scenario
+    else:
+        fallback = sanitize_run_name(str(metadata.get("run_name") or metadata["run_id"]))
+        scenario = ScenarioSpec(
+            identifier=fallback or f"scenario-{index + 1}",
+            label=str(metadata.get("run_name") or metadata["run_id"]),
+        )
+    color = scenario.color or COMPARISON_COLORS[index % len(COMPARISON_COLORS)]
+    return ScenarioSpec(scenario.identifier, scenario.label, color, dict(scenario.parameters))
+
+
+def resolve_comparison_source(
+    value: Path,
+    output_root: Path,
+    luminosities: Optional[Sequence[float]],
+    index: int,
+) -> ComparisonSource:
+    candidate = value.expanduser()
+    if not candidate.exists():
+        candidate = output_root.expanduser().resolve() / "runs" / str(value)
+    run_dir = candidate.resolve()
+    expected_parent = (output_root.expanduser().resolve() / "runs").resolve()
+    if run_dir.parent != expected_parent:
+        raise ValueError(
+            f"Comparison source {run_dir} is not inside {expected_parent}; "
+            "portable source links require one output root"
+        )
+    config, results, metadata = load_completed_run(run_dir, luminosities)
+    xgb_path = run_dir / "summaries" / "xgboost.json"
+    xgb_metadata = (
+        json.loads(xgb_path.read_text(encoding="utf-8")) if xgb_path.is_file() else None
+    )
+    return ComparisonSource(
+        run_dir=run_dir,
+        config=config,
+        results=tuple(results),
+        metadata=metadata,
+        scenario=_scenario_from_run(run_dir, config, metadata, index),
+        xgboost_metadata=xgb_metadata,
+    )
+
+
+def validate_comparison_sources(
+    sources: Sequence[ComparisonSource],
+    analyses: Sequence[str],
+) -> Dict[str, float]:
+    if len(sources) < 2:
+        raise ValueError("At least two completed runs are required for comparison")
+    if len({source.run_dir for source in sources}) != len(sources):
+        raise ValueError("Comparison source runs must be distinct")
+    if len({source.scenario.identifier for source in sources}) != len(sources):
+        raise ValueError("Comparison scenario ids must be unique")
+    reference = sources[0]
+    reference_samples = {
+        sample.name: (sample.channel, sample.role) for sample in reference.config.samples
+    }
+    reference_cross_sections = {
+        sample.name: float(sample.cross_section_pb) for sample in reference.config.samples
+    }
+    reference_cuts = reference.metadata.get("configuration", {}).get("cuts", {})
+    reference_tree = reference.config.tree_name
+    reference_partial = bool(reference.metadata.get("partial"))
+    reference_max_events = reference.metadata.get("max_events_per_sample")
+    reference_version = reference.metadata.get("analysis_version")
+    reference_strategies = {result.strategy for result in reference.results}
+    reference_xgb_signature = (
+        _xgboost_model_signature(reference.xgboost_metadata)
+        if "xgboost" in analyses and reference.xgboost_metadata is not None
+        else None
+    )
+    for source in sources:
+        available = {result.strategy for result in source.results}
+        if available != reference_strategies:
+            raise ValueError(f"Analysis strategies differ in source run {source.run_dir}")
+        missing = set(analyses) - available
+        if missing:
+            raise ValueError(f"Source run {source.run_dir} is missing analyses {sorted(missing)}")
+        identities = {
+            sample.name: (sample.channel, sample.role) for sample in source.config.samples
+        }
+        if identities != reference_samples:
+            raise ValueError(f"Process identities differ in source run {source.run_dir}")
+        if source.config.tree_name != reference_tree:
+            raise ValueError(f"ROOT tree setting differs in source run {source.run_dir}")
+        if source.metadata.get("analysis_version") != reference_version:
+            raise ValueError(f"Analysis version differs in source run {source.run_dir}")
+        if source.metadata.get("configuration", {}).get("cuts", {}) != reference_cuts:
+            raise ValueError(f"Analysis cuts differ in source run {source.run_dir}")
+        if bool(source.metadata.get("partial")) != reference_partial or source.metadata.get(
+            "max_events_per_sample"
+        ) != reference_max_events:
+            raise ValueError("Full and partial runs, or unequal event limits, cannot be compared")
+        for result in source.results:
+            if result.strategy not in analyses:
+                continue
+            if result.pull_moment_model != PULL_MOMENT_MODEL:
+                raise ValueError(
+                    f"Comparison source {source.run_dir.name} lacks required event-level "
+                    f"moments for {result.spec.name} {result.strategy}"
+                )
+            for observable in PULL_OBSERVABLE_KEYS:
+                histogram = result.histograms[observable]
+                moments = result.pull_observable_moments[observable]
+                if not np.array_equal(histogram.edges, moments.edges):
+                    raise ValueError(
+                        f"Histogram/moment binning mismatch for {observable} in {source.run_dir}"
+                    )
+                reference_result = next(
+                    item
+                    for item in reference.results
+                    if item.spec.name == result.spec.name and item.strategy == result.strategy
+                )
+                if not np.array_equal(
+                    moments.edges,
+                    reference_result.pull_observable_moments[observable].edges,
+                ):
+                    raise ValueError(
+                        f"Pull-observable binning differs for {observable} in {source.run_dir}"
+                    )
+            reference_result = next(
+                item
+                for item in reference.results
+                if item.spec.name == result.spec.name and item.strategy == result.strategy
+            )
+            if set(result.histograms) != set(reference_result.histograms):
+                raise ValueError(f"Histogram identities differ in source run {source.run_dir}")
+            for key, histogram in result.histograms.items():
+                if not np.array_equal(histogram.edges, reference_result.histograms[key].edges):
+                    raise ValueError(
+                        f"Histogram binning differs for {key} in source run {source.run_dir}"
+                    )
+        if "xgboost" in analyses:
+            if source.xgboost_metadata is None or reference_xgb_signature is None:
+                raise ValueError("Every XGBoost comparison source must contain model metadata")
+            if _xgboost_model_signature(source.xgboost_metadata) != reference_xgb_signature:
+                raise ValueError(
+                    f"Frozen XGBoost model hashes or thresholds differ in {source.run_dir}"
+                )
+    return reference_cross_sections
+
+
+def build_comparison_statistics(
+    sources: Sequence[ComparisonSource],
+    analyses: Sequence[str],
+    luminosities: Sequence[float],
+    reference_cross_sections_pb: Mapping[str, float],
+) -> Tuple[Dict[str, Any], Dict[Tuple[str, str, float, str, str], Dict[str, np.ndarray]]]:
+    """Build serializable comparison summaries plus arrays used by plots/artifacts."""
+    source_rows = [
+        {
+            "run_id": source.metadata["run_id"],
+            "run_name": source.metadata.get("run_name"),
+            "scenario": asdict(source.scenario),
+            "partial": bool(source.metadata.get("partial")),
+            "analysis_version": source.metadata.get("analysis_version"),
+            "configuration_hash": source.metadata.get("configuration_hash"),
+        }
+        for source in sources
+    ]
+    payload: Dict[str, Any] = {
+        "schema_version": 1,
+        "reference_run_id": sources[0].metadata["run_id"],
+        "reference_scenario_id": sources[0].scenario.identifier,
+        "source_runs": source_rows,
+        "normalization": {
+            "cross_section_source": "first comparison run",
+            "reference_cross_sections_pb": dict(reference_cross_sections_pb),
+            "formula": "1000 * luminosity_fb * sigma_reference_pb / generated_sumw_scenario",
+        },
+        "independence_assumption": "process samples and scenario samples are statistically independent",
+        "xgboost_model_signature": (
+            _xgboost_model_signature(sources[0].xgboost_metadata)
+            if "xgboost" in analyses and sources[0].xgboost_metadata is not None
+            else None
+        ),
+        "analyses": {},
+    }
+    numerical: Dict[
+        Tuple[str, str, float, str, str], Dict[str, np.ndarray]
+    ] = {}
+    selector = np.zeros(PULL_BIN_COUNT, dtype=np.float64)
+    selector[: PULL_BIN_COUNT // 2] = 1.0
+    for strategy in analyses:
+        strategy_payload: Dict[str, Any] = {}
+        for channel in ("higgs", "z"):
+            channel_payload: Dict[str, Any] = {
+                "scenarios": {},
+                "differences_from_reference": {},
+                "observables": {},
+            }
+            differentials: Dict[str, Dict[str, Any]] = {}
+            for source in sources:
+                folded = total_pull_observable_statistics(
+                    channel,
+                    strategy,
+                    "folded_pull_angle",
+                    source.results,
+                    luminosities[0],
+                    reference_cross_sections_pb,
+                )
+                differential = differential_pull_statistics(
+                    folded["bin_cross_sections_pb"],
+                    folded["event_second_pb"],
+                    folded["mc_second_pb2"],
+                    luminosities,
+                )
+                if differential["R"] is None:
+                    raise RuntimeError(
+                        f"Empty folded pull prediction for {source.scenario.identifier} "
+                        f"{channel} {strategy}"
+                    )
+                differentials[source.scenario.identifier] = differential
+                channel_payload["scenarios"][source.scenario.identifier] = {
+                    "label": source.scenario.label,
+                    "color": source.scenario.color,
+                    "selected_cross_section_pb": float(folded["selected_cross_section_pb"]),
+                    "R": differential["R"],
+                    "f_beam": differential["f_beam"],
+                    "mc_statistical_covariance": differential["mc_statistical_covariance"],
+                    "f_beam_mc_statistical_error": differential[
+                        "f_beam_mc_statistical_error"
+                    ],
+                    "expected_statistical_covariance": differential[
+                        "expected_statistical_covariance"
+                    ],
+                    "f_beam_statistical_error": differential[
+                        "f_beam_statistical_error"
+                    ],
+                }
+
+            for observable in PULL_OBSERVABLE_KEYS:
+                observable_payload: Dict[str, Any] = {
+                    "bin_edges": None,
+                    "luminosities": {},
+                }
+                for luminosity in luminosities:
+                    luminosity_payload: Dict[str, Any] = {}
+                    for source in sources:
+                        statistics = total_pull_observable_statistics(
+                            channel,
+                            strategy,
+                            observable,
+                            source.results,
+                            luminosity,
+                            reference_cross_sections_pb,
+                        )
+                        key = (
+                            strategy,
+                            channel,
+                            float(luminosity),
+                            observable,
+                            source.scenario.identifier,
+                        )
+                        numerical[key] = statistics
+                        if observable_payload["bin_edges"] is None:
+                            observable_payload["bin_edges"] = statistics["edges"].tolist()
+                        luminosity_payload[source.scenario.identifier] = {
+                            "total_yield": statistics["yield"].tolist(),
+                            "data_statistical_covariance": statistics[
+                                "data_covariance"
+                            ].tolist(),
+                            "mc_statistical_covariance": statistics["mc_covariance"].tolist(),
+                        }
+                    observable_payload["luminosities"][str(float(luminosity))] = (
+                        luminosity_payload
+                    )
+                channel_payload["observables"][observable] = observable_payload
+
+            reference_id = sources[0].scenario.identifier
+            reference_differential = differentials[reference_id]
+            reference_r = np.asarray(reference_differential["R"], dtype=np.float64)
+            reference_mc_covariance = np.asarray(
+                reference_differential["mc_statistical_covariance"], dtype=np.float64
+            )
+            for source in sources[1:]:
+                scenario_id = source.scenario.identifier
+                differential = differentials[scenario_id]
+                scenario_r = np.asarray(differential["R"], dtype=np.float64)
+                delta_r = scenario_r - reference_r
+                delta_fbeam = float(selector @ delta_r)
+                scenario_mc_covariance = np.asarray(
+                    differential["mc_statistical_covariance"], dtype=np.float64
+                )
+                independent_mc_covariance = (
+                    scenario_mc_covariance + reference_mc_covariance
+                )
+                luminosity_summaries: Dict[str, Any] = {}
+                for luminosity in luminosities:
+                    lumi_key = str(float(luminosity))
+                    reference_data_covariance = np.asarray(
+                        reference_differential["expected_statistical_covariance"][lumi_key],
+                        dtype=np.float64,
+                    )
+                    scenario_data_covariance = np.asarray(
+                        differential["expected_statistical_covariance"][lumi_key],
+                        dtype=np.float64,
+                    )
+                    truth_summaries = {}
+                    for truth_name, data_covariance in (
+                        ("nominal_truth", reference_data_covariance),
+                        ("variation_truth", scenario_data_covariance),
+                    ):
+                        data_fbeam_variance = max(
+                            float(selector @ data_covariance @ selector), 0.0
+                        )
+                        combined_fbeam_variance = max(
+                            float(
+                                selector
+                                @ (data_covariance + independent_mc_covariance)
+                                @ selector
+                            ),
+                            0.0,
+                        )
+                        truth_summaries[truth_name] = {
+                            "directional_f_beam_significance_data_stat_only": (
+                                delta_fbeam / math.sqrt(data_fbeam_variance)
+                                if data_fbeam_variance > 0.0
+                                else None
+                            ),
+                            "directional_f_beam_significance_data_plus_mc_stat": (
+                                delta_fbeam / math.sqrt(combined_fbeam_variance)
+                                if combined_fbeam_variance > 0.0
+                                else None
+                            ),
+                            "six_bin_data_stat_only": mahalanobis_distance(
+                                delta_r, data_covariance
+                            ),
+                            "six_bin_data_plus_mc_stat": mahalanobis_distance(
+                                delta_r, data_covariance + independent_mc_covariance
+                            ),
+                        }
+                    luminosity_summaries[lumi_key] = truth_summaries
+                channel_payload["differences_from_reference"][scenario_id] = {
+                    "label": source.scenario.label,
+                    "delta_R": delta_r.tolist(),
+                    "delta_f_beam": delta_fbeam,
+                    "independent_mc_difference_covariance": independent_mc_covariance.tolist(),
+                    "luminosities": luminosity_summaries,
+                }
+            strategy_payload[channel] = channel_payload
+        payload["analyses"][strategy] = strategy_payload
+    return payload, numerical
+
+
+def write_comparison_artifacts(
+    run_dir: Path,
+    payload: Mapping[str, Any],
+    numerical: Mapping[Tuple[str, str, float, str, str], Mapping[str, np.ndarray]],
+) -> Tuple[Path, Path, Path]:
+    json_path = run_dir / "summaries" / "comparison.json"
+    csv_path = run_dir / "summaries" / "comparison.csv"
+    npz_path = run_dir / "summaries" / "comparison.npz"
+    write_json_exclusive(json_path, payload)
+    fields = [
+        "record_type",
+        "strategy",
+        "channel",
+        "luminosity_fb",
+        "observable",
+        "scenario",
+        "reference_scenario",
+        "bin",
+        "low_edge",
+        "high_edge",
+        "expected_yield",
+        "data_statistical_error",
+        "mc_statistical_error",
+        "R_i",
+        "f_beam",
+        "delta_R_i",
+        "delta_f_beam",
+        "directional_fbeam_z_nominal_truth_data",
+        "directional_fbeam_z_nominal_truth_data_plus_mc",
+        "directional_fbeam_z_variation_truth_data",
+        "directional_fbeam_z_variation_truth_data_plus_mc",
+        "six_bin_D2_nominal_truth_data",
+        "six_bin_D2_nominal_truth_data_plus_mc",
+        "six_bin_covariance_rank_nominal_truth_data_plus_mc",
+    ]
+    rows: List[Dict[str, Any]] = []
+    arrays: Dict[str, np.ndarray] = {}
+    for (strategy, channel, luminosity, observable, scenario), statistics in numerical.items():
+        prefix = (
+            f"{strategy}__{channel}__{_format_luminosity(luminosity)}__"
+            f"{observable}__{scenario}"
+        )
+        for name in (
+            "edges",
+            "bin_cross_sections_pb",
+            "event_second_pb",
+            "mc_second_pb2",
+            "yield",
+            "data_covariance",
+            "mc_covariance",
+        ):
+            arrays[f"{prefix}__{name}"] = np.asarray(statistics[name], dtype=np.float64)
+        yields = np.asarray(statistics["yield"], dtype=np.float64)
+        data_errors = np.sqrt(
+            np.maximum(np.diag(np.asarray(statistics["data_covariance"])), 0.0)
+        )
+        mc_errors = np.sqrt(
+            np.maximum(np.diag(np.asarray(statistics["mc_covariance"])), 0.0)
+        )
+        edges = np.asarray(statistics["edges"], dtype=np.float64)
+        for index, value in enumerate(yields):
+            rows.append(
+                {
+                    "record_type": "observable_yield",
+                    "strategy": strategy,
+                    "channel": channel,
+                    "luminosity_fb": luminosity,
+                    "observable": observable,
+                    "scenario": scenario,
+                    "bin": index + 1,
+                    "low_edge": edges[index],
+                    "high_edge": edges[index + 1],
+                    "expected_yield": value,
+                    "data_statistical_error": data_errors[index],
+                    "mc_statistical_error": mc_errors[index],
+                }
+            )
+    reference_id = str(payload["reference_scenario_id"])
+    for strategy, strategy_values in payload["analyses"].items():
+        for channel, channel_values in strategy_values.items():
+            for scenario, scenario_values in channel_values["scenarios"].items():
+                prefix = f"{strategy}__{channel}__{scenario}"
+                arrays[f"{prefix}__R"] = np.asarray(scenario_values["R"], dtype=np.float64)
+                arrays[f"{prefix}__f_beam"] = np.asarray(
+                    scenario_values["f_beam"], dtype=np.float64
+                )
+                arrays[f"{prefix}__mc_R_covariance"] = np.asarray(
+                    scenario_values["mc_statistical_covariance"], dtype=np.float64
+                )
+                arrays[f"{prefix}__f_beam_mc_error"] = np.asarray(
+                    scenario_values["f_beam_mc_statistical_error"], dtype=np.float64
+                )
+                for lumi_key, covariance in scenario_values[
+                    "expected_statistical_covariance"
+                ].items():
+                    luminosity = float(lumi_key)
+                    arrays[
+                        f"{prefix}__data_R_covariance__{_format_luminosity(luminosity)}"
+                    ] = np.asarray(covariance, dtype=np.float64)
+                    arrays[
+                        f"{prefix}__f_beam_data_error__{_format_luminosity(luminosity)}"
+                    ] = np.asarray(
+                        scenario_values["f_beam_statistical_error"][lumi_key],
+                        dtype=np.float64,
+                    )
+                    data_errors = np.sqrt(
+                        np.maximum(np.diag(np.asarray(covariance, dtype=np.float64)), 0.0)
+                    )
+                    mc_errors = np.sqrt(
+                        np.maximum(
+                            np.diag(
+                                np.asarray(
+                                    scenario_values["mc_statistical_covariance"],
+                                    dtype=np.float64,
+                                )
+                            ),
+                            0.0,
+                        )
+                    )
+                    for index, fraction in enumerate(scenario_values["R"]):
+                        rows.append(
+                            {
+                                "record_type": "differential_fraction",
+                                "strategy": strategy,
+                                "channel": channel,
+                                "luminosity_fb": luminosity,
+                                "observable": "folded_pull_angle",
+                                "scenario": scenario,
+                                "reference_scenario": reference_id,
+                                "bin": index + 1,
+                                "low_edge": PULL_BIN_EDGES[index],
+                                "high_edge": PULL_BIN_EDGES[index + 1],
+                                "data_statistical_error": data_errors[index],
+                                "mc_statistical_error": mc_errors[index],
+                                "R_i": fraction,
+                                "f_beam": scenario_values["f_beam"],
+                            }
+                        )
+            for scenario, difference in channel_values[
+                "differences_from_reference"
+            ].items():
+                prefix = f"{strategy}__{channel}__{scenario}__minus__{reference_id}"
+                arrays[f"{prefix}__delta_R"] = np.asarray(
+                    difference["delta_R"], dtype=np.float64
+                )
+                arrays[f"{prefix}__delta_f_beam"] = np.asarray(
+                    difference["delta_f_beam"], dtype=np.float64
+                )
+                arrays[f"{prefix}__independent_mc_R_difference_covariance"] = np.asarray(
+                    difference["independent_mc_difference_covariance"], dtype=np.float64
+                )
+                for lumi_key, truth_values in difference["luminosities"].items():
+                    luminosity = float(lumi_key)
+                    nominal = truth_values["nominal_truth"]
+                    variation = truth_values["variation_truth"]
+                    lumi_tag = _format_luminosity(luminosity)
+                    for truth_name, truth_summary in (
+                        ("nominal_truth", nominal),
+                        ("variation_truth", variation),
+                    ):
+                        arrays[
+                            f"{prefix}__{truth_name}__directional_f_beam_Z_data__{lumi_tag}"
+                        ] = np.asarray(
+                            truth_summary[
+                                "directional_f_beam_significance_data_stat_only"
+                            ],
+                            dtype=np.float64,
+                        )
+                        arrays[
+                            f"{prefix}__{truth_name}__directional_f_beam_Z_data_plus_mc__{lumi_tag}"
+                        ] = np.asarray(
+                            truth_summary[
+                                "directional_f_beam_significance_data_plus_mc_stat"
+                            ],
+                            dtype=np.float64,
+                        )
+                        for covariance_name, distance in (
+                            ("data", truth_summary["six_bin_data_stat_only"]),
+                            (
+                                "data_plus_mc",
+                                truth_summary["six_bin_data_plus_mc_stat"],
+                            ),
+                        ):
+                            distance_prefix = (
+                                f"{prefix}__{truth_name}__six_bin_{covariance_name}__{lumi_tag}"
+                            )
+                            arrays[f"{distance_prefix}__D2"] = np.asarray(
+                                distance["D2"], dtype=np.float64
+                            )
+                            arrays[f"{distance_prefix}__rank"] = np.asarray(
+                                distance["covariance_rank"], dtype=np.int64
+                            )
+                            arrays[f"{distance_prefix}__pseudoinverse_tolerance"] = np.asarray(
+                                distance["pseudoinverse_tolerance"], dtype=np.float64
+                            )
+                    for index, delta_fraction in enumerate(difference["delta_R"]):
+                        rows.append(
+                            {
+                                "record_type": "difference_from_reference",
+                                "strategy": strategy,
+                                "channel": channel,
+                                "luminosity_fb": luminosity,
+                                "observable": "folded_pull_angle",
+                                "scenario": scenario,
+                                "reference_scenario": reference_id,
+                                "bin": index + 1,
+                                "low_edge": PULL_BIN_EDGES[index],
+                                "high_edge": PULL_BIN_EDGES[index + 1],
+                                "delta_R_i": delta_fraction,
+                                "delta_f_beam": difference["delta_f_beam"],
+                                "directional_fbeam_z_nominal_truth_data": nominal[
+                                    "directional_f_beam_significance_data_stat_only"
+                                ],
+                                "directional_fbeam_z_nominal_truth_data_plus_mc": nominal[
+                                    "directional_f_beam_significance_data_plus_mc_stat"
+                                ],
+                                "directional_fbeam_z_variation_truth_data": variation[
+                                    "directional_f_beam_significance_data_stat_only"
+                                ],
+                                "directional_fbeam_z_variation_truth_data_plus_mc": variation[
+                                    "directional_f_beam_significance_data_plus_mc_stat"
+                                ],
+                                "six_bin_D2_nominal_truth_data": nominal[
+                                    "six_bin_data_stat_only"
+                                ]["D2"],
+                                "six_bin_D2_nominal_truth_data_plus_mc": nominal[
+                                    "six_bin_data_plus_mc_stat"
+                                ]["D2"],
+                                "six_bin_covariance_rank_nominal_truth_data_plus_mc": nominal[
+                                    "six_bin_data_plus_mc_stat"
+                                ]["covariance_rank"],
+                            }
+                        )
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("x", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    with npz_path.open("xb") as stream:
+        np.savez_compressed(stream, **arrays)
+    return json_path, csv_path, npz_path
+
+
 def write_histogram_npz(run_dir: Path, results: Sequence[SampleResult]) -> Path:
     destination = run_dir / "summaries" / "histograms.npz"
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -2352,6 +3321,14 @@ def write_histogram_npz(run_dir: Path, results: Sequence[SampleResult]) -> Path:
         arrays[f"{result_prefix}__pull_bin_sumw"] = result.pull_bin_sumw
         arrays[f"{result_prefix}__pull_event_second_sumw"] = result.pull_event_second_sumw
         arrays[f"{result_prefix}__pull_mc_second_sumw2"] = result.pull_mc_second_sumw2
+        for observable, moments in result.pull_observable_moments.items():
+            if observable not in PULL_OBSERVABLE_KEYS:
+                raise ValueError(f"Unsupported pull-observable moments: {observable}")
+            prefix = f"{result_prefix}__pull_moment__{observable}"
+            arrays[f"{prefix}__edges"] = moments.edges
+            arrays[f"{prefix}__bin_sumw"] = moments.bin_sumw
+            arrays[f"{prefix}__event_second_sumw"] = moments.event_second_sumw
+            arrays[f"{prefix}__mc_second_sumw2"] = moments.mc_second_sumw2
     with destination.open("xb") as stream:
         np.savez_compressed(stream, **arrays)
     return destination
@@ -2717,6 +3694,204 @@ def generate_ri_plots(
     return records
 
 
+def generate_comparison_plots(
+    run_dir: Path,
+    sources: Sequence[ComparisonSource],
+    analyses: Sequence[str],
+    luminosities: Sequence[float],
+    numerical: Mapping[Tuple[str, str, float, str, str], Mapping[str, np.ndarray]],
+) -> List[Dict[str, Any]]:
+    """Draw non-stacked total pull predictions with data- or MC-stat errors."""
+    matplotlib_config = Path(tempfile.gettempdir()) / "pullpheno-matplotlib"
+    matplotlib_config.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(matplotlib_config))
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import ScalarFormatter
+
+    records: List[Dict[str, Any]] = []
+    registry = {(spec.channel, spec.key): spec for spec in plot_registry()}
+    planned_paths = set()
+    reference_id = sources[0].scenario.identifier
+    for strategy in analyses:
+        for channel in ("higgs", "z"):
+            for luminosity in luminosities:
+                for observable in PULL_OBSERVABLE_KEYS:
+                    plot_spec = registry[(channel, observable)]
+                    reference = numerical[
+                        (strategy, channel, float(luminosity), observable, reference_id)
+                    ]
+                    edges = np.asarray(reference["edges"], dtype=np.float64)
+                    centers = 0.5 * (edges[:-1] + edges[1:])
+                    bin_widths = np.diff(edges)
+                    for uncertainty_kind, covariance_key, include_reference in (
+                        ("data-stat", "data_covariance", False),
+                        ("mc-stat", "mc_covariance", True),
+                    ):
+                        relative_base = (
+                            Path("plots")
+                            / "comparison"
+                            / strategy
+                            / "yields"
+                            / _format_luminosity(luminosity)
+                            / channel
+                            / uncertainty_kind
+                            / observable
+                        )
+                        for extension in ("png", "pdf"):
+                            candidate = str(relative_base.with_suffix(f".{extension}"))
+                            if candidate in planned_paths:
+                                raise RuntimeError(f"Duplicate comparison plot path: {candidate}")
+                            planned_paths.add(candidate)
+                        figure, (axis, ratio_axis) = plt.subplots(
+                            2,
+                            1,
+                            figsize=(7.5, 6.5),
+                            sharex=True,
+                            constrained_layout=True,
+                            gridspec_kw={"height_ratios": (3.1, 1.15), "hspace": 0.06},
+                        )
+                        reference_yield = np.asarray(reference["yield"], dtype=np.float64)
+                        reference_covariance = np.asarray(
+                            reference[covariance_key], dtype=np.float64
+                        )
+                        scenario_count = len(sources)
+                        ratio_extent_values: List[float] = []
+                        for source_index, source in enumerate(sources):
+                            scenario_id = source.scenario.identifier
+                            statistics = numerical[
+                                (
+                                    strategy,
+                                    channel,
+                                    float(luminosity),
+                                    observable,
+                                    scenario_id,
+                                )
+                            ]
+                            values = np.asarray(statistics["yield"], dtype=np.float64)
+                            covariance = np.asarray(
+                                statistics[covariance_key], dtype=np.float64
+                            )
+                            errors = np.sqrt(np.maximum(np.diag(covariance), 0.0))
+                            offset_fraction = (
+                                source_index - 0.5 * (scenario_count - 1)
+                            ) * min(0.12, 0.55 / max(scenario_count, 1))
+                            shifted_centers = centers + offset_fraction * bin_widths
+                            color = str(source.scenario.color)
+                            marker = COMPARISON_MARKERS[
+                                source_index % len(COMPARISON_MARKERS)
+                            ]
+                            axis.errorbar(
+                                shifted_centers,
+                                values,
+                                yerr=errors,
+                                fmt=marker,
+                                linestyle="none",
+                                markersize=4.5,
+                                capsize=2.4,
+                                elinewidth=1.05,
+                                color=color,
+                                label=source.scenario.label,
+                            )
+                            ratios, ratio_errors = propagated_independent_ratio_errors(
+                                values,
+                                covariance,
+                                reference_yield,
+                                reference_covariance,
+                                include_reference=(
+                                    include_reference and source_index != 0
+                                ),
+                            )
+                            finite_ratio = np.isfinite(ratios) & np.isfinite(ratio_errors)
+                            ratio_extent_values.extend(
+                                (ratios[finite_ratio] - ratio_errors[finite_ratio]).tolist()
+                            )
+                            ratio_extent_values.extend(
+                                (ratios[finite_ratio] + ratio_errors[finite_ratio]).tolist()
+                            )
+                            ratio_axis.errorbar(
+                                shifted_centers,
+                                ratios,
+                                yerr=ratio_errors,
+                                fmt=marker,
+                                linestyle="none",
+                                markersize=4.0,
+                                capsize=2.2,
+                                elinewidth=0.95,
+                                color=color,
+                            )
+                        axis.set_ylabel(
+                            rf"Expected events / bin at {luminosity:g} fb$^{{-1}}$"
+                        )
+                        axis.set_title(
+                            f"{plot_spec.title} · total CR-scenario comparison",
+                            loc="left",
+                            pad=28,
+                            fontweight="semibold",
+                        )
+                        subtitle = (
+                            "Projected counting uncertainty"
+                            if uncertainty_kind == "data-stat"
+                            else "Finite-MC uncertainty · independent samples"
+                        )
+                        axis.text(
+                            1.0,
+                            1.015,
+                            f"{strategy} · {channel} · {subtitle}",
+                            transform=axis.transAxes,
+                            fontsize=8.8,
+                            color="#555b66",
+                            ha="right",
+                        )
+                        formatter = ScalarFormatter(useMathText=True)
+                        formatter.set_scientific(True)
+                        formatter.set_powerlimits((-4, 4))
+                        formatter.set_useOffset(False)
+                        axis.yaxis.set_major_formatter(formatter)
+                        axis.yaxis.get_offset_text().set_x(-0.08)
+                        axis.yaxis.get_offset_text().set_y(1.01)
+                        axis.grid(False)
+                        ratio_axis.grid(False)
+                        axis.legend(frameon=False, ncol=min(3, len(sources)))
+                        ratio_axis.axhline(1.0, color="#657086", linewidth=1.0)
+                        ratio_axis.set_ylabel("Scenario / ref.")
+                        ratio_axis.set_xlabel(plot_spec.xlabel)
+                        ratio_axis.set_xlim(edges[0], edges[-1])
+                        if ratio_extent_values:
+                            deviation = max(
+                                0.05,
+                                max(abs(value - 1.0) for value in ratio_extent_values) * 1.12,
+                            )
+                            ratio_axis.set_ylim(1.0 - deviation, 1.0 + deviation)
+                        figure.align_ylabels((axis, ratio_axis))
+                        png_path = run_dir / relative_base.with_suffix(".png")
+                        pdf_path = run_dir / relative_base.with_suffix(".pdf")
+                        _save_figure_exclusive(
+                            figure, png_path, dpi=170, bbox_inches="tight"
+                        )
+                        _save_figure_exclusive(figure, pdf_path, bbox_inches="tight")
+                        plt.close(figure)
+                        records.append(
+                            {
+                                "strategy": strategy,
+                                "observable": observable,
+                                "title": (
+                                    f"{plot_spec.title} · total scenarios · "
+                                    f"{uncertainty_kind}"
+                                ),
+                                "channel": channel,
+                                "stage": "comparison",
+                                "kind": uncertainty_kind,
+                                "luminosity_fb": luminosity,
+                                "png": png_path.relative_to(run_dir).as_posix(),
+                                "pdf": pdf_path.relative_to(run_dir).as_posix(),
+                            }
+                        )
+    return records
+
+
 def write_ri_artifacts(
     run_dir: Path,
     results: Sequence[SampleResult],
@@ -2995,6 +4170,18 @@ def generate_run_index(
     else:
         status_label = f"{partial_class} run"
         derivation_html = ""
+    raw_scenario = run_metadata.get("scenario")
+    scenario_html = ""
+    if raw_scenario:
+        parameters = ", ".join(
+            f"{key}={value}" for key, value in raw_scenario.get("parameters", {}).items()
+        ) or "default generator settings"
+        scenario_html = (
+            "<br><strong>Scenario:</strong> "
+            f"{html.escape(str(raw_scenario['label']))} "
+            f"(<code>{html.escape(str(raw_scenario['identifier']))}</code>; "
+            f"{html.escape(parameters)})"
+        )
     cutflow_html = _html_cutflow_tables(results, luminosities)
     cutflow_links = " · ".join(
         f'<a href="cutflows/{strategy}/{channel}.csv">{strategy} {channel} CSV</a>'
@@ -3083,7 +4270,7 @@ header p{{max-width:70rem;color:#dce9f8}} .eyebrow{{font-size:.76rem;letter-spac
 <body>
 <header><div class="eyebrow">PullPheno particle-level analysis</div><h1>Signed pull-angle results</h1>
 <span class="status {partial_class}">{status_label}</span>
-<p><strong>Run:</strong> {html.escape(str(run_metadata['run_id']))}<br><strong>Completed:</strong> {html.escape(str(run_metadata['completed_utc']))}{derivation_html}<br><strong>Configuration:</strong> anti-kT R=0.4, leading-pT tagging jets; cut-based and XGBoost branches share the common selection.</p></header>
+<p><strong>Run:</strong> {html.escape(str(run_metadata['run_id']))}<br><strong>Completed:</strong> {html.escape(str(run_metadata['completed_utc']))}{scenario_html}{derivation_html}<br><strong>Configuration:</strong> anti-kT R=0.4, leading-pT tagging jets; cut-based and XGBoost branches share the common selection.</p></header>
 <main>
 <section><h2>Numerical summary</h2><div class="metrics">{''.join(summary_cards)}</div>
 <p class="method-note"><strong>Uncertainties:</strong> both projected-data and current-MC errors use event-level six-bin covariance matrices, retaining the correlation between the two tagging jets. The MC term does not decrease with displayed luminosity.
@@ -3103,6 +4290,117 @@ header p{{max-width:70rem;color:#dce9f8}} .eyebrow{{font-size:.76rem;letter-spac
 const controls=["strategy","channel","stage","kind","lumi"].map(id=>document.getElementById(id));const search=document.getElementById("search");const cards=[...document.querySelectorAll(".plot-card")];const empty=document.getElementById("empty");function applyFilters(){{const values=Object.fromEntries(controls.map(el=>[el.id,el.value]));const query=search.value.trim().toLowerCase();let shown=0;for(const card of cards){{const match=(values.strategy==="all"||card.dataset.strategy===values.strategy)&&(values.channel==="all"||card.dataset.channel===values.channel)&&(values.stage==="all"||card.dataset.stage===values.stage)&&(values.kind==="all"||card.dataset.kind===values.kind)&&(values.lumi==="all"||card.dataset.lumi===values.lumi)&&(!query||card.dataset.search.includes(query));card.hidden=!match;if(match)shown++;}}empty.hidden=shown!==0;}}controls.forEach(el=>el.addEventListener("change",applyFilters));search.addEventListener("input",applyFilters);
 </script></body></html>
 """
+    destination = run_dir / "index.html"
+    write_text_exclusive(destination, document)
+    return destination
+
+
+def generate_comparison_index(
+    run_dir: Path,
+    run_metadata: Mapping[str, Any],
+    sources: Sequence[ComparisonSource],
+    comparison: Mapping[str, Any],
+    plot_records: Sequence[Mapping[str, Any]],
+    luminosities: Sequence[float],
+) -> Path:
+    def format_optional(value: Any, format_spec: str) -> str:
+        return "—" if value is None else format(float(value), format_spec)
+
+    source_rows = []
+    for index, source in enumerate(sources):
+        role = "Reference" if index == 0 else "Variation"
+        parameters = ", ".join(
+            f"{key}={value}" for key, value in source.scenario.parameters.items()
+        ) or "—"
+        source_rows.append(
+            f"<tr><th>{role}</th><td><span class=\"swatch\" "
+            f"style=\"background:{html.escape(str(source.scenario.color))}\"></span>"
+            f"{html.escape(source.scenario.label)}</td>"
+            f"<td>{html.escape(parameters)}</td>"
+            f"<td><a href=\"../{html.escape(str(source.metadata['run_id']))}/index.html\">"
+            f"{html.escape(str(source.metadata['run_id']))}</a></td></tr>"
+        )
+    cross_section_rows = "".join(
+        f"<tr><th>{html.escape(str(process))}</th><td>{float(value):.10g}</td></tr>"
+        for process, value in comparison["normalization"][
+            "reference_cross_sections_pb"
+        ].items()
+    )
+    summary_rows = []
+    for strategy, strategy_values in comparison["analyses"].items():
+        for channel, channel_values in strategy_values.items():
+            reference_id = comparison["reference_scenario_id"]
+            reference_fbeam = channel_values["scenarios"][reference_id]["f_beam"]
+            for scenario_id, difference in channel_values[
+                "differences_from_reference"
+            ].items():
+                varied_fbeam = channel_values["scenarios"][scenario_id]["f_beam"]
+                for luminosity in luminosities:
+                    lumi_key = str(float(luminosity))
+                    nominal_truth = difference["luminosities"][lumi_key][
+                        "nominal_truth"
+                    ]
+                    variation_truth = difference["luminosities"][lumi_key][
+                        "variation_truth"
+                    ]
+                    nominal_z = nominal_truth[
+                        "directional_f_beam_significance_data_plus_mc_stat"
+                    ]
+                    variation_z = variation_truth[
+                        "directional_f_beam_significance_data_plus_mc_stat"
+                    ]
+                    d2 = nominal_truth["six_bin_data_plus_mc_stat"]
+                    summary_rows.append(
+                        f"<tr><td>{html.escape(strategy)}</td><td>{html.escape(channel)}</td>"
+                        f"<td>{html.escape(difference['label'])}</td><td>{luminosity:g}</td>"
+                        f"<td>{reference_fbeam:.6f}</td><td>{varied_fbeam:.6f}</td>"
+                        f"<td>{difference['delta_f_beam']:+.6f}</td>"
+                        f"<td>{format_optional(nominal_z, '+.3f')}</td>"
+                        f"<td>{format_optional(variation_z, '+.3f')}</td>"
+                        f"<td>{d2['D2']:.3f} (rank {d2['covariance_rank']})</td></tr>"
+                    )
+    cards = []
+    for record in plot_records:
+        lumi = _format_luminosity(float(record["luminosity_fb"]))
+        cards.append(
+            "<article class=\"plot-card\" "
+            f"data-strategy=\"{html.escape(str(record['strategy']))}\" "
+            f"data-channel=\"{html.escape(str(record['channel']))}\" "
+            f"data-kind=\"{html.escape(str(record['kind']))}\" "
+            f"data-lumi=\"{html.escape(lumi)}\" "
+            f"data-search=\"{html.escape((str(record['title']) + ' ' + str(record['observable'])).lower())}\">"
+            f"<a class=\"thumb-link\" href=\"{html.escape(str(record['png']))}\">"
+            f"<img loading=\"lazy\" src=\"{html.escape(str(record['png']))}\" "
+            f"alt=\"{html.escape(str(record['title']))}\"></a>"
+            "<div class=\"plot-copy\"><div class=\"badges\">"
+            f"<span>{html.escape(str(record['strategy']))}</span>"
+            f"<span>{html.escape(str(record['channel']))}</span>"
+            f"<span>{html.escape(str(record['kind']))}</span><span>{html.escape(lumi)}</span>"
+            f"</div><h3>{html.escape(str(record['title']))}</h3>"
+            f"<p><a href=\"{html.escape(str(record['png']))}\">PNG</a> "
+            f"<a href=\"{html.escape(str(record['pdf']))}\">PDF</a></p></div></article>"
+        )
+    analyses = list(comparison["analyses"])
+    document = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PullPheno CR comparison · {html.escape(str(run_metadata['run_id']))}</title>
+<style>
+:root{{--ink:#172033;--muted:#657086;--line:#dce2eb;--paper:#fff;--wash:#f3f6fa;--accent:#275dad}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--wash);color:var(--ink);font:15px/1.5 Inter,system-ui,sans-serif}}a{{color:var(--accent);text-decoration:none}}a:hover{{text-decoration:underline}}header{{padding:3rem max(1rem,calc((100vw - 1280px)/2));background:linear-gradient(125deg,#12213c,#244b78 62%,#11776d);color:white}}header p{{color:#dce9f8}}h1{{font-size:clamp(2rem,5vw,3.7rem);margin:.3rem 0}}main{{max-width:1320px;margin:auto;padding:1.5rem}}section{{margin:1.2rem 0}}.panel,.plot-card{{background:white;border:1px solid var(--line);border-radius:14px;box-shadow:0 5px 18px #2435510c}}.panel{{padding:1rem}}.table-wrap{{overflow:auto}}table{{border-collapse:collapse;width:100%;font-size:.87rem}}th,td{{padding:.5rem .65rem;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}}th:first-child,td:first-child{{text-align:left}}.swatch{{display:inline-block;width:.75rem;height:.75rem;border-radius:50%;margin-right:.4rem}}.controls{{display:grid;grid-template-columns:repeat(5,minmax(130px,1fr));gap:.7rem;position:sticky;top:0;z-index:2;background:#f3f6faed;backdrop-filter:blur(8px);padding:.8rem 0}}label{{font-size:.78rem;color:var(--muted);font-weight:700}}select,input{{display:block;width:100%;margin-top:.2rem;padding:.5rem;border:1px solid #bfc8d5;border-radius:8px;background:white}}.gallery{{display:grid;grid-template-columns:repeat(auto-fit,minmax(315px,1fr));gap:1rem}}.plot-card{{overflow:hidden}}.plot-card[hidden]{{display:none}}.thumb-link{{display:block;aspect-ratio:1.25;background:white;overflow:hidden}}.thumb-link img{{width:100%;height:100%;object-fit:contain}}.plot-copy{{padding:.85rem}}.plot-copy h3{{font-size:1rem;margin:.45rem 0}}.badges{{display:flex;gap:.35rem;flex-wrap:wrap}}.badges span{{font-size:.68rem;text-transform:uppercase;font-weight:750;border-radius:999px;padding:.18rem .45rem;background:#e7eef8;color:#274b79}}code{{overflow-wrap:anywhere}}footer{{padding:2.5rem;text-align:center;color:var(--muted)}}@media(max-width:760px){{.controls{{grid-template-columns:1fr 1fr;position:static}}}}
+</style></head><body><header><div>PullPheno particle-level analysis</div>
+<h1>Independent CR scenarios</h1><p><strong>Comparison run:</strong> {html.escape(str(run_metadata['run_id']))}<br>
+Each point is the total prediction from one complete, independently generated scenario. All process samples, including backgrounds, are scenario-specific; no background sample is shared. The first run fixes the process cross sections and is the ratio reference.</p></header><main>
+<section class="panel"><h2>Source runs</h2><div class="table-wrap"><table><thead><tr><th>Role</th><th>Scenario</th><th>Parameters</th><th>Immutable source</th></tr></thead><tbody>{''.join(source_rows)}</tbody></table></div><h3>Common reference cross sections</h3><p>Every scenario uses the first run's final-state cross sections; scenario-specific efficiencies and generated sums of weights remain independent.</p><div class="table-wrap"><table><thead><tr><th>Process</th><th>Cross section [pb]</th></tr></thead><tbody>{cross_section_rows}</tbody></table></div></section>
+<section class="panel"><h2>Folded-angle numerical comparison</h2><p>Directional f<sub>beam</sub> values retain their signs. Six-bin D² values are Mahalanobis distances in the supported covariance subspace; √D² is not labelled as a one-dimensional Gaussian significance.</p><div class="table-wrap"><table><thead><tr><th>Analysis</th><th>Channel</th><th>Variation</th><th>fb⁻¹</th><th>f<sub>beam</sub> ref.</th><th>f<sub>beam</sub> var.</th><th>Δf<sub>beam</sub></th><th>Z (ref. truth)</th><th>Z (var. truth)</th><th>D² (ref. truth)</th></tr></thead><tbody>{''.join(summary_rows)}</tbody></table></div><p><a href="summaries/comparison.json">JSON</a> · <a href="summaries/comparison.csv">CSV</a> · <a href="summaries/comparison.npz">NPZ arrays and covariances</a></p></section>
+<section><h2>Total pull-observable plots</h2><div class="controls">
+<label>Analysis<select id="strategy"><option value="all">All</option>{''.join(f'<option value="{name}">{name}</option>' for name in analyses)}</select></label>
+<label>Channel<select id="channel"><option value="all">All</option><option value="higgs">Higgs</option><option value="z">Z</option></select></label>
+<label>Uncertainty<select id="kind"><option value="all">All</option><option value="data-stat">Projected data stat.</option><option value="mc-stat">MC stat.</option></select></label>
+<label>Luminosity<select id="lumi"><option value="all">All</option>{''.join(f'<option value="{_format_luminosity(value)}">{value:g} fb⁻¹</option>' for value in luminosities)}</select></label>
+<label>Search<input id="search" type="search" placeholder="angle, t_phi…"></label></div>
+<div class="gallery">{''.join(cards)}</div><p id="empty" hidden>No plots match these filters.</p></section></main>
+<footer>Portable immutable comparison bundle · source runs remain untouched.</footer>
+<script>const ids=["strategy","channel","kind","lumi"],controls=ids.map(id=>document.getElementById(id)),search=document.getElementById("search"),cards=[...document.querySelectorAll(".plot-card")],empty=document.getElementById("empty");function filter(){{let n=0;for(const card of cards){{const ok=controls.every(el=>el.value==="all"||card.dataset[el.id]===el.value)&&(!search.value.trim()||card.dataset.search.includes(search.value.trim().toLowerCase()));card.hidden=!ok;if(ok)n++;}}empty.hidden=n!==0;}}controls.forEach(el=>el.addEventListener("change",filter));search.addEventListener("input",filter);</script></body></html>"""
     destination = run_dir / "index.html"
     write_text_exclusive(destination, document)
     return destination
@@ -3138,15 +4436,35 @@ def _top_level_document(runs: Sequence[Mapping[str, Any]]) -> str:
     cards = []
     for run in runs:
         badge = "partial" if run.get("partial") else "full"
-        badge_label = f"derived {badge}" if run.get("derived_from_run") else badge
+        if run.get("run_type") == "comparison":
+            badge_label = f"comparison · {badge}"
+        else:
+            badge_label = f"derived {badge}" if run.get("derived_from_run") else badge
         name = html.escape(str(run.get("run_name") or "unnamed"))
+        if run.get("run_type") == "comparison":
+            detail = (
+                f"{len(run.get('source_runs', []))} scenarios · "
+                f"{html.escape(', '.join(run.get('analyses', ['cutbased'])))}"
+            )
+            action = "Open comparison →"
+        else:
+            scenario_suffix = (
+                f" · {html.escape(str(run['scenario']['label']))}"
+                if run.get("scenario")
+                else ""
+            )
+            detail = (
+                f"{len(run.get('samples', []))} samples · "
+                f"{html.escape(', '.join(run.get('analyses', ['cutbased'])))}"
+                f"{scenario_suffix}"
+            )
+            action = "Open plots and cutflows →"
         cards.append(
             "<article>"
             f"<div><span class=\"badge {badge}\">{badge_label}</span><span class=\"name\">{name}</span></div>"
             f"<h2><a href=\"runs/{html.escape(str(run['run_id']))}/index.html\">{html.escape(str(run['run_id']))}</a></h2>"
-            f"<p>Completed {html.escape(str(run.get('completed_utc', 'unknown')))} · {len(run.get('samples', []))} samples · "
-            f"{html.escape(', '.join(run.get('analyses', ['cutbased'])))}</p>"
-            f"<p><a href=\"runs/{html.escape(str(run['run_id']))}/index.html\">Open plots and cutflows →</a></p>"
+            f"<p>Completed {html.escape(str(run.get('completed_utc', 'unknown')))} · {detail}</p>"
+            f"<p><a href=\"runs/{html.escape(str(run['run_id']))}/index.html\">{action}</a></p>"
             "</article>"
         )
     if not cards:
@@ -3210,6 +4528,59 @@ def validate_results(results: Sequence[SampleResult], partial: bool) -> Dict[str
         folded_integral_match = math.isclose(
             selected, folded_pull_integral, rel_tol=1.0e-10, abs_tol=1.0e-10
         )
+        pull_moments_valid = True
+        exact_pull_moments = result.pull_moment_model == PULL_MOMENT_MODEL
+        selected_sumw2 = result.cutflow[steps[-1]].sumw2
+        for observable in PULL_OBSERVABLE_KEYS:
+            moments = result.pull_observable_moments.get(observable)
+            histogram = result.histograms[observable]
+            if moments is None:
+                pull_moments_valid = False
+                continue
+            tolerance = max(1.0e-10, 1.0e-10 * abs(selected))
+            sumw2_tolerance = max(1.0e-10, 1.0e-10 * abs(selected_sumw2))
+            pull_moments_valid = pull_moments_valid and (
+                np.array_equal(moments.edges, histogram.edges)
+                and np.all(np.isfinite(moments.bin_sumw))
+                and np.all(np.isfinite(moments.event_second_sumw))
+                and np.all(np.isfinite(moments.mc_second_sumw2))
+                and np.allclose(
+                    moments.event_second_sumw,
+                    moments.event_second_sumw.T,
+                    rtol=0.0,
+                    atol=tolerance,
+                )
+                and np.allclose(
+                    moments.mc_second_sumw2,
+                    moments.mc_second_sumw2.T,
+                    rtol=0.0,
+                    atol=sumw2_tolerance,
+                )
+                and np.allclose(
+                    moments.bin_sumw, histogram.sumw, rtol=1.0e-10, atol=tolerance
+                )
+                and math.isclose(
+                    float(np.sum(moments.bin_sumw)),
+                    selected,
+                    rel_tol=1.0e-10,
+                    abs_tol=tolerance,
+                )
+                and math.isclose(
+                    float(np.sum(moments.event_second_sumw)),
+                    selected,
+                    rel_tol=1.0e-10,
+                    abs_tol=tolerance,
+                )
+                and (
+                    not exact_pull_moments
+                    or math.isclose(
+                        float(np.sum(moments.mc_second_sumw2)),
+                        selected_sumw2,
+                        rel_tol=1.0e-10,
+                        abs_tol=sumw2_tolerance,
+                    )
+                )
+            )
         bin_integral_match = math.isclose(
             selected,
             float(np.sum(result.pull_bin_sumw, dtype=np.float64)),
@@ -3268,6 +4639,7 @@ def validate_results(results: Sequence[SampleResult], partial: bool) -> Dict[str
             "finite_histograms": finite,
             "pull_integral_matches_selected": integral_match,
             "folded_pull_integral_matches_selected": folded_integral_match,
+            "all_pull_observable_moments_valid": pull_moments_valid,
             "ri_integral_matches_selected": bin_integral_match,
             "ri_and_fbeam_closure": ri_closure,
             "covariances_valid": covariance_valid,
@@ -3291,6 +4663,16 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--from-run",
         type=Path,
         help="Completed run to replot from stored histograms without rereading ROOT events",
+    )
+    source.add_argument(
+        "--compare-runs",
+        type=Path,
+        nargs="+",
+        metavar="RUN",
+        help=(
+            "Completed scenario runs to compare without ROOT input; the first run is the "
+            "cross-section and ratio reference"
+        ),
     )
     parser.add_argument("--output-root", type=Path, default=Path("results"), help="Root directory containing immutable runs")
     parser.add_argument("--run-name", help="Optional human-readable label included in the unique run ID")
@@ -3320,21 +4702,149 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--max-events must be positive")
     if args.from_run is not None and args.max_events is not None:
         parser.error("--max-events cannot be combined with --from-run")
+    if args.compare_runs is not None and len(args.compare_runs) < 2:
+        parser.error("--compare-runs requires a reference and at least one variation")
+    if args.compare_runs is not None and args.max_events is not None:
+        parser.error("--max-events cannot be combined with --compare-runs")
     if len(set(args.analyses)) != len(args.analyses):
         parser.error("--analyses contains a duplicate strategy")
     if args.xgb_model_run is not None and "xgboost" not in args.analyses:
         parser.error("--xgb-model-run requires --analyses to include xgboost")
     if args.from_run is not None and args.xgb_model_run is not None:
         parser.error("--xgb-model-run cannot be combined with --from-run")
+    if args.compare_runs is not None and args.xgb_model_run is not None:
+        parser.error("--xgb-model-run cannot be combined with --compare-runs")
     if args.workers <= 0:
         parser.error("--workers must be positive")
     return args
+
+
+def run_comparison(args: argparse.Namespace, started: datetime) -> int:
+    analyses = tuple(
+        strategy for strategy in ANALYSIS_STRATEGIES if strategy in args.analyses
+    )
+    output_root = args.output_root.expanduser().resolve()
+    sources = tuple(
+        resolve_comparison_source(path, output_root, args.luminosities, index)
+        for index, path in enumerate(args.compare_runs)
+    )
+    reference_cross_sections = validate_comparison_sources(sources, analyses)
+    luminosities = tuple(
+        float(value)
+        for value in (args.luminosities or sources[0].config.luminosities_fb)
+    )
+    payload = {
+        "analysis_version": ANALYSIS_VERSION,
+        "run_type": "comparison",
+        "analyses": list(analyses),
+        "luminosities_fb": list(luminosities),
+        "source_runs": [
+            {
+                "run_id": source.metadata["run_id"],
+                "configuration_hash": source.metadata.get("configuration_hash"),
+                "scenario": asdict(source.scenario),
+            }
+            for source in sources
+        ],
+        "reference_cross_sections_pb": reference_cross_sections,
+        "pull_moment_model": PULL_MOMENT_MODEL,
+    }
+    reservation = reserve_run_directory(
+        output_root, make_run_id(payload, args.run_name, started)
+    )
+    logging.info("Reserved immutable comparison run %s", reservation.run_id)
+    try:
+        comparison, numerical = build_comparison_statistics(
+            sources,
+            analyses,
+            luminosities,
+            reference_cross_sections,
+        )
+        write_comparison_artifacts(reservation.incomplete_dir, comparison, numerical)
+        plot_records = generate_comparison_plots(
+            reservation.incomplete_dir,
+            sources,
+            analyses,
+            luminosities,
+            numerical,
+        )
+        write_json_exclusive(
+            reservation.incomplete_dir / "summaries" / "plots.json", plot_records
+        )
+        completed = datetime.now(timezone.utc)
+        partial = bool(sources[0].metadata.get("partial"))
+        run_metadata = {
+            "status": "complete",
+            "run_type": "comparison",
+            "run_id": reservation.run_id,
+            "run_name": sanitize_run_name(args.run_name),
+            "analysis_version": ANALYSIS_VERSION,
+            "started_utc": started.isoformat(),
+            "completed_utc": completed.isoformat(),
+            "duration_seconds": (completed - started).total_seconds(),
+            "partial": partial,
+            "max_events_per_sample": sources[0].metadata.get("max_events_per_sample"),
+            "workers": 0,
+            "analyses": list(analyses),
+            "luminosities_fb": list(luminosities),
+            "configuration_hash": config_digest(payload),
+            "configuration": payload,
+            "git": git_provenance(Path(__file__).resolve().parent),
+            "samples": [],
+            "scenario": None,
+            "source_runs": [
+                {
+                    "run_id": source.metadata["run_id"],
+                    "run_name": source.metadata.get("run_name"),
+                    "scenario": asdict(source.scenario),
+                    "configuration_hash": source.metadata.get("configuration_hash"),
+                }
+                for source in sources
+            ],
+            "reference_run_id": sources[0].metadata["run_id"],
+            "artifacts": {
+                "plots": len(plot_records),
+                "comparison_json": "summaries/comparison.json",
+                "comparison_csv": "summaries/comparison.csv",
+                "comparison_npz": "summaries/comparison.npz",
+            },
+            "validation": {
+                "status": "passed",
+                "source_compatibility": True,
+                "source_count": len(sources),
+                "pull_moment_model": PULL_MOMENT_MODEL,
+                "normalization_uses_reference_cross_sections": True,
+            },
+        }
+        generate_comparison_index(
+            reservation.incomplete_dir,
+            run_metadata,
+            sources,
+            comparison,
+            plot_records,
+            luminosities,
+        )
+        write_json_exclusive(reservation.incomplete_dir / "run.json", run_metadata)
+        validate_html_links(reservation.incomplete_dir / "index.html")
+        reservation.incomplete_dir.rename(reservation.final_dir)
+        update_top_level_catalog(reservation.output_root)
+        logging.info("Completed comparison run: %s", reservation.final_dir)
+        print(reservation.final_dir)
+        return 0
+    except Exception:
+        logging.exception(
+            "Comparison failed; partial artifacts remain in %s",
+            reservation.incomplete_dir,
+        )
+        return 1
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_arguments(argv)
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(message)s")
     started = datetime.now(timezone.utc)
+    if args.compare_runs is not None:
+        return run_comparison(args, started)
     source_metadata: Optional[Dict[str, Any]] = None
     preloaded_results: Optional[List[SampleResult]] = None
     xgboost_metadata: Optional[Dict[str, Any]] = None
@@ -3494,6 +5004,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         completed = datetime.now(timezone.utc)
         run_metadata = {
             "status": "complete",
+            "run_type": "analysis",
             "run_id": reservation.run_id,
             "run_name": sanitize_run_name(args.run_name),
             "analysis_version": ANALYSIS_VERSION,
@@ -3506,6 +5017,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "analyses": list(analyses),
             "configuration_hash": config_digest(payload),
             "configuration": payload,
+            "scenario": None if config.scenario is None else asdict(config.scenario),
             "git": git_provenance(Path(__file__).resolve().parent),
             "samples": [
                 {
@@ -3513,6 +5025,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "channel": spec.channel,
                     "role": spec.role,
                     "cross_section_pb": spec.cross_section_pb,
+                    "cross_section_unc_pb": spec.cross_section_unc_pb,
+                    "cross_section_source": spec.cross_section_source,
+                    "generator_cross_section_pb": spec.generator_cross_section_pb,
+                    "generator_cross_section_unc_pb": spec.generator_cross_section_unc_pb,
                     "total_entries": next(result for result in results if result.spec.name == spec.name).total_entries,
                     "processed_entries": next(result for result in results if result.spec.name == spec.name).processed_entries,
                     "generated_sumw": next(result for result in results if result.spec.name == spec.name).generated_sumw,

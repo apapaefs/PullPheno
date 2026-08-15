@@ -1,0 +1,101 @@
+{
+  "description": "Odysseus summer2026 campaign 4, nominal Herwig samples",
+  "campaign_id": 4,
+  "chain": "herwig",
+  "higgs_branching_ratio": 0.00227,
+  "scenario": {
+    "id": "herwig-default",
+    "label": "Herwig default",
+    "color": "#275DAD",
+    "parameters": {
+      "ReconnectionProbability": "default"
+    }
+  },
+  "tree_name": "Data",
+  "luminosities_fb": [
+    300.0,
+    3000.0
+  ],
+  "samples": [
+    {
+      "name": "aajj",
+      "channel": "higgs",
+      "role": "background",
+      "files": [
+        "/micron/Projects/PullPheno/campaigns/campaign-00004/merged/aajj_herwig.root"
+      ],
+      "generator_cross_section_pb": 1.335588163308196,
+      "generator_cross_section_unc_pb": 0.004406642338090395,
+      "cross_section_pb": 1.335588163308196,
+      "cross_section_unc_pb": 0.004406642338090395,
+      "cross_section_source": "Campaign-4 nominal Herwig .out",
+      "label": "QCD gamma gamma jj",
+      "color": "#D5A84B",
+      "stack_order": 0
+    },
+    {
+      "name": "QCDHjj",
+      "channel": "higgs",
+      "role": "background",
+      "files": [
+        "/micron/Projects/PullPheno/campaigns/campaign-00004/merged/QCDHjj_herwig.root"
+      ],
+      "generator_cross_section_pb": 2.5205057242181135,
+      "generator_cross_section_unc_pb": 0.0025285938063826334,
+      "cross_section_pb": 0.00572154799397512,
+      "cross_section_unc_pb": 0.00000573990794048858,
+      "cross_section_source": "Campaign-4 nominal Herwig .out times BR(H to gamma gamma)",
+      "label": "QCD Hjj",
+      "color": "#4E79A7",
+      "stack_order": 1
+    },
+    {
+      "name": "VBFH",
+      "channel": "higgs",
+      "role": "signal",
+      "files": [
+        "/micron/Projects/PullPheno/campaigns/campaign-00004/merged/VBFH_herwig.root"
+      ],
+      "generator_cross_section_pb": 2.624672565785113,
+      "generator_cross_section_unc_pb": 0.002930900369093667,
+      "cross_section_pb": 0.00595800672433221,
+      "cross_section_unc_pb": 0.00000665314383784262,
+      "cross_section_source": "Campaign-4 nominal Herwig .out times BR(H to gamma gamma)",
+      "label": "VBF H",
+      "color": "#59A14F",
+      "stack_order": 2
+    },
+    {
+      "name": "QCDZjj",
+      "channel": "z",
+      "role": "background",
+      "files": [
+        "/micron/Projects/PullPheno/campaigns/campaign-00004/merged/QCDZjj_herwig.root"
+      ],
+      "generator_cross_section_pb": 92.84,
+      "generator_cross_section_unc_pb": 0.09486832980505139,
+      "cross_section_pb": 92.84,
+      "cross_section_unc_pb": 0.09486832980505139,
+      "cross_section_source": "Campaign-4 nominal Herwig .out; decay-inclusive Z to electrons and muons",
+      "label": "QCD Zjj",
+      "color": "#4E79A7",
+      "stack_order": 0
+    },
+    {
+      "name": "VBFZ",
+      "channel": "z",
+      "role": "signal",
+      "files": [
+        "/micron/Projects/PullPheno/campaigns/campaign-00004/merged/VBFZ_herwig.root"
+      ],
+      "generator_cross_section_pb": 0.8796000000000002,
+      "generator_cross_section_unc_pb": 0.0009486832980505138,
+      "cross_section_pb": 0.8796,
+      "cross_section_unc_pb": 0.0009486832980505138,
+      "cross_section_source": "Campaign-4 nominal Herwig .out; decay-inclusive Z to electrons and muons",
+      "label": "VBF Z",
+      "color": "#59A14F",
+      "stack_order": 1
+    }
+  ]
+}

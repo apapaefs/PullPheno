@@ -13,6 +13,7 @@ import concurrent.futures
 import csv
 import hashlib
 import html
+import itertools
 import json
 import logging
 import math
@@ -37,7 +38,7 @@ import numpy as np
 import xgboost_root_varfiles_module as xgbtools
 
 
-ANALYSIS_VERSION = "2.2.1"
+ANALYSIS_VERSION = "2.3.0"
 MZ_GEV = 91.1876
 NEUTRINO_IDS = frozenset((12, 14, 16))
 ANALYSIS_STRATEGIES = ("cutbased", "xgboost")
@@ -52,6 +53,8 @@ PULL_OBSERVABLE_KEYS = (
     "folded_pull_angle",
 )
 PULL_MOMENT_MODEL = "event_level_two_tagging_jet_all_pull_observables"
+SCORE_PULL_BIN_COUNT = 10
+SCORE_PULL_MOMENT_MODEL = "event_level_xgboost_score_quantile_by_folded_pull"
 COMPARISON_PINV_RCOND = 1.0e-12
 COMPARISON_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "*", "<", ">")
 COMPARISON_COLORS = (
@@ -392,6 +395,82 @@ class PullObservableMoments:
 
 
 @dataclass
+class ScorePullMoments:
+    """Joint XGBoost-score and folded-pull moments at common selection.
+
+    The score belongs to the event and both half-weight tagging-jet entries
+    therefore occupy the same score bin.  The flattened second moments retain
+    their correlation for projected-data and finite-MC covariance estimates.
+    """
+
+    score_edges: np.ndarray
+    pull_edges: np.ndarray = field(default_factory=lambda: PULL_BIN_EDGES.copy())
+    bin_sumw: np.ndarray = field(init=False)
+    event_second_sumw: np.ndarray = field(init=False)
+    mc_second_sumw2: np.ndarray = field(init=False)
+    event_count: int = 0
+
+    def __post_init__(self) -> None:
+        self.score_edges = np.asarray(self.score_edges, dtype=np.float64)
+        self.pull_edges = np.asarray(self.pull_edges, dtype=np.float64)
+        for name, edges in (("score", self.score_edges), ("pull", self.pull_edges)):
+            if edges.ndim != 1 or len(edges) < 2 or np.any(np.diff(edges) <= 0.0):
+                raise ValueError(f"Joint {name} edges must be strictly increasing")
+        shape = (len(self.score_edges) - 1, len(self.pull_edges) - 1)
+        flat_bins = shape[0] * shape[1]
+        self.bin_sumw = np.zeros(shape, dtype=np.float64)
+        self.event_second_sumw = np.zeros((flat_bins, flat_bins), dtype=np.float64)
+        self.mc_second_sumw2 = np.zeros((flat_bins, flat_bins), dtype=np.float64)
+
+    def fill_batch(
+        self,
+        scores: np.ndarray,
+        signed_angles: np.ndarray,
+        event_weights: np.ndarray,
+    ) -> None:
+        score_values = np.asarray(scores, dtype=np.float64)
+        angle_values = np.asarray(signed_angles, dtype=np.float64)
+        weights = np.asarray(event_weights, dtype=np.float64)
+        if score_values.ndim != 1 or weights.shape != score_values.shape:
+            raise ValueError("Joint score-pull scores and weights must be one-dimensional")
+        if angle_values.shape != (len(score_values), 2):
+            raise ValueError("Joint score-pull angles must have shape (events, 2)")
+        if not (
+            np.all(np.isfinite(score_values))
+            and np.all(np.isfinite(angle_values))
+            and np.all(np.isfinite(weights))
+        ):
+            raise ValueError("Joint score-pull inputs must be finite")
+        if np.any((score_values < 0.0) | (score_values > 1.0)):
+            raise ValueError("XGBoost scores must lie in [0, 1]")
+
+        score_bins = np.searchsorted(self.score_edges, score_values, side="right") - 1
+        score_bins = np.clip(score_bins, 0, len(self.score_edges) - 2)
+        folded = np.abs((angle_values + math.pi) % (2.0 * math.pi) - math.pi)
+        pull_bins = np.searchsorted(self.pull_edges, folded, side="right") - 1
+        pull_bins = np.clip(pull_bins, 0, len(self.pull_edges) - 2)
+        pull_bin_count = len(self.pull_edges) - 1
+        flat = score_bins[:, None] * pull_bin_count + pull_bins
+        half_weights = 0.5 * weights
+        flat_sum = self.bin_sumw.reshape(-1)
+        np.add.at(flat_sum, flat[:, 0], half_weights)
+        np.add.at(flat_sum, flat[:, 1], half_weights)
+
+        for first, second in ((0, 0), (0, 1), (1, 0), (1, 1)):
+            np.add.at(
+                self.event_second_sumw,
+                (flat[:, first], flat[:, second]),
+                0.25 * weights,
+            )
+            np.add.at(
+                self.mc_second_sumw2,
+                (flat[:, first], flat[:, second]),
+                0.25 * np.square(weights),
+            )
+        self.event_count += len(score_values)
+
+
+@dataclass
 class SampleResult:
     spec: SampleSpec
     total_entries: int
@@ -421,6 +500,8 @@ class SampleResult:
         default_factory=dict
     )
     pull_moment_model: str = PULL_MOMENT_MODEL
+    score_pull_moments: Optional[ScorePullMoments] = None
+    score_pull_moment_model: Optional[str] = None
     invalid_events: int = 0
     files: List[Dict[str, Any]] = field(default_factory=list)
     common_events: Optional["CommonEventTable"] = None
@@ -560,6 +641,44 @@ def pull_event_bin_vector(signed_angles: Sequence[float]) -> np.ndarray:
         PULL_BIN_EDGES,
         [fold_signed_pull_angle(float(angle)) for angle in signed_angles],
     )
+
+
+def weighted_score_quantile_edges(
+    scores: np.ndarray,
+    physical_weights: np.ndarray,
+    bins: int = SCORE_PULL_BIN_COUNT,
+) -> Tuple[np.ndarray, str]:
+    """Return frozen score edges with approximately equal nominal yield.
+
+    Tree classifiers can occasionally return too few distinct probabilities
+    for strict quantile edges, particularly in tiny tests.  In that case the
+    deterministic equal-width fallback keeps the joint observable well-defined
+    and records the fallback in metadata.
+    """
+    values = np.asarray(scores, dtype=np.float64)
+    weights = np.asarray(physical_weights, dtype=np.float64)
+    if values.ndim != 1 or weights.shape != values.shape or len(values) == 0:
+        raise ValueError("Score-quantile inputs must be non-empty one-dimensional arrays")
+    if not np.all(np.isfinite(values)) or np.any((values < 0.0) | (values > 1.0)):
+        raise ValueError("Score-quantile values must be finite and lie in [0, 1]")
+    if not np.all(np.isfinite(weights)) or np.any(weights < 0.0):
+        raise ValueError("Score-quantile weights must be finite and non-negative")
+    total = float(np.sum(weights, dtype=np.float64))
+    if total <= 0.0:
+        raise ValueError("Score-quantile weights must have a positive sum")
+    if bins < 2:
+        raise ValueError("At least two score bins are required")
+
+    order = np.argsort(values, kind="mergesort")
+    ordered_values = values[order]
+    cumulative = np.cumsum(weights[order], dtype=np.float64)
+    targets = total * np.arange(1, bins, dtype=np.float64) / float(bins)
+    positions = np.searchsorted(cumulative, targets, side="left")
+    positions = np.clip(positions, 0, len(ordered_values) - 1)
+    edges = np.concatenate(([0.0], ordered_values[positions], [1.0]))
+    if np.all(np.diff(edges) > 0.0):
+        return edges, "nominal_total_weighted_quantiles"
+    return np.linspace(0.0, 1.0, bins + 1, dtype=np.float64), "equal_width_fallback"
 
 
 def normalized_fraction_covariance(
@@ -1414,6 +1533,39 @@ def load_completed_run(
                 if exact_observables
                 else "legacy_folded_only_or_independent_jet_reconstruction"
             )
+            score_pull_prefix = f"{result_prefix}__score_pull"
+            score_pull_keys = {
+                "score_edges": f"{score_pull_prefix}__score_edges",
+                "pull_edges": f"{score_pull_prefix}__pull_edges",
+                "bin": f"{score_pull_prefix}__bin_sumw",
+                "event": f"{score_pull_prefix}__event_second_sumw",
+                "mc": f"{score_pull_prefix}__mc_second_sumw2",
+                "count": f"{score_pull_prefix}__event_count",
+            }
+            if all(key in available for key in score_pull_keys.values()):
+                score_pull = ScorePullMoments(
+                    np.asarray(arrays[score_pull_keys["score_edges"]], dtype=np.float64),
+                    np.asarray(arrays[score_pull_keys["pull_edges"]], dtype=np.float64),
+                )
+                expected_shape = score_pull.bin_sumw.shape
+                flat_bins = expected_shape[0] * expected_shape[1]
+                stored_bin = np.asarray(arrays[score_pull_keys["bin"]], dtype=np.float64)
+                stored_event = np.asarray(arrays[score_pull_keys["event"]], dtype=np.float64)
+                stored_mc = np.asarray(arrays[score_pull_keys["mc"]], dtype=np.float64)
+                if (
+                    stored_bin.shape != expected_shape
+                    or stored_event.shape != (flat_bins, flat_bins)
+                    or stored_mc.shape != (flat_bins, flat_bins)
+                ):
+                    raise ValueError(
+                        f"Stored score-pull moment dimensions are invalid for {spec.name}"
+                    )
+                score_pull.bin_sumw = stored_bin.copy()
+                score_pull.event_second_sumw = stored_event.copy()
+                score_pull.mc_second_sumw2 = stored_mc.copy()
+                score_pull.event_count = int(arrays[score_pull_keys["count"]])
+                result.score_pull_moments = score_pull
+                result.score_pull_moment_model = SCORE_PULL_MOMENT_MODEL
             results.append(result)
     return config, results, metadata
 
@@ -2302,6 +2454,40 @@ def build_xgboost_results(
             ):
                 raise RuntimeError(f"Sample {name} received invalid physics scores or thresholds")
 
+        edge_score_parts: List[np.ndarray] = []
+        edge_weight_parts: List[np.ndarray] = []
+        for cut_result in channel_results:
+            table = cut_result.common_events
+            if table is None:
+                raise RuntimeError(f"Sample {cut_result.spec.name} lost its common-event table")
+            edge_score_parts.append(sample_scores[cut_result.spec.name])
+            edge_weight_parts.append(
+                (cut_result.spec.cross_section_pb / cut_result.generated_sumw) * table.weights
+            )
+        if source_metadata is None:
+            score_pull_edges, score_edge_scheme = weighted_score_quantile_edges(
+                np.concatenate(edge_score_parts),
+                np.concatenate(edge_weight_parts),
+            )
+            score_edge_source = "this nominal out-of-fold prediction"
+        else:
+            source_diagnostic = channel_source.get("score_pull_diagnostic")
+            if not source_diagnostic:
+                raise ValueError(
+                    f"Frozen nominal XGBoost metadata for {channel} lacks score-pull "
+                    "quantile edges; rerun the nominal analysis with analysis version 2.3 or later"
+                )
+            score_pull_edges = np.asarray(
+                source_diagnostic.get("score_edges", ()), dtype=np.float64
+            )
+            if (
+                score_pull_edges.shape != (SCORE_PULL_BIN_COUNT + 1,)
+                or not np.all(np.diff(score_pull_edges) > 0.0)
+            ):
+                raise ValueError(f"Frozen {channel} score-pull edges are invalid")
+            score_edge_scheme = str(source_diagnostic.get("edge_scheme", "frozen_nominal"))
+            score_edge_source = str(model_run.resolve())
+
         score_parts: List[np.ndarray] = []
         threshold_parts: List[np.ndarray] = []
         label_parts: List[np.ndarray] = []
@@ -2319,6 +2505,15 @@ def build_xgboost_results(
                 cut_result, indices, scores, thresholds, correction=1.0
             )
             xgb_result.application_scope = application_scope
+            score_pull_moments = ScorePullMoments(score_pull_edges.copy())
+            signed_angle_index = PULL_VALUE_NAMES.index("signed_angle")
+            score_pull_moments.fill_batch(
+                scores,
+                table.pulls[:, :, signed_angle_index],
+                table.weights,
+            )
+            xgb_result.score_pull_moments = score_pull_moments
+            xgb_result.score_pull_moment_model = SCORE_PULL_MOMENT_MODEL
             xgboost_results.append(xgb_result)
             passed = scores >= thresholds
             sample_application[name] = {
@@ -2379,6 +2574,17 @@ def build_xgboost_results(
             "out_of_fold" if source_metadata is None else "application": performance,
             "feature_importance_gain": feature_importance,
             "samples": sample_application,
+            "score_pull_diagnostic": {
+                "moment_model": SCORE_PULL_MOMENT_MODEL,
+                "score_bins": SCORE_PULL_BIN_COUNT,
+                "score_edges": score_pull_edges.tolist(),
+                "pull_bins": PULL_BIN_COUNT,
+                "pull_edges": PULL_BIN_EDGES.tolist(),
+                "edge_scheme": score_edge_scheme,
+                "edge_source": score_edge_source,
+                "selection": "common selection through opposite hemispheres; no score cut",
+                "entry_model": "two half-weight tagging-jet entries per event",
+            },
         }
         if model_records:
             channel_metadata.update(
@@ -2473,6 +2679,16 @@ def result_summary(result: SampleResult, luminosities: Sequence[float]) -> Dict[
         scale_pb * scale_pb * result.pull_mc_second_sumw2,
         luminosities,
     )
+    score_pull_summary = None
+    if result.score_pull_moments is not None:
+        score_pull_summary = {
+            "moment_model": result.score_pull_moment_model,
+            "event_count": result.score_pull_moments.event_count,
+            "score_edges": result.score_pull_moments.score_edges.tolist(),
+            "pull_edges": result.score_pull_moments.pull_edges.tolist(),
+            "sumw": float(np.sum(result.score_pull_moments.bin_sumw, dtype=np.float64)),
+            "selection": "common selection through opposite hemispheres",
+        }
     return {
         "strategy": result.strategy,
         "application_scope": result.application_scope,
@@ -2501,6 +2717,7 @@ def result_summary(result: SampleResult, luminosities: Sequence[float]) -> Dict[
             "differential": differential,
             "moment_model": result.pull_moment_model,
         },
+        "score_pull_diagnostic": score_pull_summary,
         "yields": yields,
     }
 
@@ -2624,6 +2841,189 @@ def total_pull_observable_statistics(
         "data_covariance": luminosity_scale * event_second_pb,
         "mc_covariance": luminosity_scale * luminosity_scale * mc_second_pb2,
         "selected_cross_section_pb": np.asarray(selected_cross_section_pb),
+    }
+
+
+def total_score_pull_statistics(
+    channel: str,
+    results: Sequence[SampleResult],
+    luminosity_fb: float,
+    reference_cross_sections_pb: Mapping[str, float],
+) -> Dict[str, np.ndarray]:
+    """Combine the common-selection score-pull moments over all processes."""
+    selected = [
+        result
+        for result in results
+        if result.spec.channel == channel and result.strategy == "xgboost"
+    ]
+    if not selected:
+        raise ValueError(f"No {channel} XGBoost results are available")
+    first = selected[0].score_pull_moments
+    if first is None:
+        raise ValueError(f"{channel} run lacks joint score-pull moments")
+    score_edges = first.score_edges
+    pull_edges = first.pull_edges
+    shape = first.bin_sumw.shape
+    flat_bins = shape[0] * shape[1]
+    bin_cross_sections_pb = np.zeros(shape, dtype=np.float64)
+    event_second_pb = np.zeros((flat_bins, flat_bins), dtype=np.float64)
+    mc_second_pb2 = np.zeros_like(event_second_pb)
+    common_cross_section_pb = 0.0
+    for result in selected:
+        moments = result.score_pull_moments
+        if moments is None or result.score_pull_moment_model != SCORE_PULL_MOMENT_MODEL:
+            raise ValueError(
+                f"Run lacks exact joint score-pull moments for {result.spec.name}"
+            )
+        if not (
+            np.array_equal(moments.score_edges, score_edges)
+            and np.array_equal(moments.pull_edges, pull_edges)
+        ):
+            raise ValueError(f"Inconsistent score-pull binning in {channel}")
+        if result.spec.name not in reference_cross_sections_pb:
+            raise ValueError(f"Reference cross section is missing for {result.spec.name}")
+        scale_pb = float(reference_cross_sections_pb[result.spec.name]) / result.generated_sumw
+        bin_cross_sections_pb += scale_pb * moments.bin_sumw
+        event_second_pb += scale_pb * moments.event_second_sumw
+        mc_second_pb2 += scale_pb * scale_pb * moments.mc_second_sumw2
+        common_cross_section_pb += scale_pb * result.cutflow[
+            "xgboost_application_sample"
+        ].sumw
+    if not math.isclose(
+        float(np.sum(bin_cross_sections_pb, dtype=np.float64)),
+        common_cross_section_pb,
+        rel_tol=1.0e-10,
+        abs_tol=1.0e-12,
+    ):
+        raise RuntimeError(f"{channel} score-pull integral does not match common selection")
+    luminosity_scale = 1000.0 * float(luminosity_fb)
+    return {
+        "score_edges": score_edges.copy(),
+        "pull_edges": pull_edges.copy(),
+        "bin_cross_sections_pb": bin_cross_sections_pb,
+        "event_second_pb": event_second_pb,
+        "mc_second_pb2": mc_second_pb2,
+        "yield": luminosity_scale * bin_cross_sections_pb,
+        "data_covariance": luminosity_scale * event_second_pb,
+        "mc_covariance": luminosity_scale * luminosity_scale * mc_second_pb2,
+        "common_cross_section_pb": np.asarray(common_cross_section_pb),
+    }
+
+
+def score_category_transformation(
+    score_bins: int,
+    pull_bins: int,
+    score_ranges: Sequence[Tuple[int, int]],
+) -> np.ndarray:
+    """Map flattened score×pull bins into conditional pull categories."""
+    transform = np.zeros(
+        (len(score_ranges) * pull_bins, score_bins * pull_bins), dtype=np.float64
+    )
+    for category, (start, stop) in enumerate(score_ranges):
+        if not (0 <= start < stop <= score_bins):
+            raise ValueError(f"Invalid score-category range {(start, stop)}")
+        for score_bin in range(start, stop):
+            for pull_bin in range(pull_bins):
+                transform[category * pull_bins + pull_bin, score_bin * pull_bins + pull_bin] = 1.0
+    return transform
+
+
+def conditional_score_pull_statistics(
+    statistics: Mapping[str, np.ndarray],
+    score_ranges: Sequence[Tuple[int, int]],
+) -> Dict[str, np.ndarray]:
+    """Normalize the six-bin pull distribution independently in each category."""
+    score_edges = np.asarray(statistics["score_edges"], dtype=np.float64)
+    pull_edges = np.asarray(statistics["pull_edges"], dtype=np.float64)
+    bin_yields = np.asarray(statistics["yield"], dtype=np.float64)
+    score_bins, pull_bins = bin_yields.shape
+    if pull_bins != PULL_BIN_COUNT or not np.array_equal(pull_edges, PULL_BIN_EDGES):
+        raise ValueError("Conditional score-pull statistics require the six folded-angle bins")
+    transform = score_category_transformation(score_bins, pull_bins, score_ranges)
+    flat_yields = bin_yields.reshape(-1)
+    category_yields = transform @ flat_yields
+    data_unnormalized = (
+        transform @ np.asarray(statistics["data_covariance"], dtype=np.float64) @ transform.T
+    )
+    mc_unnormalized = (
+        transform @ np.asarray(statistics["mc_covariance"], dtype=np.float64) @ transform.T
+    )
+    fractions = np.zeros_like(category_yields)
+    jacobian = np.zeros((len(category_yields), len(category_yields)), dtype=np.float64)
+    totals = np.zeros(len(score_ranges), dtype=np.float64)
+    for category in range(len(score_ranges)):
+        block = slice(category * pull_bins, (category + 1) * pull_bins)
+        values = category_yields[block]
+        total = float(np.sum(values, dtype=np.float64))
+        if total <= 0.0 or not math.isfinite(total):
+            raise ValueError("Every score category must have a positive finite prediction")
+        totals[category] = total
+        fractions[block] = values / total
+        jacobian[block, block] = (
+            np.eye(pull_bins, dtype=np.float64) - fractions[block, None]
+        ) / total
+    data_covariance = jacobian @ data_unnormalized @ jacobian.T
+    mc_covariance = jacobian @ mc_unnormalized @ jacobian.T
+    return {
+        "score_edges": score_edges,
+        "pull_edges": pull_edges,
+        "score_ranges": np.asarray(score_ranges, dtype=np.int64),
+        "category_yields": totals,
+        "R": fractions,
+        "data_covariance": 0.5 * (data_covariance + data_covariance.T),
+        "mc_covariance": 0.5 * (mc_covariance + mc_covariance.T),
+    }
+
+
+def contiguous_score_partitions(
+    score_bins: int,
+    categories: int,
+) -> Tuple[Tuple[Tuple[int, int], ...], ...]:
+    if categories < 1 or categories > score_bins:
+        raise ValueError("Score-category count is outside the available score bins")
+    partitions: List[Tuple[Tuple[int, int], ...]] = []
+    for cuts in itertools.combinations(range(1, score_bins), categories - 1):
+        boundaries = (0,) + tuple(cuts) + (score_bins,)
+        partitions.append(
+            tuple((boundaries[index], boundaries[index + 1]) for index in range(categories))
+        )
+    return tuple(partitions)
+
+
+def score_partition_comparison(
+    reference: Mapping[str, np.ndarray],
+    variation: Mapping[str, np.ndarray],
+    score_ranges: Sequence[Tuple[int, int]],
+) -> Dict[str, Any]:
+    """Evaluate conditional pull-shape separation for one fixed partition."""
+    reference_conditional = conditional_score_pull_statistics(reference, score_ranges)
+    variation_conditional = conditional_score_pull_statistics(variation, score_ranges)
+    delta = variation_conditional["R"] - reference_conditional["R"]
+    independent_mc = (
+        reference_conditional["mc_covariance"]
+        + variation_conditional["mc_covariance"]
+    )
+    nominal_data = reference_conditional["data_covariance"]
+    variation_data = variation_conditional["data_covariance"]
+    delta_fbeam = []
+    for category in range(len(score_ranges)):
+        block = slice(category * PULL_BIN_COUNT, (category + 1) * PULL_BIN_COUNT)
+        delta_fbeam.append(float(np.sum(delta[block][: PULL_BIN_COUNT // 2])))
+    return {
+        "score_ranges": [list(values) for values in score_ranges],
+        "reference_category_yields": reference_conditional["category_yields"].tolist(),
+        "variation_category_yields": variation_conditional["category_yields"].tolist(),
+        "delta_f_beam_by_category": delta_fbeam,
+        "nominal_truth": {
+            "data_stat_only": mahalanobis_distance(delta, nominal_data),
+            "data_plus_mc_stat": mahalanobis_distance(delta, nominal_data + independent_mc),
+        },
+        "variation_truth": {
+            "data_stat_only": mahalanobis_distance(delta, variation_data),
+            "data_plus_mc_stat": mahalanobis_distance(
+                delta, variation_data + independent_mc
+            ),
+        },
     }
 
 
@@ -2858,6 +3258,44 @@ def validate_comparison_sources(
                 raise ValueError(
                     f"Frozen XGBoost model hashes or thresholds differ in {source.run_dir}"
                 )
+            for channel in ("higgs", "z"):
+                reference_joint_edges = None
+                for result in source.results:
+                    if result.strategy != "xgboost" or result.spec.channel != channel:
+                        continue
+                    if (
+                        result.score_pull_moments is None
+                        or result.score_pull_moment_model != SCORE_PULL_MOMENT_MODEL
+                    ):
+                        raise ValueError(
+                            f"Comparison source {source.run_dir.name} lacks joint score-pull "
+                            f"moments for {result.spec.name}; rerun it with analysis version "
+                            "2.3 or later"
+                        )
+                    edges = result.score_pull_moments.score_edges
+                    if reference_joint_edges is None:
+                        reference_joint_edges = edges
+                    elif not np.array_equal(edges, reference_joint_edges):
+                        raise ValueError(
+                            f"Score-pull edges differ between {channel} processes in "
+                            f"{source.run_dir}"
+                        )
+                    nominal_result = next(
+                        item
+                        for item in reference.results
+                        if item.strategy == "xgboost"
+                        and item.spec.channel == channel
+                        and item.spec.name == result.spec.name
+                    )
+                    if (
+                        nominal_result.score_pull_moments is None
+                        or not np.array_equal(
+                            edges, nominal_result.score_pull_moments.score_edges
+                        )
+                    ):
+                        raise ValueError(
+                            f"Frozen nominal score-quantile edges differ in {source.run_dir}"
+                        )
     return reference_cross_sections
 
 
@@ -3061,6 +3499,194 @@ def build_comparison_statistics(
                 }
             strategy_payload[channel] = channel_payload
         payload["analyses"][strategy] = strategy_payload
+    return payload, numerical
+
+
+def build_score_pull_diagnostic(
+    sources: Sequence[ComparisonSource],
+    luminosities: Sequence[float],
+    reference_cross_sections_pb: Mapping[str, float],
+) -> Tuple[
+    Dict[str, Any],
+    Dict[Tuple[str, float, str], Dict[str, np.ndarray]],
+]:
+    """Build the exploratory score-quantile × folded-pull comparison."""
+    reference_id = sources[0].scenario.identifier
+    variation_ids = [source.scenario.identifier for source in sources[1:]]
+    numerical: Dict[Tuple[str, float, str], Dict[str, np.ndarray]] = {}
+    payload: Dict[str, Any] = {
+        "schema_version": 1,
+        "moment_model": SCORE_PULL_MOMENT_MODEL,
+        "selection": "common selection through opposite hemispheres; no VBF or score cut",
+        "score_binning": "ten total-prediction weighted quantiles frozen by the nominal run",
+        "pull_binning": "six equal folded signed-pull-angle bins on [0, pi]",
+        "category_objective": (
+            "conditional pull-shape Mahalanobis D2; each score category is normalized "
+            "independently, with nominal-truth projected-data covariance plus independent "
+            "nominal/variation MC covariance"
+        ),
+        "multi_variation_objective": "maximize the minimum D2 across all supplied variations",
+        "interpretation": (
+            "exploratory design diagnostic; boundaries are fixed across scenarios but must be "
+            "confirmed with statistically independent simulations before a significance claim"
+        ),
+        "reference_scenario_id": reference_id,
+        "variation_scenario_ids": variation_ids,
+        "channels": {},
+    }
+    singleton_ranges = tuple((index, index + 1) for index in range(SCORE_PULL_BIN_COUNT))
+    for channel in ("higgs", "z"):
+        channel_payload: Dict[str, Any] = {"luminosities": {}}
+        for luminosity in luminosities:
+            for source in sources:
+                numerical[(channel, float(luminosity), source.scenario.identifier)] = (
+                    total_score_pull_statistics(
+                        channel,
+                        source.results,
+                        luminosity,
+                        reference_cross_sections_pb,
+                    )
+                )
+            reference = numerical[(channel, float(luminosity), reference_id)]
+            score_edges = np.asarray(reference["score_edges"], dtype=np.float64)
+            for scenario_id in variation_ids:
+                if not np.array_equal(
+                    numerical[(channel, float(luminosity), scenario_id)]["score_edges"],
+                    score_edges,
+                ):
+                    raise ValueError(
+                        f"Frozen score edges differ for {channel} scenario {scenario_id}"
+                    )
+            reference_singletons = conditional_score_pull_statistics(
+                reference, singleton_ranges
+            )
+            variations_payload: Dict[str, Any] = {}
+            for source in sources[1:]:
+                scenario_id = source.scenario.identifier
+                variation = numerical[(channel, float(luminosity), scenario_id)]
+                variation_singletons = conditional_score_pull_statistics(
+                    variation, singleton_ranges
+                )
+                delta = variation_singletons["R"] - reference_singletons["R"]
+                independent_mc = (
+                    reference_singletons["mc_covariance"]
+                    + variation_singletons["mc_covariance"]
+                )
+                quantiles = []
+                selector = np.concatenate(
+                    (np.ones(PULL_BIN_COUNT // 2), np.zeros(PULL_BIN_COUNT // 2))
+                )
+                for score_bin in range(SCORE_PULL_BIN_COUNT):
+                    block = slice(
+                        score_bin * PULL_BIN_COUNT,
+                        (score_bin + 1) * PULL_BIN_COUNT,
+                    )
+                    reference_r = reference_singletons["R"][block]
+                    variation_r = variation_singletons["R"][block]
+                    delta_r = delta[block]
+                    data_covariance = reference_singletons["data_covariance"][block, block]
+                    mc_covariance = independent_mc[block, block]
+                    delta_fbeam = float(selector @ delta_r)
+                    quantiles.append(
+                        {
+                            "score_bin": score_bin + 1,
+                            "score_low": float(score_edges[score_bin]),
+                            "score_high": float(score_edges[score_bin + 1]),
+                            "reference_yield": float(
+                                reference_singletons["category_yields"][score_bin]
+                            ),
+                            "variation_yield": float(
+                                variation_singletons["category_yields"][score_bin]
+                            ),
+                            "reference_R": reference_r.tolist(),
+                            "variation_R": variation_r.tolist(),
+                            "delta_R": delta_r.tolist(),
+                            "reference_f_beam": float(selector @ reference_r),
+                            "variation_f_beam": float(selector @ variation_r),
+                            "delta_f_beam": delta_fbeam,
+                            "delta_f_beam_data_plus_mc_error": math.sqrt(
+                                max(
+                                    float(
+                                        selector
+                                        @ (data_covariance + mc_covariance)
+                                        @ selector
+                                    ),
+                                    0.0,
+                                )
+                            ),
+                            "six_bin_data_stat_only": mahalanobis_distance(
+                                delta_r, data_covariance
+                            ),
+                            "six_bin_data_plus_mc_stat": mahalanobis_distance(
+                                delta_r, data_covariance + mc_covariance
+                            ),
+                        }
+                    )
+                variations_payload[scenario_id] = {
+                    "label": source.scenario.label,
+                    "quantiles": quantiles,
+                }
+
+            category_scans: Dict[str, Any] = {}
+            for category_count in (2, 3):
+                candidates = []
+                for score_ranges in contiguous_score_partitions(
+                    SCORE_PULL_BIN_COUNT, category_count
+                ):
+                    per_variation = {}
+                    data_plus_mc_values = []
+                    data_only_values = []
+                    for source in sources[1:]:
+                        scenario_id = source.scenario.identifier
+                        comparison = score_partition_comparison(
+                            reference,
+                            numerical[(channel, float(luminosity), scenario_id)],
+                            score_ranges,
+                        )
+                        data_plus_mc = comparison["nominal_truth"][
+                            "data_plus_mc_stat"
+                        ]["D2"]
+                        data_only = comparison["nominal_truth"]["data_stat_only"]["D2"]
+                        data_plus_mc_values.append(float(data_plus_mc))
+                        data_only_values.append(float(data_only))
+                        per_variation[scenario_id] = {
+                            "D2_data_plus_mc_stat": float(data_plus_mc),
+                            "D2_data_stat_only": float(data_only),
+                            "delta_f_beam_by_category": comparison[
+                                "delta_f_beam_by_category"
+                            ],
+                        }
+                    candidates.append(
+                        {
+                            "score_ranges": [list(values) for values in score_ranges],
+                            "boundary_scores": [
+                                float(score_edges[stop]) for _, stop in score_ranges[:-1]
+                            ],
+                            "minimum_D2_data_plus_mc_stat": min(data_plus_mc_values),
+                            "mean_D2_data_plus_mc_stat": float(
+                                np.mean(data_plus_mc_values, dtype=np.float64)
+                            ),
+                            "minimum_D2_data_stat_only": min(data_only_values),
+                            "per_variation": per_variation,
+                        }
+                    )
+                candidates.sort(
+                    key=lambda values: (
+                        values["minimum_D2_data_plus_mc_stat"],
+                        values["mean_D2_data_plus_mc_stat"],
+                    ),
+                    reverse=True,
+                )
+                category_scans[str(category_count)] = {
+                    "recommended": candidates[0],
+                    "candidates": candidates,
+                }
+            channel_payload["luminosities"][str(float(luminosity))] = {
+                "score_edges": score_edges.tolist(),
+                "variations": variations_payload,
+                "category_scans": category_scans,
+            }
+        payload["channels"][channel] = channel_payload
     return payload, numerical
 
 
@@ -3307,6 +3933,87 @@ def write_comparison_artifacts(
     return json_path, csv_path, npz_path
 
 
+def write_score_pull_diagnostic_artifacts(
+    run_dir: Path,
+    payload: Mapping[str, Any],
+    numerical: Mapping[Tuple[str, float, str], Mapping[str, np.ndarray]],
+) -> Tuple[Path, Path, Path]:
+    json_path = run_dir / "summaries" / "score_pull_diagnostic.json"
+    csv_path = run_dir / "summaries" / "score_pull_diagnostic.csv"
+    npz_path = run_dir / "summaries" / "score_pull_diagnostic.npz"
+    write_json_exclusive(json_path, payload)
+    arrays: Dict[str, np.ndarray] = {}
+    for (channel, luminosity, scenario), statistics in numerical.items():
+        prefix = f"{channel}__{_format_luminosity(luminosity)}__{scenario}"
+        for name in (
+            "score_edges",
+            "pull_edges",
+            "bin_cross_sections_pb",
+            "event_second_pb",
+            "mc_second_pb2",
+            "yield",
+            "data_covariance",
+            "mc_covariance",
+            "common_cross_section_pb",
+        ):
+            arrays[f"{prefix}__{name}"] = np.asarray(
+                statistics[name], dtype=np.float64
+            )
+    rows: List[Dict[str, Any]] = []
+    for channel, channel_values in payload["channels"].items():
+        for luminosity_key, luminosity_values in channel_values["luminosities"].items():
+            luminosity = float(luminosity_key)
+            for scenario, scenario_values in luminosity_values["variations"].items():
+                for quantile in scenario_values["quantiles"]:
+                    for pull_bin, delta_r in enumerate(quantile["delta_R"], start=1):
+                        rows.append(
+                            {
+                                "record_type": "score_quantile_pull_bin",
+                                "channel": channel,
+                                "luminosity_fb": luminosity,
+                                "variation": scenario,
+                                "category_count": 1,
+                                "score_bin": quantile["score_bin"],
+                                "score_low": quantile["score_low"],
+                                "score_high": quantile["score_high"],
+                                "pull_bin": pull_bin,
+                                "delta_R_i": delta_r,
+                                "delta_f_beam": quantile["delta_f_beam"],
+                                "D2_data_plus_mc_stat": quantile[
+                                    "six_bin_data_plus_mc_stat"
+                                ]["D2"],
+                            }
+                        )
+            for category_count, scan in luminosity_values["category_scans"].items():
+                for rank, candidate in enumerate(scan["candidates"], start=1):
+                    rows.append(
+                        {
+                            "record_type": "category_partition_candidate",
+                            "channel": channel,
+                            "luminosity_fb": luminosity,
+                            "category_count": int(category_count),
+                            "partition_rank": rank,
+                            "score_ranges": json.dumps(candidate["score_ranges"]),
+                            "boundary_scores": json.dumps(candidate["boundary_scores"]),
+                            "D2_data_plus_mc_stat": candidate[
+                                "minimum_D2_data_plus_mc_stat"
+                            ],
+                            "D2_data_stat_only": candidate[
+                                "minimum_D2_data_stat_only"
+                            ],
+                        }
+                    )
+    fields = sorted({key for row in rows for key in row})
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("x", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    with npz_path.open("xb") as stream:
+        np.savez_compressed(stream, **arrays)
+    return json_path, csv_path, npz_path
+
+
 def write_histogram_npz(run_dir: Path, results: Sequence[SampleResult]) -> Path:
     destination = run_dir / "summaries" / "histograms.npz"
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -3329,6 +4036,17 @@ def write_histogram_npz(run_dir: Path, results: Sequence[SampleResult]) -> Path:
             arrays[f"{prefix}__bin_sumw"] = moments.bin_sumw
             arrays[f"{prefix}__event_second_sumw"] = moments.event_second_sumw
             arrays[f"{prefix}__mc_second_sumw2"] = moments.mc_second_sumw2
+        if result.score_pull_moments is not None:
+            prefix = f"{result_prefix}__score_pull"
+            moments = result.score_pull_moments
+            arrays[f"{prefix}__score_edges"] = moments.score_edges
+            arrays[f"{prefix}__pull_edges"] = moments.pull_edges
+            arrays[f"{prefix}__bin_sumw"] = moments.bin_sumw
+            arrays[f"{prefix}__event_second_sumw"] = moments.event_second_sumw
+            arrays[f"{prefix}__mc_second_sumw2"] = moments.mc_second_sumw2
+            arrays[f"{prefix}__event_count"] = np.asarray(
+                moments.event_count, dtype=np.int64
+            )
     with destination.open("xb") as stream:
         np.savez_compressed(stream, **arrays)
     return destination
@@ -3944,6 +4662,294 @@ def generate_comparison_plots(
     return records
 
 
+def generate_score_pull_diagnostic_plots(
+    run_dir: Path,
+    sources: Sequence[ComparisonSource],
+    luminosities: Sequence[float],
+    payload: Mapping[str, Any],
+    numerical: Mapping[Tuple[str, float, str], Mapping[str, np.ndarray]],
+) -> List[Dict[str, Any]]:
+    """Plot the exploratory score-quantile dependence of the folded pull shape."""
+    matplotlib_config = Path(tempfile.gettempdir()) / "pullpheno-matplotlib"
+    matplotlib_config.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(matplotlib_config))
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm
+
+    records: List[Dict[str, Any]] = []
+    reference_id = sources[0].scenario.identifier
+    source_by_id = {source.scenario.identifier: source for source in sources}
+    singleton_ranges = tuple((index, index + 1) for index in range(SCORE_PULL_BIN_COUNT))
+    for channel in ("higgs", "z"):
+        for luminosity in luminosities:
+            luminosity_key = str(float(luminosity))
+            luminosity_payload = payload["channels"][channel]["luminosities"][
+                luminosity_key
+            ]
+            reference = numerical[(channel, float(luminosity), reference_id)]
+            reference_conditional = conditional_score_pull_statistics(
+                reference, singleton_ranges
+            )
+            reference_r = reference_conditional["R"].reshape(
+                SCORE_PULL_BIN_COUNT, PULL_BIN_COUNT
+            )
+            base = (
+                Path("plots")
+                / "comparison"
+                / "xgboost"
+                / "score-pull"
+                / _format_luminosity(luminosity)
+                / channel
+            )
+            for scenario_id, variation_payload in luminosity_payload[
+                "variations"
+            ].items():
+                source = source_by_id[scenario_id]
+                variation = numerical[(channel, float(luminosity), scenario_id)]
+                variation_conditional = conditional_score_pull_statistics(
+                    variation, singleton_ranges
+                )
+                variation_r = variation_conditional["R"].reshape(
+                    SCORE_PULL_BIN_COUNT, PULL_BIN_COUNT
+                )
+                delta = variation_r - reference_r
+                difference_covariance = (
+                    reference_conditional["data_covariance"]
+                    + reference_conditional["mc_covariance"]
+                    + variation_conditional["mc_covariance"]
+                )
+                errors = np.sqrt(
+                    np.maximum(np.diag(difference_covariance), 0.0)
+                ).reshape(SCORE_PULL_BIN_COUNT, PULL_BIN_COUNT)
+                standardized = np.divide(
+                    delta,
+                    errors,
+                    out=np.full_like(delta, np.nan),
+                    where=errors > 0.0,
+                )
+                delta_limit = max(float(np.max(np.abs(delta))), 1.0e-6)
+                standardized_finite = np.abs(standardized[np.isfinite(standardized)])
+                standardized_limit = max(
+                    float(np.max(standardized_finite)) if standardized_finite.size else 0.0,
+                    0.1,
+                )
+                figure, axes = plt.subplots(
+                    1, 3, figsize=(13.2, 4.9), constrained_layout=True
+                )
+                images = [
+                    axes[0].imshow(
+                        reference_r,
+                        origin="lower",
+                        aspect="auto",
+                        cmap="Blues",
+                        vmin=0.0,
+                    ),
+                    axes[1].imshow(
+                        delta,
+                        origin="lower",
+                        aspect="auto",
+                        cmap="RdBu_r",
+                        norm=TwoSlopeNorm(vcenter=0.0, vmin=-delta_limit, vmax=delta_limit),
+                    ),
+                    axes[2].imshow(
+                        standardized,
+                        origin="lower",
+                        aspect="auto",
+                        cmap="RdBu_r",
+                        norm=TwoSlopeNorm(
+                            vcenter=0.0,
+                            vmin=-standardized_limit,
+                            vmax=standardized_limit,
+                        ),
+                    ),
+                ]
+                titles = (
+                    "Reference conditional $R_i$",
+                    r"Variation $-$ reference: $\Delta R_i$",
+                    r"$\Delta R_i / \sigma_{\mathrm{data+MC}}$",
+                )
+                colorbar_labels = (r"$R_i$", r"$\Delta R_i$", "signed displacement")
+                for axis, image, title, colorbar_label in zip(
+                    axes, images, titles, colorbar_labels
+                ):
+                    axis.set_title(title, fontsize=10.2)
+                    axis.set_xticks(range(PULL_BIN_COUNT), [f"$R_{index}$" for index in range(1, 7)])
+                    axis.set_yticks(
+                        range(SCORE_PULL_BIN_COUNT),
+                        [f"Q{index}" for index in range(1, SCORE_PULL_BIN_COUNT + 1)],
+                    )
+                    axis.set_xlabel("Folded pull-angle bin")
+                    axis.grid(False)
+                    figure.colorbar(image, ax=axis, shrink=0.82, label=colorbar_label)
+                axes[0].set_ylabel("Frozen nominal score quantile (low → high)")
+                figure.suptitle(
+                    f"{channel.capitalize()} score × pull map · {source.scenario.label}\n"
+                    f"common selection · {luminosity:g} fb$^{{-1}}$ · exploratory",
+                    fontweight="semibold",
+                )
+                scenario_slug = sanitize_run_name(scenario_id) or "variation"
+                map_base = base / f"score_pull_map__{scenario_slug}"
+                map_png = run_dir / map_base.with_suffix(".png")
+                map_pdf = run_dir / map_base.with_suffix(".pdf")
+                _save_figure_exclusive(figure, map_png, dpi=170, bbox_inches="tight")
+                _save_figure_exclusive(figure, map_pdf, bbox_inches="tight")
+                plt.close(figure)
+                records.append(
+                    {
+                        "strategy": "xgboost",
+                        "observable": "score_pull_map",
+                        "title": f"Score × pull map · {source.scenario.label}",
+                        "channel": channel,
+                        "stage": "diagnostic",
+                        "kind": "score-pull-map",
+                        "luminosity_fb": luminosity,
+                        "png": map_png.relative_to(run_dir).as_posix(),
+                        "pdf": map_pdf.relative_to(run_dir).as_posix(),
+                    }
+                )
+
+                quantiles = variation_payload["quantiles"]
+                centers = np.arange(1, SCORE_PULL_BIN_COUNT + 1, dtype=np.float64)
+                delta_fbeam = np.asarray(
+                    [values["delta_f_beam"] for values in quantiles], dtype=np.float64
+                )
+                fbeam_errors = np.asarray(
+                    [
+                        values["delta_f_beam_data_plus_mc_error"]
+                        for values in quantiles
+                    ],
+                    dtype=np.float64,
+                )
+                figure, axis = plt.subplots(figsize=(7.4, 4.8), constrained_layout=True)
+                axis.errorbar(
+                    centers,
+                    delta_fbeam,
+                    yerr=fbeam_errors,
+                    fmt="o",
+                    color=str(source.scenario.color),
+                    capsize=2.5,
+                    markersize=4.5,
+                    label=source.scenario.label,
+                )
+                axis.axhline(0.0, color="#657086", linewidth=1.0)
+                axis.set_xticks(centers)
+                axis.set_xlabel("Frozen nominal XGBoost-score quantile (low → high)")
+                axis.set_ylabel(r"$\Delta f_{\mathrm{beam}}$ in score quantile")
+                axis.set_title(
+                    f"{channel.capitalize()} conditional beam fraction by score",
+                    loc="left",
+                    fontweight="semibold",
+                )
+                axis.text(
+                    1.0,
+                    1.015,
+                    f"common selection · {luminosity:g} fb$^{{-1}}$ · data+MC stat.",
+                    transform=axis.transAxes,
+                    fontsize=8.8,
+                    color="#555b66",
+                    ha="right",
+                )
+                axis.grid(False)
+                _place_plot_legend(axis)
+                fbeam_base = base / f"delta_fbeam_by_score__{scenario_slug}"
+                fbeam_png = run_dir / fbeam_base.with_suffix(".png")
+                fbeam_pdf = run_dir / fbeam_base.with_suffix(".pdf")
+                _save_figure_exclusive(figure, fbeam_png, dpi=170, bbox_inches="tight")
+                _save_figure_exclusive(figure, fbeam_pdf, bbox_inches="tight")
+                plt.close(figure)
+                records.append(
+                    {
+                        "strategy": "xgboost",
+                        "observable": "delta_fbeam_by_score",
+                        "title": f"Conditional Δfbeam by score · {source.scenario.label}",
+                        "channel": channel,
+                        "stage": "diagnostic",
+                        "kind": "score-pull-fbeam",
+                        "luminosity_fb": luminosity,
+                        "png": fbeam_png.relative_to(run_dir).as_posix(),
+                        "pdf": fbeam_pdf.relative_to(run_dir).as_posix(),
+                    }
+                )
+
+            two_scan = luminosity_payload["category_scans"]["2"]
+            three_scan = luminosity_payload["category_scans"]["3"]
+            two_candidates = sorted(
+                two_scan["candidates"], key=lambda values: values["score_ranges"][0][1]
+            )
+            two_boundaries = np.asarray(
+                [values["score_ranges"][0][1] for values in two_candidates], dtype=np.int64
+            )
+            two_d2 = np.asarray(
+                [values["minimum_D2_data_plus_mc_stat"] for values in two_candidates],
+                dtype=np.float64,
+            )
+            three_grid = np.full(
+                (SCORE_PULL_BIN_COUNT - 1, SCORE_PULL_BIN_COUNT - 1),
+                np.nan,
+                dtype=np.float64,
+            )
+            for candidate in three_scan["candidates"]:
+                first_cut = candidate["score_ranges"][0][1]
+                second_cut = candidate["score_ranges"][1][1]
+                three_grid[first_cut - 1, second_cut - 1] = candidate[
+                    "minimum_D2_data_plus_mc_stat"
+                ]
+            figure, (left, right) = plt.subplots(
+                1, 2, figsize=(11.2, 4.6), constrained_layout=True
+            )
+            left.plot(two_boundaries, two_d2, marker="o", color="#275DAD")
+            best_two_cut = two_scan["recommended"]["score_ranges"][0][1]
+            left.axvline(best_two_cut, color="#D05A47", linestyle="--", linewidth=1.2)
+            left.set_xlabel("Boundary after nominal score quantile")
+            left.set_ylabel(r"worst-case conditional-shape $D^2$")
+            left.set_title("Two common score categories")
+            left.grid(False)
+            image = right.imshow(
+                three_grid,
+                origin="lower",
+                aspect="auto",
+                cmap="viridis",
+                interpolation="none",
+            )
+            best_three = three_scan["recommended"]["score_ranges"]
+            right.plot(best_three[1][1] - 1, best_three[0][1] - 1, "x", color="white", ms=8, mew=2)
+            right.set_xticks(range(SCORE_PULL_BIN_COUNT - 1), range(1, SCORE_PULL_BIN_COUNT))
+            right.set_yticks(range(SCORE_PULL_BIN_COUNT - 1), range(1, SCORE_PULL_BIN_COUNT))
+            right.set_xlabel("Second boundary after quantile")
+            right.set_ylabel("First boundary after quantile")
+            right.set_title("Three common score categories")
+            right.grid(False)
+            figure.colorbar(image, ax=right, label=r"worst-case $D^2$")
+            figure.suptitle(
+                f"{channel.capitalize()} fixed score-category scan · {luminosity:g} fb$^{{-1}}$\n"
+                "conditional pull shapes · nominal truth · data+independent MC stat.",
+                fontweight="semibold",
+            )
+            scan_base = base / "score_category_scan"
+            scan_png = run_dir / scan_base.with_suffix(".png")
+            scan_pdf = run_dir / scan_base.with_suffix(".pdf")
+            _save_figure_exclusive(figure, scan_png, dpi=170, bbox_inches="tight")
+            _save_figure_exclusive(figure, scan_pdf, bbox_inches="tight")
+            plt.close(figure)
+            records.append(
+                {
+                    "strategy": "xgboost",
+                    "observable": "score_category_scan",
+                    "title": "Common two/three score-category scan",
+                    "channel": channel,
+                    "stage": "diagnostic",
+                    "kind": "score-category-scan",
+                    "luminosity_fb": luminosity,
+                    "png": scan_png.relative_to(run_dir).as_posix(),
+                    "pdf": scan_pdf.relative_to(run_dir).as_posix(),
+                }
+            )
+    return records
+
+
 def write_ri_artifacts(
     run_dir: Path,
     results: Sequence[SampleResult],
@@ -4354,6 +5360,7 @@ def generate_comparison_index(
     comparison: Mapping[str, Any],
     plot_records: Sequence[Mapping[str, Any]],
     luminosities: Sequence[float],
+    score_pull_diagnostic: Optional[Mapping[str, Any]] = None,
 ) -> Path:
     def format_optional(value: Any, format_spec: str) -> str:
         return "—" if value is None else format(float(value), format_spec)
@@ -4411,6 +5418,39 @@ def generate_comparison_index(
                         f"<td>{format_optional(variation_z, '+.3f')}</td>"
                         f"<td>{d2['D2']:.3f} (rank {d2['covariance_rank']})</td></tr>"
                     )
+    score_pull_html = ""
+    if score_pull_diagnostic is not None:
+        recommendation_rows = []
+        for channel, channel_values in score_pull_diagnostic["channels"].items():
+            for luminosity_key, luminosity_values in channel_values["luminosities"].items():
+                for category_count, scan in luminosity_values["category_scans"].items():
+                    recommended = scan["recommended"]
+                    boundaries = ", ".join(
+                        f"{value:.5g}" for value in recommended["boundary_scores"]
+                    )
+                    recommendation_rows.append(
+                        f"<tr><td>{html.escape(channel)}</td>"
+                        f"<td>{float(luminosity_key):g}</td>"
+                        f"<td>{html.escape(category_count)}</td>"
+                        f"<td>{html.escape(boundaries)}</td>"
+                        f"<td>{recommended['minimum_D2_data_plus_mc_stat']:.4g}</td>"
+                        f"<td>{recommended['minimum_D2_data_stat_only']:.4g}</td></tr>"
+                    )
+        score_pull_html = (
+            '<section class="panel"><h2>Exploratory XGBoost score × pull diagnostic</h2>'
+            '<p>The ten score quantiles are frozen by the nominal run and use all events '
+            'after common selection. Pull shapes are normalized independently inside each '
+            'candidate score category, so the scan is not driven by category-rate changes. '
+            'The listed boundaries maximize the worst-case conditional-shape D² across all '
+            'supplied CR variations. They require confirmation with independent simulations.</p>'
+            '<div class="table-wrap"><table><thead><tr><th>Channel</th><th>fb⁻¹</th>'
+            '<th>Categories</th><th>Score boundaries</th><th>Worst D² data+MC</th>'
+            '<th>Worst D² data only</th></tr></thead><tbody>'
+            + ''.join(recommendation_rows)
+            + '</tbody></table></div><p><a href="summaries/score_pull_diagnostic.json">JSON</a> · '
+            '<a href="summaries/score_pull_diagnostic.csv">CSV</a> · '
+            '<a href="summaries/score_pull_diagnostic.npz">NPZ moments</a></p></section>'
+        )
     cards = []
     for record in plot_records:
         lumi = _format_luminosity(float(record["luminosity_fb"]))
@@ -4433,6 +5473,7 @@ def generate_comparison_index(
             f"<a href=\"{html.escape(str(record['pdf']))}\">PDF</a></p></div></article>"
         )
     analyses = list(comparison["analyses"])
+    kinds = sorted({str(record["kind"]) for record in plot_records})
     document = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>PullPheno CR comparison · {html.escape(str(run_metadata['run_id']))}</title>
@@ -4444,10 +5485,11 @@ def generate_comparison_index(
 Each point is the total prediction from one complete, independently generated scenario. All process samples, including backgrounds, are scenario-specific; no background sample is shared. The first run fixes the process cross sections and is the ratio reference.</p></header><main>
 <section class="panel"><h2>Source runs</h2><div class="table-wrap"><table><thead><tr><th>Role</th><th>Scenario</th><th>Parameters</th><th>Immutable source</th></tr></thead><tbody>{''.join(source_rows)}</tbody></table></div><h3>Common reference cross sections</h3><p>Every scenario uses the first run's final-state cross sections; scenario-specific efficiencies and generated sums of weights remain independent.</p><div class="table-wrap"><table><thead><tr><th>Process</th><th>Cross section [pb]</th></tr></thead><tbody>{cross_section_rows}</tbody></table></div></section>
 <section class="panel"><h2>Folded-angle numerical comparison</h2><p>Directional f<sub>beam</sub> values retain their signs. Six-bin D² values are Mahalanobis distances in the supported covariance subspace; √D² is not labelled as a one-dimensional Gaussian significance.</p><div class="table-wrap"><table><thead><tr><th>Analysis</th><th>Channel</th><th>Variation</th><th>fb⁻¹</th><th>f<sub>beam</sub> ref.</th><th>f<sub>beam</sub> var.</th><th>Δf<sub>beam</sub></th><th>Z (ref. truth)</th><th>Z (var. truth)</th><th>D² (ref. truth)</th></tr></thead><tbody>{''.join(summary_rows)}</tbody></table></div><p><a href="summaries/comparison.json">JSON</a> · <a href="summaries/comparison.csv">CSV</a> · <a href="summaries/comparison.npz">NPZ arrays and covariances</a></p></section>
-<section><h2>Total pull-observable plots</h2><div class="controls">
+{score_pull_html}
+<section><h2>Total pull-observable plots and diagnostics</h2><div class="controls">
 <label>Analysis<select id="strategy"><option value="all">All</option>{''.join(f'<option value="{name}">{name}</option>' for name in analyses)}</select></label>
 <label>Channel<select id="channel"><option value="all">All</option><option value="higgs">Higgs</option><option value="z">Z</option></select></label>
-<label>Uncertainty<select id="kind"><option value="all">All</option><option value="data-stat">Projected data stat.</option><option value="mc-stat">MC stat.</option></select></label>
+<label>Plot type<select id="kind"><option value="all">All</option>{''.join(f'<option value="{html.escape(name)}">{html.escape(name)}</option>' for name in kinds)}</select></label>
 <label>Luminosity<select id="lumi"><option value="all">All</option>{''.join(f'<option value="{_format_luminosity(value)}">{value:g} fb⁻¹</option>' for value in luminosities)}</select></label>
 <label>Search<input id="search" type="search" placeholder="angle, t_phi…"></label></div>
 <div class="gallery">{''.join(cards)}</div><p id="empty" hidden>No plots match these filters.</p></section></main>
@@ -4670,6 +5712,7 @@ def validate_results(results: Sequence[SampleResult], partial: bool) -> Dict[str
             )
         generated_match = partial or math.isclose(result.processed_sumw, result.generated_sumw, rel_tol=1.0e-10, abs_tol=1.0e-8)
         full_xgboost_application = True
+        score_pull_moments_valid = True
         if result.strategy == "xgboost" and result.application_scope in {
             "five_fold_out_of_fold_all_events",
             "five_fold_routed_independent_events",
@@ -4683,6 +5726,51 @@ def validate_results(results: Sequence[SampleResult], partial: bool) -> Dict[str
                 and math.isclose(common.sumw, application.sumw, rel_tol=1.0e-12, abs_tol=1.0e-10)
                 and math.isclose(common.sumw2, application.sumw2, rel_tol=1.0e-12, abs_tol=1.0e-10)
             )
+            if result.score_pull_moments is not None:
+                joint = result.score_pull_moments
+                joint_tolerance = max(1.0e-10, 1.0e-10 * abs(application.sumw))
+                joint_sumw2_tolerance = max(
+                    1.0e-10, 1.0e-10 * abs(application.sumw2)
+                )
+                score_pull_moments_valid = (
+                    result.score_pull_moment_model == SCORE_PULL_MOMENT_MODEL
+                    and joint.event_count == application.raw_count
+                    and np.array_equal(joint.pull_edges, PULL_BIN_EDGES)
+                    and len(joint.score_edges) == SCORE_PULL_BIN_COUNT + 1
+                    and np.all(np.isfinite(joint.bin_sumw))
+                    and np.all(np.isfinite(joint.event_second_sumw))
+                    and np.all(np.isfinite(joint.mc_second_sumw2))
+                    and np.allclose(
+                        joint.event_second_sumw,
+                        joint.event_second_sumw.T,
+                        rtol=0.0,
+                        atol=joint_tolerance,
+                    )
+                    and np.allclose(
+                        joint.mc_second_sumw2,
+                        joint.mc_second_sumw2.T,
+                        rtol=0.0,
+                        atol=joint_sumw2_tolerance,
+                    )
+                    and math.isclose(
+                        float(np.sum(joint.bin_sumw, dtype=np.float64)),
+                        application.sumw,
+                        rel_tol=1.0e-10,
+                        abs_tol=joint_tolerance,
+                    )
+                    and math.isclose(
+                        float(np.sum(joint.event_second_sumw, dtype=np.float64)),
+                        application.sumw,
+                        rel_tol=1.0e-10,
+                        abs_tol=joint_tolerance,
+                    )
+                    and math.isclose(
+                        float(np.sum(joint.mc_second_sumw2, dtype=np.float64)),
+                        application.sumw2,
+                        rel_tol=1.0e-10,
+                        abs_tol=joint_sumw2_tolerance,
+                    )
+                )
         item = {
             "sample": result.spec.name,
             "strategy": result.strategy,
@@ -4698,6 +5786,7 @@ def validate_results(results: Sequence[SampleResult], partial: bool) -> Dict[str
             "processed_sumw_matches_generated": generated_match,
             "nonnegative_sumw2": positive_weights,
             "xgboost_application_uses_all_common_events": full_xgboost_application,
+            "score_pull_moments_valid_if_present": score_pull_moments_valid,
         }
         checks.append(item)
         if not all(value for key, value in item.items() if key not in ("sample", "strategy")):
@@ -4812,7 +5901,28 @@ def run_comparison(args: argparse.Namespace, started: datetime) -> int:
             luminosities,
             reference_cross_sections,
         )
+        score_pull_payload: Optional[Dict[str, Any]] = None
+        score_pull_numerical: Dict[Tuple[str, float, str], Dict[str, np.ndarray]] = {}
+        if "xgboost" in analyses:
+            score_pull_payload, score_pull_numerical = build_score_pull_diagnostic(
+                sources,
+                luminosities,
+                reference_cross_sections,
+            )
+            comparison["score_pull_diagnostic"] = {
+                "available": True,
+                "json": "summaries/score_pull_diagnostic.json",
+                "csv": "summaries/score_pull_diagnostic.csv",
+                "npz": "summaries/score_pull_diagnostic.npz",
+                "moment_model": SCORE_PULL_MOMENT_MODEL,
+            }
         write_comparison_artifacts(reservation.incomplete_dir, comparison, numerical)
+        if score_pull_payload is not None:
+            write_score_pull_diagnostic_artifacts(
+                reservation.incomplete_dir,
+                score_pull_payload,
+                score_pull_numerical,
+            )
         plot_records = generate_comparison_plots(
             reservation.incomplete_dir,
             sources,
@@ -4820,6 +5930,16 @@ def run_comparison(args: argparse.Namespace, started: datetime) -> int:
             luminosities,
             numerical,
         )
+        if score_pull_payload is not None:
+            plot_records.extend(
+                generate_score_pull_diagnostic_plots(
+                    reservation.incomplete_dir,
+                    sources,
+                    luminosities,
+                    score_pull_payload,
+                    score_pull_numerical,
+                )
+            )
         write_json_exclusive(
             reservation.incomplete_dir / "summaries" / "plots.json", plot_records
         )
@@ -4859,6 +5979,15 @@ def run_comparison(args: argparse.Namespace, started: datetime) -> int:
                 "comparison_json": "summaries/comparison.json",
                 "comparison_csv": "summaries/comparison.csv",
                 "comparison_npz": "summaries/comparison.npz",
+                **(
+                    {
+                        "score_pull_diagnostic_json": "summaries/score_pull_diagnostic.json",
+                        "score_pull_diagnostic_csv": "summaries/score_pull_diagnostic.csv",
+                        "score_pull_diagnostic_npz": "summaries/score_pull_diagnostic.npz",
+                    }
+                    if score_pull_payload is not None
+                    else {}
+                ),
             },
             "validation": {
                 "status": "passed",
@@ -4866,6 +5995,9 @@ def run_comparison(args: argparse.Namespace, started: datetime) -> int:
                 "source_count": len(sources),
                 "pull_moment_model": PULL_MOMENT_MODEL,
                 "normalization_uses_reference_cross_sections": True,
+                "score_pull_moment_model": (
+                    SCORE_PULL_MOMENT_MODEL if score_pull_payload is not None else None
+                ),
             },
         }
         generate_comparison_index(
@@ -4875,6 +6007,7 @@ def run_comparison(args: argparse.Namespace, started: datetime) -> int:
             comparison,
             plot_records,
             luminosities,
+            score_pull_payload,
         )
         write_json_exclusive(reservation.incomplete_dir / "run.json", run_metadata)
         validate_html_links(reservation.incomplete_dir / "index.html")

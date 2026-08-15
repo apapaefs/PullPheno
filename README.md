@@ -147,6 +147,27 @@ and six-bin Mahalanobis $D^2$.  To add another complete CR scenario, analyze it
 with the same `NOMINAL_RUN` models and append its completed path to
 `--compare-runs`; the existing source runs remain untouched.
 
+Analysis version 2.3 additionally stores an event-level joint observable with
+ten frozen XGBoost-score quantiles and the six folded pull-angle bins.  The
+quantile boundaries are fixed from the nominal total prediction after common
+selection and copied unchanged into every independent CR run.  The comparison
+therefore produces score-by-pull maps, $\Delta f_{\rm beam}$ in every score
+quantile, and exhaustive scans of all contiguous two- and three-category score
+partitions.  Each category's pull distribution is normalized independently,
+so the scan measures conditional pull-shape sensitivity rather than a change in
+the XGBoost category rate.  For multiple CR variations, one common partition is
+chosen by maximizing the minimum data-plus-independent-MC $D^2$ across the
+variations.
+
+The resulting boundaries are an exploratory design choice, since the same CR
+samples are used to propose them.  They must be frozen and confirmed with
+statistically independent simulations before quoting a sensitivity.  Runs made
+before version 2.3 do not contain the joint event moments and cannot be used to
+construct this diagnostic with `--from-run`; nominal and variation analyses
+must be rerun once from their ROOT events.  After that one-time pass, all maps,
+partition scans and later multi-scenario comparisons are generated without
+reopening ROOT files.
+
 The manifest assigns each process an XGBoost `role` of `signal` or
 `background`.  The classifiers use only $m_{jj}$,
 $|\Delta y_{jj}|$, the two tagging-jet transverse momenta, boson $p_T$ and

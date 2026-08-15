@@ -238,6 +238,96 @@ class PullAndWeightTests(unittest.TestCase):
             moments.mc_second_sumw2, [[1.0, 1.0], [1.0, 1.0]]
         )
 
+    def test_score_pull_moments_retain_same_event_jet_correlations(self):
+        moments = analysis.ScorePullMoments(np.linspace(0.0, 1.0, 11))
+        moments.fill_batch(
+            np.asarray([0.05, 0.95]),
+            np.asarray([[0.1, 0.2], [0.1, 1.0]]),
+            np.asarray([2.0, 3.0]),
+        )
+        first = 0
+        high_first = 9 * analysis.PULL_BIN_COUNT
+        high_second = high_first + 1
+        self.assertEqual(moments.event_count, 2)
+        self.assertAlmostEqual(np.sum(moments.bin_sumw), 5.0)
+        self.assertAlmostEqual(np.sum(moments.event_second_sumw), 5.0)
+        self.assertAlmostEqual(np.sum(moments.mc_second_sumw2), 13.0)
+        self.assertAlmostEqual(moments.event_second_sumw[first, first], 2.0)
+        self.assertAlmostEqual(
+            moments.event_second_sumw[high_first, high_second], 0.75
+        )
+        self.assertAlmostEqual(
+            moments.mc_second_sumw2[high_first, high_second], 2.25
+        )
+
+    def test_weighted_score_quantiles_and_fixed_partition_counts(self):
+        scores = np.linspace(0.001, 0.999, 100)
+        edges, scheme = analysis.weighted_score_quantile_edges(
+            scores, np.ones_like(scores)
+        )
+        self.assertEqual(scheme, "nominal_total_weighted_quantiles")
+        self.assertEqual(len(edges), 11)
+        self.assertTrue(np.all(np.diff(edges) > 0.0))
+        self.assertEqual(len(analysis.contiguous_score_partitions(10, 2)), 9)
+        self.assertEqual(len(analysis.contiguous_score_partitions(10, 3)), 36)
+
+    def test_conditional_score_categories_normalize_each_pull_shape(self):
+        yields = np.asarray(
+            [
+                [10.0, 20.0, 30.0, 10.0, 20.0, 10.0],
+                [40.0, 10.0, 10.0, 20.0, 10.0, 10.0],
+            ]
+        )
+        flat = yields.reshape(-1)
+        statistics = {
+            "score_edges": np.asarray([0.0, 0.5, 1.0]),
+            "pull_edges": analysis.PULL_BIN_EDGES,
+            "yield": yields,
+            "data_covariance": np.diag(flat),
+            "mc_covariance": np.diag(0.1 * flat),
+        }
+        conditional = analysis.conditional_score_pull_statistics(
+            statistics, ((0, 1), (1, 2))
+        )
+        fractions = conditional["R"].reshape(2, analysis.PULL_BIN_COUNT)
+        np.testing.assert_allclose(np.sum(fractions, axis=1), 1.0)
+        np.testing.assert_allclose(
+            np.sum(conditional["data_covariance"], axis=1), 0.0, atol=1.0e-15
+        )
+        np.testing.assert_allclose(
+            np.sum(conditional["mc_covariance"], axis=1), 0.0, atol=1.0e-15
+        )
+
+    def test_score_partition_comparison_uses_conditional_shape_covariance(self):
+        reference_yields = np.full((10, analysis.PULL_BIN_COUNT), 100.0)
+        variation_yields = reference_yields.copy()
+        variation_yields[:5, 0] += 10.0
+        variation_yields[:5, 5] -= 10.0
+
+        def statistics(values):
+            flat = values.reshape(-1)
+            return {
+                "score_edges": np.linspace(0.0, 1.0, 11),
+                "pull_edges": analysis.PULL_BIN_EDGES,
+                "yield": values,
+                "data_covariance": np.diag(flat),
+                "mc_covariance": np.diag(0.05 * flat),
+            }
+
+        comparison = analysis.score_partition_comparison(
+            statistics(reference_yields),
+            statistics(variation_yields),
+            ((0, 5), (5, 10)),
+        )
+        self.assertEqual(len(comparison["delta_f_beam_by_category"]), 2)
+        self.assertGreater(
+            comparison["nominal_truth"]["data_plus_mc_stat"]["D2"], 0.0
+        )
+        self.assertLessEqual(
+            comparison["nominal_truth"]["data_plus_mc_stat"]["covariance_rank"],
+            2 * (analysis.PULL_BIN_COUNT - 1),
+        )
+
     def test_total_observable_uses_reference_cross_section_and_covariance_scaling(self):
         spec = analysis.SampleSpec(
             "VBFH", "higgs", ("unused.root",), 99.0, "VBF H", "#000000", 0
@@ -374,6 +464,13 @@ class RunManagementTests(unittest.TestCase):
         result = analysis.initialize_result(spec, 1, 1.0)
         pull = analysis.PullVector(0.01, 0.02, 0.01, math.hypot(0.01, 0.02), 0.2, False)
         analysis.fill_pull_histograms(result, (pull, pull), 1.0)
+        result.score_pull_moments = analysis.ScorePullMoments(
+            np.linspace(0.0, 1.0, analysis.SCORE_PULL_BIN_COUNT + 1)
+        )
+        result.score_pull_moments.fill_batch(
+            np.asarray([0.5]), np.asarray([[0.2, 0.2]]), np.asarray([1.0])
+        )
+        result.score_pull_moment_model = analysis.SCORE_PULL_MOMENT_MODEL
         with tempfile.TemporaryDirectory() as temporary:
             path = analysis.write_histogram_npz(Path(temporary), (result,))
             with np.load(path) as archive:
@@ -381,6 +478,153 @@ class RunManagementTests(unittest.TestCase):
                     prefix = f"cutbased__VBFH__pull_moment__{observable}"
                     self.assertIn(f"{prefix}__edges", archive.files)
                     self.assertIn(f"{prefix}__event_second_sumw", archive.files)
+                self.assertIn(
+                    "cutbased__VBFH__score_pull__event_second_sumw", archive.files
+                )
+
+    def test_completed_run_reload_preserves_joint_score_pull_moments(self):
+        spec = analysis.SampleSpec(
+            "VBFH", "higgs", ("unused.root",), 1.0, "VBF H", "#000000", 0, "signal"
+        )
+        result = analysis.initialize_result(spec, 1, 1.0, strategy="xgboost")
+        result.score_pull_moments = analysis.ScorePullMoments(np.linspace(0.0, 1.0, 11))
+        result.score_pull_moments.fill_batch(
+            np.asarray([0.55]), np.asarray([[0.2, 2.8]]), np.asarray([1.0])
+        )
+        result.score_pull_moment_model = analysis.SCORE_PULL_MOMENT_MODEL
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            analysis.write_json_exclusive(
+                run_dir / "summaries" / "analysis.json",
+                {
+                    "samples": [analysis.result_summary(result, (300.0,))],
+                    "analysis_version": analysis.ANALYSIS_VERSION,
+                    "partial": False,
+                },
+            )
+            analysis.write_histogram_npz(run_dir, (result,))
+            analysis.write_json_exclusive(
+                run_dir / "run.json",
+                {
+                    "status": "complete",
+                    "run_id": "joint-reload",
+                    "analysis_version": analysis.ANALYSIS_VERSION,
+                    "configuration": {
+                        "tree_name": "Data",
+                        "luminosities_fb": [300.0],
+                        "samples": [analysis.asdict(spec)],
+                        "source_manifest": "synthetic.json",
+                    },
+                },
+            )
+            _, loaded, _ = analysis.load_completed_run(run_dir)
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].score_pull_moment_model, analysis.SCORE_PULL_MOMENT_MODEL)
+        self.assertEqual(loaded[0].score_pull_moments.event_count, 1)
+        np.testing.assert_allclose(
+            loaded[0].score_pull_moments.bin_sumw,
+            result.score_pull_moments.bin_sumw,
+        )
+
+    def test_score_pull_diagnostic_builds_portable_artifacts_and_plots(self):
+        score_edges = np.linspace(0.0, 1.0, analysis.SCORE_PULL_BIN_COUNT + 1)
+
+        def make_source(run_id, scenario, shifted):
+            specs = (
+                analysis.SampleSpec(
+                    "VBFH", "higgs", (f"{run_id}-h.root",), 1.0,
+                    "VBF H", scenario.color, 0, "signal"
+                ),
+                analysis.SampleSpec(
+                    "VBFZ", "z", (f"{run_id}-z.root",), 1.0,
+                    "VBF Z", scenario.color, 0, "signal"
+                ),
+            )
+            results = []
+            for spec in specs:
+                result = analysis.initialize_result(spec, 20, 20.0, strategy="xgboost")
+                for event_index in range(20):
+                    result.cutflow["xgboost_application_sample"].fill(1.0)
+                    result.cutflow["xgboost_score"].fill(1.0)
+                    first_angle = 1.2 if shifted and event_index < 10 else 0.2
+                    second_angle = 2.8
+                    pulls = tuple(
+                        analysis.PullVector(
+                            0.01 * math.cos(angle),
+                            0.01 * math.sin(angle),
+                            0.01 * math.cos(angle),
+                            0.01,
+                            angle,
+                            False,
+                        )
+                        for angle in (first_angle, second_angle)
+                    )
+                    analysis.fill_pull_histograms(result, pulls, 1.0)
+                scores = np.repeat((score_edges[:-1] + score_edges[1:]) / 2.0, 2)
+                first_angles = np.full(20, 0.2)
+                second_angles = np.full(20, 2.8)
+                if shifted:
+                    first_angles[:10] = 1.2
+                result.score_pull_moments = analysis.ScorePullMoments(score_edges)
+                result.score_pull_moments.fill_batch(
+                    scores,
+                    np.column_stack((first_angles, second_angles)),
+                    np.ones(20),
+                )
+                result.score_pull_moment_model = analysis.SCORE_PULL_MOMENT_MODEL
+                results.append(result)
+            config = analysis.AnalysisConfig(
+                "Data", (300.0,), specs, f"{run_id}.json", scenario
+            )
+            return analysis.ComparisonSource(
+                Path("/tmp") / run_id,
+                config,
+                tuple(results),
+                {"run_id": run_id},
+                scenario,
+                None,
+            )
+
+        sources = (
+            make_source(
+                "nominal", analysis.ScenarioSpec("nominal", "Nominal", "#275DAD"), False
+            ),
+            make_source(
+                "variation", analysis.ScenarioSpec("variation", "Variation", "#D05A47"), True
+            ),
+        )
+        payload, numerical = analysis.build_score_pull_diagnostic(
+            sources, (300.0,), {"VBFH": 1.0, "VBFZ": 1.0}
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            paths = analysis.write_score_pull_diagnostic_artifacts(
+                run_dir, payload, numerical
+            )
+            plots = analysis.generate_score_pull_diagnostic_plots(
+                run_dir, sources, (300.0,), payload, numerical
+            )
+            comparison, _ = analysis.build_comparison_statistics(
+                sources, ("xgboost",), (300.0,), {"VBFH": 1.0, "VBFZ": 1.0}
+            )
+            index = analysis.generate_comparison_index(
+                run_dir,
+                {"run_id": "score-pull-test"},
+                sources,
+                comparison,
+                plots,
+                (300.0,),
+                payload,
+            )
+            self.assertTrue(all(path.is_file() for path in paths))
+            self.assertEqual(len(plots), 6)
+            self.assertTrue(all((run_dir / record["png"]).is_file() for record in plots))
+            self.assertIn("score_pull_diagnostic.json", index.read_text())
+            self.assertIn(
+                "recommended",
+                payload["channels"]["higgs"]["luminosities"]["300.0"]
+                ["category_scans"]["2"],
+            )
 
     def test_compare_runs_parser_requires_two_sources(self):
         with mock.patch("sys.stderr"), self.assertRaises(SystemExit):

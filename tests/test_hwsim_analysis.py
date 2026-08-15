@@ -146,6 +146,22 @@ class PullAndWeightTests(unittest.TestCase):
     def test_normalization(self):
         self.assertAlmostEqual(analysis.normalization_factor(300.0, 2.0, 100.0), 6000.0)
 
+    def test_compensated_sum_stabilizes_mixed_event_weights(self):
+        weights = [29.316138588567334] + [0.067293999999998078] * 100_000
+        naive = 0.0
+        compensated = 0.0
+        correction = 0.0
+        for weight in weights:
+            naive += weight
+            compensated, correction = analysis.compensated_add(
+                compensated,
+                correction,
+                weight,
+            )
+        expected = math.fsum(weights)
+        self.assertNotEqual(naive, expected)
+        self.assertEqual(compensated, expected)
+
     def test_projected_fbeam_statistical_error_uses_two_jet_entries(self):
         expected = math.sqrt(0.5 * 0.5 / 200.0)
         self.assertAlmostEqual(analysis.projected_fbeam_statistical_error(0.5, 100.0), expected)

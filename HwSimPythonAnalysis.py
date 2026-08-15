@@ -766,6 +766,13 @@ def normalization_factor(luminosity_fb: float, cross_section_pb: float, generate
     return 1000.0 * float(luminosity_fb) * float(cross_section_pb) / float(generated_sumw)
 
 
+def compensated_add(total: float, correction: float, value: float) -> Tuple[float, float]:
+    """Add one value using Kahan compensated summation."""
+    adjusted = float(value) - float(correction)
+    updated = float(total) + adjusted
+    return updated, (updated - float(total)) - adjusted
+
+
 def projected_fbeam_statistical_error(
     f_beam: float,
     expected_selected_events: float,
@@ -1407,6 +1414,7 @@ def analyze_sample(
         else None
     )
     remaining = max_events
+    processed_sumw_correction = 0.0
     started = time.monotonic()
     logging.info("%s: %d generated events, sumw %.12g", spec.name, total_entries, generated_sumw)
 
@@ -1435,7 +1443,11 @@ def analyze_sample(
                     else select_z_candidate(particles)
                 )
                 result.processed_entries += 1
-                result.processed_sumw += event_weight
+                result.processed_sumw, processed_sumw_correction = compensated_add(
+                    result.processed_sumw,
+                    processed_sumw_correction,
+                    event_weight,
+                )
                 result.cutflow["all_events"].fill(event_weight)
                 fill_cut_steps(result, decision.passed_steps, event_weight)
                 if decision.candidate is None:

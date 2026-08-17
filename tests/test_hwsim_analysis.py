@@ -420,6 +420,117 @@ class RunManagementTests(unittest.TestCase):
                 analysis.write_text_exclusive(path, "second")
             self.assertEqual(path.read_text(), "first")
 
+    def test_root_pass_checkpoint_round_trip_preserves_common_events(self):
+        spec = analysis.SampleSpec(
+            "VBFH",
+            "higgs",
+            ("unused.root",),
+            1.0,
+            "VBF H",
+            "#275DAD",
+            0,
+            "signal",
+        )
+        config = analysis.AnalysisConfig(
+            "Data", (300.0, 3000.0), (spec,), "synthetic.json"
+        )
+        result = analysis.initialize_result(spec, 2, 2.0)
+        result.processed_entries = 2
+        result.processed_sumw = 2.0
+        for step in analysis.cutflow_steps("higgs"):
+            result.cutflow[step].fill(1.0)
+        pull = analysis.PullVector(0.01, 0.02, 0.01, math.hypot(0.01, 0.02), 0.3, False)
+        analysis.fill_pull_histograms(result, (pull, pull), 1.0)
+        keys = analysis.common_observable_keys("higgs")
+        values = np.arange(len(keys), dtype=np.float64)[None, :]
+        pull_row = np.asarray([0.01, 0.02, math.hypot(0.01, 0.02), 0.3, 0.0])
+        result.common_events = analysis.CommonEventTable(
+            observable_keys=keys,
+            weights=np.asarray([1.0]),
+            observables=values,
+            pulls=np.tile(pull_row, (1, 2, 1)),
+            source_file_indices=np.asarray([3], dtype=np.int32),
+            source_entries=np.asarray([17], dtype=np.int64),
+        )
+        payload = analysis.resolved_config_payload(
+            config, None, ("cutbased", "xgboost"), None
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / ".incomplete-test"
+            run_dir.mkdir()
+            checkpoint_dir = analysis.write_root_pass_checkpoint(
+                run_dir, payload, (result,), "test-run"
+            )
+            loaded_config, loaded, metadata = analysis.load_root_pass_checkpoint(run_dir)
+            self.assertTrue((checkpoint_dir / "checkpoint.json").is_file())
+            self.assertEqual(metadata["source_run_id"], "test-run")
+            self.assertEqual(loaded_config.samples, config.samples)
+            self.assertEqual(len(loaded), 1)
+            restored = loaded[0]
+            self.assertEqual(restored.processed_entries, 2)
+            np.testing.assert_allclose(
+                restored.histograms["signed_pull_angle"].sumw,
+                result.histograms["signed_pull_angle"].sumw,
+            )
+            np.testing.assert_allclose(
+                restored.pull_event_second_sumw,
+                result.pull_event_second_sumw,
+            )
+            np.testing.assert_allclose(
+                restored.common_events.observables,
+                result.common_events.observables,
+            )
+            np.testing.assert_array_equal(restored.common_events.source_entries, [17])
+            analysis.remove_root_pass_checkpoint(run_dir)
+            self.assertFalse(checkpoint_dir.exists())
+
+    def test_resume_parser_is_exclusive_and_rejects_new_event_limits(self):
+        parsed = analysis.parse_arguments(
+            [
+                "--resume-incomplete",
+                ".incomplete-run",
+                "--analyses",
+                "cutbased",
+                "xgboost",
+            ]
+        )
+        self.assertEqual(parsed.resume_incomplete, Path(".incomplete-run"))
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            analysis.parse_arguments(
+                [
+                    "--resume-incomplete",
+                    ".incomplete-run",
+                    "--max-events",
+                    "10",
+                ]
+            )
+
+    def test_failed_run_has_persistent_log_and_structured_record(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            reservation = analysis.reserve_run_directory(Path(temporary), "failed-run")
+            handler = analysis.attach_run_file_logger(
+                reservation.incomplete_dir, "INFO"
+            )
+            started = datetime.now(timezone.utc)
+            try:
+                try:
+                    raise RuntimeError("synthetic failure")
+                except RuntimeError as error:
+                    analysis.write_failure_record(
+                        reservation, started, "unit-test", error
+                    )
+                    analysis.logging.exception("Synthetic failure for run-log test")
+            finally:
+                analysis.detach_run_file_logger(handler)
+            log_text = (reservation.incomplete_dir / analysis.RUN_LOG_NAME).read_text()
+            failure = json.loads(
+                (reservation.incomplete_dir / "failure.json").read_text()
+            )
+            self.assertIn("synthetic failure", log_text)
+            self.assertEqual(failure["phase"], "unit-test")
+            self.assertEqual(failure["exception_type"], "RuntimeError")
+            self.assertFalse(failure["root_pass_checkpoint_available"])
+
     def test_catalog_excludes_incomplete_runs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

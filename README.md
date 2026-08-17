@@ -214,12 +214,32 @@ overwritten.  A completed run contains:
 - saved Higgs and Z models, frozen thresholds and classifier diagnostics;
 - long-form CSV and Markdown cutflows;
 - JSON summaries and compressed NumPy histogram arrays;
+- a persistent `run.log` recording parent-process diagnostics;
 - a self-contained `index.html` with plot filters, cutflows and numerical
   summaries.
 
 The top-level `results/index.html` is an atomically regenerated catalogue of
 all completed runs.  Directories prefixed with `.incomplete-` record failed or
-interrupted runs and are deliberately excluded from that catalogue.
+interrupted runs and are deliberately excluded from that catalogue.  After
+the ROOT event pass, the analysis writes an atomic recovery checkpoint before
+starting XGBoost.  If a later Python exception occurs, the incomplete run also
+contains `failure.json`; the checkpoint is retained while successful runs
+remove it to avoid permanently duplicating the compact event table.
+
+Resume a failed run that reports
+`"root_pass_checkpoint_available": true` without rereading ROOT events:
+
+```bash
+python3 HwSimPythonAnalysis.py \
+  --resume-incomplete results/runs/.incomplete-<failed-run-id> \
+  --analyses cutbased xgboost \
+  --output-root results \
+  --run-name <name>-resume
+```
+
+The resumed invocation creates another immutable run.  Its analysis list must
+exactly match the checkpoint, and its frozen-model source (if any) is restored
+from the checkpoint rather than accepted from the command line.
 
 Plot-only revisions can reuse the stored histogram arrays without reopening
 the ROOT events.  The command still creates a new immutable run and records

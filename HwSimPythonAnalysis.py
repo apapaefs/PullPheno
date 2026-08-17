@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import uuid
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
@@ -38,7 +39,10 @@ import numpy as np
 import xgboost_root_varfiles_module as xgbtools
 
 
-ANALYSIS_VERSION = "2.3.0"
+ANALYSIS_VERSION = "2.4.0"
+ROOT_PASS_CHECKPOINT_VERSION = 1
+ROOT_PASS_CHECKPOINT_RELATIVE = Path("checkpoints") / "root-pass"
+RUN_LOG_NAME = "run.log"
 MZ_GEV = 91.1876
 NEUTRINO_IDS = frozenset((12, 14, 16))
 ANALYSIS_STRATEGIES = ("cutbased", "xgboost")
@@ -1163,6 +1167,84 @@ def read_manifest(path: Path, luminosity_override: Optional[Sequence[float]] = N
     return AnalysisConfig(tree_name, luminosities, tuple(samples), str(path), scenario)
 
 
+def analysis_config_from_payload(
+    configuration: Mapping[str, Any],
+    luminosity_override: Optional[Sequence[float]] = None,
+) -> AnalysisConfig:
+    """Reconstruct a resolved analysis configuration without reopening a manifest."""
+    luminosities = tuple(
+        float(value)
+        for value in (
+            luminosity_override
+            or configuration.get("luminosities_fb", (300.0, 3000.0))
+        )
+    )
+    if not luminosities or any(
+        value <= 0.0 or not math.isfinite(value) for value in luminosities
+    ):
+        raise ValueError("Luminosities must be finite positive values")
+
+    samples = tuple(
+        SampleSpec(
+            name=str(raw["name"]),
+            channel=str(raw["channel"]),
+            files=tuple(str(value) for value in raw["files"]),
+            cross_section_pb=float(raw["cross_section_pb"]),
+            label=str(raw["label"]),
+            color=str(raw["color"]),
+            stack_order=int(raw["stack_order"]),
+            role=str(raw.get("role", "background")),
+            generator_cross_section_pb=(
+                None
+                if raw.get("generator_cross_section_pb") is None
+                else float(raw["generator_cross_section_pb"])
+            ),
+            generator_cross_section_unc_pb=(
+                None
+                if raw.get("generator_cross_section_unc_pb") is None
+                else float(raw["generator_cross_section_unc_pb"])
+            ),
+            cross_section_unc_pb=(
+                None
+                if raw.get("cross_section_unc_pb") is None
+                else float(raw["cross_section_unc_pb"])
+            ),
+            cross_section_source=(
+                None
+                if raw.get("cross_section_source") is None
+                else str(raw["cross_section_source"])
+            ),
+        )
+        for raw in configuration["samples"]
+    )
+    if not samples:
+        raise ValueError("Resolved configuration contains no samples")
+    raw_scenario = configuration.get("scenario")
+    scenario = (
+        None
+        if raw_scenario is None
+        else ScenarioSpec(
+            identifier=str(
+                raw_scenario.get("identifier", raw_scenario.get("id", ""))
+            ),
+            label=str(raw_scenario["label"]),
+            color=(
+                None
+                if raw_scenario.get("color") is None
+                else str(raw_scenario["color"])
+            ),
+            parameters=dict(raw_scenario.get("parameters", {})),
+        )
+    )
+    return AnalysisConfig(
+        tree_name=str(configuration.get("tree_name", "Data")),
+        luminosities_fb=luminosities,
+        samples=samples,
+        source_manifest=str(configuration.get("source_manifest", "resolved-configuration")),
+        scenario=scenario,
+    )
+
+
 def resolved_config_payload(
     config: AnalysisConfig,
     max_events: Optional[int],
@@ -1270,6 +1352,385 @@ def atomic_write_text(path: Path, text_value: str) -> None:
             temporary.unlink()
 
 
+def atomic_write_text_exclusive(path: Path, text_value: str) -> None:
+    """Atomically publish text while retaining exclusive-artifact semantics."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            stream.write(text_value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def attach_run_file_logger(run_dir: Path, level_name: str) -> logging.FileHandler:
+    """Mirror parent-process diagnostics to a file that survives failed runs."""
+    path = run_dir / RUN_LOG_NAME
+    handler = logging.FileHandler(path, mode="x", encoding="utf-8")
+    handler.setLevel(getattr(logging, level_name))
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logging.getLogger().addHandler(handler)
+    return handler
+
+
+def detach_run_file_logger(handler: logging.FileHandler) -> None:
+    logging.getLogger().removeHandler(handler)
+    handler.flush()
+    handler.close()
+
+
+def write_failure_record(
+    reservation: RunReservation,
+    started: datetime,
+    phase: str,
+    error: BaseException,
+) -> Optional[Path]:
+    """Best-effort structured failure record next to an incomplete run log."""
+    destination = reservation.incomplete_dir / "failure.json"
+    checkpoint = reservation.incomplete_dir / ROOT_PASS_CHECKPOINT_RELATIVE / "checkpoint.json"
+    payload = {
+        "status": "failed",
+        "run_id": reservation.run_id,
+        "started_utc": started.isoformat(),
+        "failed_utc": datetime.now(timezone.utc).isoformat(),
+        "phase": phase,
+        "exception_type": type(error).__name__,
+        "exception_message": str(error),
+        "traceback": traceback.format_exc(),
+        "root_pass_checkpoint_available": checkpoint.is_file(),
+        "root_pass_checkpoint": (
+            str(ROOT_PASS_CHECKPOINT_RELATIVE) if checkpoint.is_file() else None
+        ),
+        "run_log": RUN_LOG_NAME,
+    }
+    try:
+        atomic_write_text_exclusive(
+            destination,
+            json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        )
+    except Exception:
+        logging.exception("Could not write structured failure record %s", destination)
+        return None
+    return destination
+
+
+def _write_npz_exclusive(path: Path, arrays: Mapping[str, np.ndarray]) -> None:
+    """Durably publish an uncompressed NPZ without an overwrite window."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as stream:
+            np.savez(stream, **arrays)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _root_pass_result_metadata(result: SampleResult) -> Dict[str, Any]:
+    return {
+        "sample": result.spec.name,
+        "total_entries": result.total_entries,
+        "generated_sumw": result.generated_sumw,
+        "strategy": result.strategy,
+        "application_scope": result.application_scope,
+        "processed_entries": result.processed_entries,
+        "processed_sumw": result.processed_sumw,
+        "cutflow": {step: asdict(stat) for step, stat in result.cutflow.items()},
+        "histogram_entries": {
+            key: histogram.entries for key, histogram in result.histograms.items()
+        },
+        "pull_total_sumw": result.pull_total_sumw,
+        "pull_beam_sumw": result.pull_beam_sumw,
+        "pull_left_sumw": result.pull_left_sumw,
+        "pull_right_sumw": result.pull_right_sumw,
+        "zero_pull_jets": result.zero_pull_jets,
+        "zero_pull_sumw": result.zero_pull_sumw,
+        "pull_moment_model": result.pull_moment_model,
+        "invalid_events": result.invalid_events,
+        "files": result.files,
+        "common_event_observable_keys": (
+            None
+            if result.common_events is None
+            else list(result.common_events.observable_keys)
+        ),
+    }
+
+
+def _root_pass_result_arrays(result: SampleResult) -> Dict[str, np.ndarray]:
+    arrays: Dict[str, np.ndarray] = {}
+    for key, histogram in result.histograms.items():
+        prefix = f"hist__{key}"
+        arrays[f"{prefix}__edges"] = histogram.edges
+        arrays[f"{prefix}__sumw"] = histogram.sumw
+        arrays[f"{prefix}__sumw2"] = histogram.sumw2
+    for key, moments in result.pull_observable_moments.items():
+        prefix = f"moment__{key}"
+        arrays[f"{prefix}__edges"] = moments.edges
+        arrays[f"{prefix}__bin_sumw"] = moments.bin_sumw
+        arrays[f"{prefix}__event_second_sumw"] = moments.event_second_sumw
+        arrays[f"{prefix}__mc_second_sumw2"] = moments.mc_second_sumw2
+    if result.common_events is not None:
+        common = result.common_events
+        arrays["common__weights"] = common.weights
+        arrays["common__observables"] = common.observables
+        arrays["common__pulls"] = common.pulls
+        arrays["common__source_file_indices"] = common.source_file_indices
+        arrays["common__source_entries"] = common.source_entries
+    return arrays
+
+
+def _validate_root_pass_results(
+    config: AnalysisConfig,
+    results: Sequence[SampleResult],
+    analyses: Sequence[str],
+) -> None:
+    expected_names = [sample.name for sample in config.samples]
+    names = [result.spec.name for result in results]
+    if names != expected_names or len(names) != len(set(names)):
+        raise ValueError(
+            f"ROOT-pass result order differs from the resolved manifest: {names}"
+        )
+    for result in results:
+        if result.strategy != "cutbased":
+            raise ValueError("ROOT-pass checkpoints may contain only cut-based source results")
+        if result.generated_sumw == 0.0 or not math.isfinite(result.generated_sumw):
+            raise ValueError(f"Sample {result.spec.name} has invalid generated sum of weights")
+        if "xgboost" in analyses and result.common_events is None:
+            raise ValueError(
+                f"Sample {result.spec.name} lacks common-event records required by XGBoost"
+            )
+
+
+def write_root_pass_checkpoint(
+    run_dir: Path,
+    configuration: Mapping[str, Any],
+    results: Sequence[SampleResult],
+    source_run_id: str,
+) -> Path:
+    """Checkpoint reconstructed events and cut histograms before XGBoost training."""
+    config = analysis_config_from_payload(configuration)
+    analyses = tuple(str(value) for value in configuration.get("analyses", ("cutbased",)))
+    _validate_root_pass_results(config, results, analyses)
+    checkpoint_dir = run_dir / ROOT_PASS_CHECKPOINT_RELATIVE
+    checkpoint_dir.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir()
+    samples: List[Dict[str, Any]] = []
+    for index, result in enumerate(results):
+        archive_name = f"sample-{index:03d}.npz"
+        archive_path = checkpoint_dir / archive_name
+        logging.info("Checkpointing ROOT-pass result for %s", result.spec.name)
+        _write_npz_exclusive(archive_path, _root_pass_result_arrays(result))
+        item = _root_pass_result_metadata(result)
+        item.update(
+            {
+                "archive": archive_name,
+                "archive_size_bytes": archive_path.stat().st_size,
+            }
+        )
+        samples.append(item)
+    payload = {
+        "status": "complete",
+        "checkpoint_version": ROOT_PASS_CHECKPOINT_VERSION,
+        "analysis_version": ANALYSIS_VERSION,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "source_run_id": source_run_id,
+        "configuration_hash": config_digest(configuration),
+        "configuration": dict(configuration),
+        "samples": samples,
+    }
+    atomic_write_text_exclusive(
+        checkpoint_dir / "checkpoint.json",
+        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
+    )
+    logging.info("Completed ROOT-pass checkpoint at %s", checkpoint_dir)
+    return checkpoint_dir
+
+
+def _restore_root_pass_result(
+    spec: SampleSpec,
+    metadata: Mapping[str, Any],
+    archive_path: Path,
+) -> SampleResult:
+    if archive_path.stat().st_size != int(metadata["archive_size_bytes"]):
+        raise ValueError(f"Checkpoint archive size differs for {spec.name}: {archive_path}")
+    strategy = str(metadata.get("strategy", "cutbased"))
+    result = initialize_result(
+        spec,
+        int(metadata["total_entries"]),
+        float(metadata["generated_sumw"]),
+        strategy=strategy,
+    )
+    result.application_scope = str(metadata.get("application_scope", "all_events"))
+    result.processed_entries = int(metadata["processed_entries"])
+    result.processed_sumw = float(metadata["processed_sumw"])
+    result.cutflow = OrderedDict(
+        (step, CutStat(**metadata["cutflow"][step]))
+        for step in cutflow_steps(spec.channel, strategy)
+    )
+    result.pull_total_sumw = float(metadata["pull_total_sumw"])
+    result.pull_beam_sumw = float(metadata["pull_beam_sumw"])
+    result.pull_left_sumw = float(metadata["pull_left_sumw"])
+    result.pull_right_sumw = float(metadata["pull_right_sumw"])
+    result.zero_pull_jets = int(metadata["zero_pull_jets"])
+    result.zero_pull_sumw = float(metadata["zero_pull_sumw"])
+    result.pull_moment_model = str(metadata["pull_moment_model"])
+    result.invalid_events = int(metadata["invalid_events"])
+    result.files = list(metadata.get("files", []))
+
+    with np.load(archive_path, allow_pickle=False) as arrays:
+        available = set(arrays.files)
+        for key, histogram in result.histograms.items():
+            prefix = f"hist__{key}"
+            required = tuple(
+                f"{prefix}__{suffix}" for suffix in ("edges", "sumw", "sumw2")
+            )
+            if not all(name in available for name in required):
+                raise ValueError(f"Checkpoint histogram {key} is missing for {spec.name}")
+            edges = np.asarray(arrays[required[0]], dtype=np.float64)
+            if not np.array_equal(edges, histogram.edges):
+                raise ValueError(f"Checkpoint histogram edges differ for {spec.name} {key}")
+            histogram.sumw = np.asarray(arrays[required[1]], dtype=np.float64).copy()
+            histogram.sumw2 = np.asarray(arrays[required[2]], dtype=np.float64).copy()
+            histogram.entries = int(metadata["histogram_entries"][key])
+
+        restored_moments: Dict[str, PullObservableMoments] = {}
+        for key in PULL_OBSERVABLE_KEYS:
+            prefix = f"moment__{key}"
+            required = {
+                suffix: f"{prefix}__{suffix}"
+                for suffix in (
+                    "edges",
+                    "bin_sumw",
+                    "event_second_sumw",
+                    "mc_second_sumw2",
+                )
+            }
+            if not all(name in available for name in required.values()):
+                raise ValueError(f"Checkpoint pull moments {key} are missing for {spec.name}")
+            moments = PullObservableMoments(
+                np.asarray(arrays[required["edges"]], dtype=np.float64).copy()
+            )
+            moments.bin_sumw = np.asarray(
+                arrays[required["bin_sumw"]], dtype=np.float64
+            ).copy()
+            moments.event_second_sumw = np.asarray(
+                arrays[required["event_second_sumw"]], dtype=np.float64
+            ).copy()
+            moments.mc_second_sumw2 = np.asarray(
+                arrays[required["mc_second_sumw2"]], dtype=np.float64
+            ).copy()
+            restored_moments[key] = moments
+        result.pull_observable_moments = restored_moments
+        folded = restored_moments["folded_pull_angle"]
+        result.pull_bin_sumw = folded.bin_sumw
+        result.pull_event_second_sumw = folded.event_second_sumw
+        result.pull_mc_second_sumw2 = folded.mc_second_sumw2
+
+        observable_keys = metadata.get("common_event_observable_keys")
+        if observable_keys is not None:
+            required = (
+                "common__weights",
+                "common__observables",
+                "common__pulls",
+                "common__source_file_indices",
+                "common__source_entries",
+            )
+            if not all(name in available for name in required):
+                raise ValueError(f"Checkpoint common-event table is missing for {spec.name}")
+            common = CommonEventTable(
+                observable_keys=tuple(str(value) for value in observable_keys),
+                weights=np.asarray(arrays[required[0]], dtype=np.float64).copy(),
+                observables=np.asarray(arrays[required[1]], dtype=np.float64).copy(),
+                pulls=np.asarray(arrays[required[2]], dtype=np.float64).copy(),
+                source_file_indices=np.asarray(arrays[required[3]], dtype=np.int32).copy(),
+                source_entries=np.asarray(arrays[required[4]], dtype=np.int64).copy(),
+            )
+            if common.observables.shape != (len(common), len(common.observable_keys)):
+                raise ValueError(f"Checkpoint observable shape is invalid for {spec.name}")
+            if common.pulls.shape != (len(common), 2, len(PULL_VALUE_NAMES)):
+                raise ValueError(f"Checkpoint pull shape is invalid for {spec.name}")
+            if common.source_file_indices.shape != (len(common),) or common.source_entries.shape != (len(common),):
+                raise ValueError(f"Checkpoint source-identity shape is invalid for {spec.name}")
+            if not (
+                np.all(np.isfinite(common.weights))
+                and np.all(np.isfinite(common.observables))
+                and np.all(np.isfinite(common.pulls))
+            ):
+                raise ValueError(f"Checkpoint common-event values are non-finite for {spec.name}")
+            result.common_events = common
+    return result
+
+
+def load_root_pass_checkpoint(
+    incomplete_run: Path,
+    luminosity_override: Optional[Sequence[float]] = None,
+) -> Tuple[AnalysisConfig, List[SampleResult], Dict[str, Any]]:
+    """Load a complete ROOT-pass checkpoint from a failed immutable run."""
+    source = incomplete_run.expanduser().resolve()
+    checkpoint_dir = (
+        source
+        if (source / "checkpoint.json").is_file()
+        else source / ROOT_PASS_CHECKPOINT_RELATIVE
+    )
+    metadata_path = checkpoint_dir / "checkpoint.json"
+    if not metadata_path.is_file():
+        raise FileNotFoundError(
+            f"Complete ROOT-pass checkpoint does not exist: {metadata_path}"
+        )
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if metadata.get("status") != "complete":
+        raise ValueError(f"ROOT-pass checkpoint is not complete: {metadata_path}")
+    if int(metadata.get("checkpoint_version", -1)) != ROOT_PASS_CHECKPOINT_VERSION:
+        raise ValueError(
+            f"Unsupported ROOT-pass checkpoint version in {metadata_path}"
+        )
+    if metadata.get("analysis_version") != ANALYSIS_VERSION:
+        raise ValueError(
+            "ROOT-pass checkpoint analysis version differs from the running code: "
+            f"{metadata.get('analysis_version')} != {ANALYSIS_VERSION}"
+        )
+    configuration = metadata["configuration"]
+    if metadata.get("configuration_hash") != config_digest(configuration):
+        raise ValueError(f"ROOT-pass checkpoint configuration hash failed: {metadata_path}")
+    config = analysis_config_from_payload(configuration, luminosity_override)
+    specs_by_name = {sample.name: sample for sample in config.samples}
+    results: List[SampleResult] = []
+    for item in metadata["samples"]:
+        sample_name = str(item["sample"])
+        if sample_name not in specs_by_name:
+            raise ValueError(f"Checkpoint references unknown sample {sample_name}")
+        archive_path = checkpoint_dir / str(item["archive"])
+        if not archive_path.is_file():
+            raise FileNotFoundError(f"Checkpoint archive is missing: {archive_path}")
+        results.append(_restore_root_pass_result(specs_by_name[sample_name], item, archive_path))
+    analyses = tuple(str(value) for value in configuration.get("analyses", ("cutbased",)))
+    _validate_root_pass_results(config, results, analyses)
+    logging.info(
+        "Loaded ROOT-pass checkpoint for %d samples from %s",
+        len(results),
+        checkpoint_dir,
+    )
+    return config, results, metadata
+
+
+def remove_root_pass_checkpoint(run_dir: Path) -> None:
+    """Discard the bulky recovery checkpoint only after all final artifacts validate."""
+    checkpoint_dir = run_dir / ROOT_PASS_CHECKPOINT_RELATIVE
+    if not checkpoint_dir.is_dir():
+        return
+    shutil.rmtree(checkpoint_dir)
+    parent = checkpoint_dir.parent
+    if parent.is_dir() and not any(parent.iterdir()):
+        parent.rmdir()
+
+
 def git_provenance(repository: Path) -> Dict[str, Any]:
     def run_git(*arguments: str) -> str:
         completed = subprocess.run(
@@ -1334,65 +1795,8 @@ def load_completed_run(
         raise ValueError(f"Source run is not complete: {run_dir}")
     summary_payload = json.loads(summary_path.read_text(encoding="utf-8"))
     configuration = metadata["configuration"]
-    luminosities = tuple(
-        float(value)
-        for value in (luminosity_override or configuration.get("luminosities_fb", (300.0, 3000.0)))
-    )
-    if not luminosities or any(value <= 0.0 or not math.isfinite(value) for value in luminosities):
-        raise ValueError("Luminosities must be finite positive values")
-    samples = tuple(
-        SampleSpec(
-            name=str(raw["name"]),
-            channel=str(raw["channel"]),
-            files=tuple(str(value) for value in raw["files"]),
-            cross_section_pb=float(raw["cross_section_pb"]),
-            label=str(raw["label"]),
-            color=str(raw["color"]),
-            stack_order=int(raw["stack_order"]),
-            role=str(raw.get("role", "background")),
-            generator_cross_section_pb=(
-                None
-                if raw.get("generator_cross_section_pb") is None
-                else float(raw["generator_cross_section_pb"])
-            ),
-            generator_cross_section_unc_pb=(
-                None
-                if raw.get("generator_cross_section_unc_pb") is None
-                else float(raw["generator_cross_section_unc_pb"])
-            ),
-            cross_section_unc_pb=(
-                None
-                if raw.get("cross_section_unc_pb") is None
-                else float(raw["cross_section_unc_pb"])
-            ),
-            cross_section_source=(
-                None
-                if raw.get("cross_section_source") is None
-                else str(raw["cross_section_source"])
-            ),
-        )
-        for raw in configuration["samples"]
-    )
-    raw_scenario = configuration.get("scenario")
-    scenario = (
-        None
-        if raw_scenario is None
-        else ScenarioSpec(
-            identifier=str(raw_scenario["identifier"]),
-            label=str(raw_scenario["label"]),
-            color=(
-                None if raw_scenario.get("color") is None else str(raw_scenario["color"])
-            ),
-            parameters=dict(raw_scenario.get("parameters", {})),
-        )
-    )
-    config = AnalysisConfig(
-        tree_name=str(configuration.get("tree_name", "Data")),
-        luminosities_fb=luminosities,
-        samples=samples,
-        source_manifest=str(configuration.get("source_manifest", metadata_path)),
-        scenario=scenario,
-    )
+    config = analysis_config_from_payload(configuration, luminosity_override)
+    samples = config.samples
     specs_by_name = {sample.name: sample for sample in samples}
     results: List[SampleResult] = []
     with np.load(histogram_path, allow_pickle=False) as arrays:
@@ -5225,6 +5629,13 @@ def generate_run_index(
             f"{html.escape(str(run_metadata['derived_from_run']['run_id']))} "
             "(stored histogram replot; no event reread)"
         )
+    elif run_metadata.get("resumed_from_checkpoint"):
+        status_label = f"resumed {partial_class} run"
+        derivation_html = (
+            "<br><strong>Resumed from:</strong> ROOT-pass checkpoint of "
+            f"{html.escape(str(run_metadata['resumed_from_checkpoint']['source_run_id']))} "
+            "(no ROOT event reread)"
+        )
     else:
         status_label = f"{partial_class} run"
         derivation_html = ""
@@ -5334,7 +5745,7 @@ header p{{max-width:70rem;color:#dce9f8}} .eyebrow{{font-size:.76rem;letter-spac
 <p class="method-note"><strong>Uncertainties:</strong> both projected-data and current-MC errors use event-level six-bin covariance matrices, retaining the correlation between the two tagging jets. The MC term does not decrease with displayed luminosity.
 <strong>Zero-|t| jets:</strong> raw tagging jets whose pull-vector magnitude is exactly zero. Their angle is undefined, so this analysis maps it to zero and reports the count explicitly.</p></section>
 {xgb_html}
-<section class="panel"><h2>Cutflows and data</h2>{cutflow_html}<p>{cutflow_links} · <a href="summaries/analysis.json">Complete JSON summary</a> · <a href="summaries/histograms.npz">Histogram arrays</a> · <a href="summaries/ri.csv">R<sub>i</sub> CSV</a> · <a href="summaries/ri_covariances.npz">R<sub>i</sub> covariances</a></p></section>
+<section class="panel"><h2>Cutflows and data</h2>{cutflow_html}<p>{cutflow_links} · <a href="summaries/analysis.json">Complete JSON summary</a> · <a href="summaries/histograms.npz">Histogram arrays</a> · <a href="summaries/ri.csv">R<sub>i</sub> CSV</a> · <a href="summaries/ri_covariances.npz">R<sub>i</sub> covariances</a> · <a href="{RUN_LOG_NAME}">Run log</a></p></section>
 <section><h2>Plot gallery</h2><div class="controls">
 <label>Analysis<select id="strategy"><option value="all">All</option>{''.join(f'<option value="{name}">{name}</option>' for name in strategies)}</select></label>
 <label>Channel<select id="channel"><option value="all">All</option><option value="higgs">Higgs</option><option value="z">Z</option></select></label>
@@ -5806,6 +6217,14 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Completed run to replot from stored histograms without rereading ROOT events",
     )
     source.add_argument(
+        "--resume-incomplete",
+        type=Path,
+        help=(
+            "Failed run containing a complete ROOT-pass checkpoint; resumes XGBoost "
+            "and artifact production without reopening ROOT events"
+        ),
+    )
+    source.add_argument(
         "--compare-runs",
         type=Path,
         nargs="+",
@@ -5843,6 +6262,8 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--max-events must be positive")
     if args.from_run is not None and args.max_events is not None:
         parser.error("--max-events cannot be combined with --from-run")
+    if args.resume_incomplete is not None and args.max_events is not None:
+        parser.error("--max-events cannot be combined with --resume-incomplete")
     if args.compare_runs is not None and len(args.compare_runs) < 2:
         parser.error("--compare-runs requires a reference and at least one variation")
     if args.compare_runs is not None and args.max_events is not None:
@@ -5853,6 +6274,8 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--xgb-model-run requires --analyses to include xgboost")
     if args.from_run is not None and args.xgb_model_run is not None:
         parser.error("--xgb-model-run cannot be combined with --from-run")
+    if args.resume_incomplete is not None and args.xgb_model_run is not None:
+        parser.error("--xgb-model-run is restored from the checkpoint when resuming")
     if args.compare_runs is not None and args.xgb_model_run is not None:
         parser.error("--xgb-model-run cannot be combined with --compare-runs")
     if args.workers <= 0:
@@ -5893,6 +6316,8 @@ def run_comparison(args: argparse.Namespace, started: datetime) -> int:
     reservation = reserve_run_directory(
         output_root, make_run_id(payload, args.run_name, started)
     )
+    run_log_handler = attach_run_file_logger(reservation.incomplete_dir, args.log_level)
+    phase = "comparison-statistics"
     logging.info("Reserved immutable comparison run %s", reservation.run_id)
     try:
         comparison, numerical = build_comparison_statistics(
@@ -5923,6 +6348,7 @@ def run_comparison(args: argparse.Namespace, started: datetime) -> int:
                 score_pull_payload,
                 score_pull_numerical,
             )
+        phase = "comparison-plots"
         plot_records = generate_comparison_plots(
             reservation.incomplete_dir,
             sources,
@@ -5975,6 +6401,7 @@ def run_comparison(args: argparse.Namespace, started: datetime) -> int:
             ],
             "reference_run_id": sources[0].metadata["run_id"],
             "artifacts": {
+                "run_log": RUN_LOG_NAME,
                 "plots": len(plot_records),
                 "comparison_json": "summaries/comparison.json",
                 "comparison_csv": "summaries/comparison.csv",
@@ -6010,40 +6437,82 @@ def run_comparison(args: argparse.Namespace, started: datetime) -> int:
             score_pull_payload,
         )
         write_json_exclusive(reservation.incomplete_dir / "run.json", run_metadata)
+        phase = "final-link-validation"
         validate_html_links(reservation.incomplete_dir / "index.html")
         reservation.incomplete_dir.rename(reservation.final_dir)
         update_top_level_catalog(reservation.output_root)
         logging.info("Completed comparison run: %s", reservation.final_dir)
         print(reservation.final_dir)
         return 0
-    except Exception:
+    except Exception as error:
+        write_failure_record(reservation, started, phase, error)
         logging.exception(
             "Comparison failed; partial artifacts remain in %s",
             reservation.incomplete_dir,
         )
         return 1
+    finally:
+        detach_run_file_logger(run_log_handler)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_arguments(argv)
-    logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
     started = datetime.now(timezone.utc)
     if args.compare_runs is not None:
         return run_comparison(args, started)
+
     source_metadata: Optional[Dict[str, Any]] = None
     preloaded_results: Optional[List[SampleResult]] = None
+    checkpoint_results: Optional[List[SampleResult]] = None
+    resume_metadata: Optional[Dict[str, Any]] = None
     xgboost_metadata: Optional[Dict[str, Any]] = None
     xgboost_diagnostics: Dict[str, Any] = {}
+    effective_xgb_model_run: Optional[Path] = args.xgb_model_run
+
     if args.from_run is not None:
-        config, preloaded_results, source_metadata = load_completed_run(args.from_run, args.luminosities)
+        config, preloaded_results, source_metadata = load_completed_run(
+            args.from_run, args.luminosities
+        )
         effective_max_events = source_metadata.get("max_events_per_sample")
         analyses = tuple(
-            strategy for strategy in ANALYSIS_STRATEGIES
+            strategy
+            for strategy in ANALYSIS_STRATEGIES
             if any(result.strategy == strategy for result in preloaded_results)
         )
-        source_xgb_summary = args.from_run.resolve() / "summaries" / "xgboost.json"
+        source_xgb_summary = (
+            args.from_run.expanduser().resolve() / "summaries" / "xgboost.json"
+        )
         if source_xgb_summary.is_file():
             xgboost_metadata = json.loads(source_xgb_summary.read_text(encoding="utf-8"))
+    elif args.resume_incomplete is not None:
+        config, checkpoint_results, resume_metadata = load_root_pass_checkpoint(
+            args.resume_incomplete, args.luminosities
+        )
+        checkpoint_configuration = resume_metadata["configuration"]
+        stored_analyses = tuple(
+            strategy
+            for strategy in ANALYSIS_STRATEGIES
+            if strategy in checkpoint_configuration.get("analyses", ("cutbased",))
+        )
+        requested_analyses = tuple(
+            strategy for strategy in ANALYSIS_STRATEGIES if strategy in args.analyses
+        )
+        if requested_analyses != stored_analyses:
+            raise ValueError(
+                "--analyses must exactly match the ROOT-pass checkpoint: "
+                f"requested {requested_analyses}, stored {stored_analyses}"
+            )
+        analyses = stored_analyses
+        effective_max_events = checkpoint_configuration.get("max_events_per_sample")
+        xgb_configuration = checkpoint_configuration.get("xgboost") or {}
+        stored_model_run = xgb_configuration.get("model_run")
+        effective_xgb_model_run = (
+            None if stored_model_run is None else Path(str(stored_model_run))
+        )
     else:
         config = read_manifest(args.samples, args.luminosities)
         effective_max_events = args.max_events
@@ -6058,20 +6527,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     f"XGBoost channel {channel} requires manifest signal and background roles"
                 )
     payload = resolved_config_payload(
-        config, effective_max_events, analyses, args.xgb_model_run
+        config, effective_max_events, analyses, effective_xgb_model_run
     )
     if source_metadata is not None:
         payload["derived_from_run_id"] = source_metadata["run_id"]
         payload["event_source"] = "stored_histograms"
+    if resume_metadata is not None:
+        payload["resumed_from_checkpoint"] = {
+            "source_run_id": resume_metadata["source_run_id"],
+            "configuration_hash": resume_metadata["configuration_hash"],
+            "checkpoint_created_utc": resume_metadata["created_utc"],
+            "path": str(args.resume_incomplete.expanduser().resolve()),
+        }
+        payload["event_source"] = "root_pass_checkpoint"
     base_run_id = make_run_id(payload, args.run_name, started)
-    reservation = reserve_run_directory(args.output_root, base_run_id)
+    reservation = reserve_run_directory(args.output_root.expanduser(), base_run_id)
+    run_log_handler = attach_run_file_logger(reservation.incomplete_dir, args.log_level)
+    phase = "initialization"
     logging.info("Reserved immutable run %s", reservation.run_id)
     try:
         if preloaded_results is not None:
             results = preloaded_results
             worker_count = 0
             partial = bool(source_metadata and source_metadata.get("partial"))
-            logging.info("Replotting stored histograms from completed run %s", source_metadata["run_id"])
+            logging.info(
+                "Replotting stored histograms from completed run %s",
+                source_metadata["run_id"],
+            )
             if xgboost_metadata is not None:
                 for values in xgboost_metadata.get("channels", {}).values():
                     relative_models = (
@@ -6088,21 +6570,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             )
                         destination_model.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(source_model, destination_model)
+        elif checkpoint_results is not None:
+            worker_count = 0
+            partial = effective_max_events is not None
+            cut_results = checkpoint_results
+            logging.info(
+                "Skipping ROOT input; resuming from checkpoint created by %s",
+                resume_metadata["source_run_id"],
+            )
+            write_json_exclusive(
+                reservation.incomplete_dir / "resumed-from-checkpoint.json",
+                payload["resumed_from_checkpoint"],
+            )
         else:
             worker_count = min(args.workers, len(config.samples))
             partial = args.max_events is not None
             collect_common_events = "xgboost" in analyses
-        if preloaded_results is None and worker_count == 1:
+        if preloaded_results is None and checkpoint_results is None and worker_count == 1:
+            phase = "root-event-processing"
             ROOT, fastjet = load_runtime()
             cut_results = [
                 analyze_sample(
-                    ROOT, fastjet, config, spec, args.max_events,
+                    ROOT,
+                    fastjet,
+                    config,
+                    spec,
+                    args.max_events,
                     collect_common_events=collect_common_events,
                 )
                 for spec in config.samples
             ]
-        elif preloaded_results is None:
-            logging.info("Processing %d samples with %d independent workers", len(config.samples), worker_count)
+        elif preloaded_results is None and checkpoint_results is None:
+            phase = "root-event-processing"
+            logging.info(
+                "Processing %d samples with %d independent workers",
+                len(config.samples),
+                worker_count,
+            )
             context = multiprocessing.get_context("spawn")
             by_name: Dict[str, SampleResult] = {}
             with concurrent.futures.ProcessPoolExecutor(
@@ -6125,17 +6629,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     by_name[name] = future.result()
                     logging.info("Collected completed sample %s", name)
             cut_results = [by_name[spec.name] for spec in config.samples]
+
+        checkpoint_created = False
+        if preloaded_results is None and checkpoint_results is None:
+            phase = "root-pass-checkpoint"
+            write_root_pass_checkpoint(
+                reservation.incomplete_dir,
+                payload,
+                cut_results,
+                reservation.run_id,
+            )
+            checkpoint_created = True
+
         if preloaded_results is None:
             results = list(cut_results) if "cutbased" in analyses else []
             if "xgboost" in analyses:
+                phase = "xgboost-training-and-application"
                 xgb_results, xgboost_metadata, xgboost_diagnostics = build_xgboost_results(
                     cut_results,
                     reservation.incomplete_dir,
-                    model_run=args.xgb_model_run,
+                    model_run=effective_xgb_model_run,
                 )
                 results.extend(xgb_results)
                 for result in cut_results:
                     result.common_events = None
+
+        phase = "numerical-summaries-and-validation"
         summaries = [result_summary(result, config.luminosities_fb) for result in results]
         validation = validate_results(results, partial)
         summary_payload = {
@@ -6156,7 +6675,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         }
         if source_metadata is not None:
             summary_payload["derived_from_run_id"] = source_metadata["run_id"]
-        write_json_exclusive(reservation.incomplete_dir / "summaries" / "analysis.json", summary_payload)
+        if resume_metadata is not None:
+            summary_payload["resumed_from_checkpoint_run_id"] = resume_metadata[
+                "source_run_id"
+            ]
+        write_json_exclusive(
+            reservation.incomplete_dir / "summaries" / "analysis.json",
+            summary_payload,
+        )
         if xgboost_metadata is not None:
             write_json_exclusive(
                 reservation.incomplete_dir / "summaries" / "xgboost.json",
@@ -6173,7 +6699,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     config.luminosities_fb,
                     strategy,
                 )
-        plot_records = generate_plots(reservation.incomplete_dir, results, config.luminosities_fb, partial)
+        phase = "plot-generation"
+        plot_records = generate_plots(
+            reservation.incomplete_dir,
+            results,
+            config.luminosities_fb,
+            partial,
+        )
         plot_records.extend(
             generate_ri_plots(
                 reservation.incomplete_dir, results, config.luminosities_fb, partial
@@ -6223,6 +6755,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 for spec in config.samples
             ],
             "artifacts": {
+                "run_log": RUN_LOG_NAME,
                 "plots": len(plot_records),
                 "summary": "summaries/analysis.json",
                 "histograms": "summaries/histograms.npz",
@@ -6242,6 +6775,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "analysis_version": source_metadata.get("analysis_version"),
             }
             run_metadata["event_processing"] = "reused_stored_histograms"
+        if resume_metadata is not None:
+            run_metadata["resumed_from_checkpoint"] = payload[
+                "resumed_from_checkpoint"
+            ]
+            run_metadata["event_processing"] = "reused_root_pass_checkpoint"
+        elif preloaded_results is None:
+            run_metadata["root_pass_checkpoint"] = {
+                "created": checkpoint_created,
+                "retained_after_success": False,
+                "format_version": ROOT_PASS_CHECKPOINT_VERSION,
+            }
         generate_run_index(
             reservation.incomplete_dir,
             run_metadata,
@@ -6252,15 +6796,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             xgboost_metadata,
         )
         write_json_exclusive(reservation.incomplete_dir / "run.json", run_metadata)
+        phase = "final-link-validation"
         validate_html_links(reservation.incomplete_dir / "index.html")
+        if checkpoint_created:
+            phase = "checkpoint-cleanup"
+            remove_root_pass_checkpoint(reservation.incomplete_dir)
+            logging.info("Removed ROOT-pass recovery checkpoint after successful validation")
+        phase = "finalization"
         reservation.incomplete_dir.rename(reservation.final_dir)
         update_top_level_catalog(reservation.output_root)
         logging.info("Completed run: %s", reservation.final_dir)
         print(reservation.final_dir)
         return 0
-    except Exception:
+    except Exception as error:
+        write_failure_record(reservation, started, phase, error)
         logging.exception("Run failed; partial artifacts remain in %s", reservation.incomplete_dir)
         return 1
+    finally:
+        detach_run_file_logger(run_log_handler)
 
 
 if __name__ == "__main__":

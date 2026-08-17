@@ -512,6 +512,34 @@ class SampleResult:
 
 
 @dataclass(frozen=True)
+class EventRange:
+    """Half-open entry interval in one original manifest ROOT file."""
+
+    source_file_index: int
+    start: int
+    stop: int
+
+    @property
+    def count(self) -> int:
+        return self.stop - self.start
+
+
+@dataclass(frozen=True)
+class SampleShard:
+    """One deterministic, contiguous interval of a sample's global event order."""
+
+    index: int
+    shard_count: int
+    global_start: int
+    global_stop: int
+    ranges: Tuple[EventRange, ...]
+
+    @property
+    def event_count(self) -> int:
+        return self.global_stop - self.global_start
+
+
+@dataclass(frozen=True)
 class CommonEventTable:
     observable_keys: Tuple[str, ...]
     weights: np.ndarray
@@ -1250,6 +1278,7 @@ def resolved_config_payload(
     max_events: Optional[int],
     analyses: Sequence[str] = ("cutbased",),
     xgb_model_run: Optional[Path] = None,
+    event_shards_per_sample: int = 1,
 ) -> Dict[str, Any]:
     return {
         "analysis_version": ANALYSIS_VERSION,
@@ -1261,6 +1290,11 @@ def resolved_config_payload(
         "max_events_per_sample": max_events,
         "source_manifest": config.source_manifest,
         "analyses": list(analyses),
+        "event_processing": {
+            "event_shards_per_sample": int(event_shards_per_sample),
+            "partition": "contiguous_global_entry_ranges",
+            "merge_order": "manifest_sample_then_global_event_order",
+        },
         "xgboost": {
             "model_run": str(xgb_model_run.resolve()) if xgb_model_run is not None else None,
             "feature_names": list(xgbtools.FEATURE_NAMES),
@@ -2129,6 +2163,182 @@ def inspect_sample(ROOT: Any, config: AnalysisConfig, spec: SampleSpec) -> Tuple
     return total_entries, total_sumw, files
 
 
+def build_sample_shards(
+    file_metadata: Sequence[Mapping[str, Any]],
+    max_events: Optional[int],
+    requested_shards: int,
+) -> Tuple[SampleShard, ...]:
+    """Partition the processed prefix into deterministic contiguous event ranges."""
+    if requested_shards <= 0:
+        raise ValueError("requested_shards must be positive")
+    file_entries = [int(item["entries"]) for item in file_metadata]
+    if any(entries < 0 for entries in file_entries):
+        raise ValueError("ROOT file entry counts cannot be negative")
+    total_entries = sum(file_entries)
+    processed_entries = (
+        total_entries if max_events is None else min(total_entries, int(max_events))
+    )
+    if processed_entries <= 0:
+        raise ValueError("Cannot shard a sample with no events to process")
+    shard_count = min(int(requested_shards), processed_entries)
+    offsets = np.cumsum(np.asarray([0] + file_entries, dtype=np.int64))
+    shards: List[SampleShard] = []
+    for index in range(shard_count):
+        global_start = processed_entries * index // shard_count
+        global_stop = processed_entries * (index + 1) // shard_count
+        ranges: List[EventRange] = []
+        for file_index, entries in enumerate(file_entries):
+            file_global_start = int(offsets[file_index])
+            file_global_stop = file_global_start + entries
+            overlap_start = max(global_start, file_global_start)
+            overlap_stop = min(global_stop, file_global_stop)
+            if overlap_start < overlap_stop:
+                ranges.append(
+                    EventRange(
+                        source_file_index=file_index,
+                        start=overlap_start - file_global_start,
+                        stop=overlap_stop - file_global_start,
+                    )
+                )
+        shard = SampleShard(
+            index=index,
+            shard_count=shard_count,
+            global_start=global_start,
+            global_stop=global_stop,
+            ranges=tuple(ranges),
+        )
+        if sum(event_range.count for event_range in shard.ranges) != shard.event_count:
+            raise RuntimeError(f"Shard {index} event-range coverage does not close")
+        shards.append(shard)
+    if sum(shard.event_count for shard in shards) != processed_entries:
+        raise RuntimeError("Sample shard event counts do not cover the processed prefix")
+    for left, right in zip(shards[:-1], shards[1:]):
+        if left.global_stop != right.global_start:
+            raise RuntimeError("Sample shard boundaries contain a gap or overlap")
+    return tuple(shards)
+
+
+def merge_sample_shard_results(
+    spec: SampleSpec,
+    total_entries: int,
+    generated_sumw: float,
+    file_metadata: Sequence[Mapping[str, Any]],
+    shard_results: Sequence[Tuple[SampleShard, SampleResult]],
+) -> SampleResult:
+    """Merge independently processed ranges while retaining event-level moments."""
+    if not shard_results:
+        raise ValueError(f"No shard results were supplied for {spec.name}")
+    ordered = sorted(shard_results, key=lambda item: item[0].index)
+    shards = [item[0] for item in ordered]
+    results = [item[1] for item in ordered]
+    if [shard.index for shard in shards] != list(range(len(shards))):
+        raise ValueError(f"Shard indices for {spec.name} are incomplete or duplicated")
+    expected_shard_count = shards[0].shard_count
+    if expected_shard_count != len(shards) or any(
+        shard.shard_count != expected_shard_count for shard in shards
+    ):
+        raise ValueError(f"Shard-count metadata differs for {spec.name}")
+    for left, right in zip(shards[:-1], shards[1:]):
+        if left.global_stop != right.global_start:
+            raise ValueError(f"Shard ranges for {spec.name} contain a gap or overlap")
+    if any(result.spec != spec or result.strategy != "cutbased" for result in results):
+        raise ValueError(f"Shard result identity differs for {spec.name}")
+    if any(
+        result.total_entries != int(total_entries)
+        or not math.isclose(
+            result.generated_sumw,
+            float(generated_sumw),
+            rel_tol=1.0e-13,
+            abs_tol=1.0e-13,
+        )
+        for result in results
+    ):
+        raise ValueError(f"Shard normalization metadata differs for {spec.name}")
+
+    merged = initialize_result(spec, int(total_entries), float(generated_sumw))
+    merged.files = [dict(item) for item in file_metadata]
+    scopes = {result.application_scope for result in results}
+    if len(scopes) != 1:
+        raise ValueError(f"Shard application scopes differ for {spec.name}")
+    merged.application_scope = scopes.pop()
+    merged.processed_entries = sum(result.processed_entries for result in results)
+    merged.processed_sumw = math.fsum(result.processed_sumw for result in results)
+    merged.invalid_events = sum(result.invalid_events for result in results)
+
+    for step in merged.cutflow:
+        merged.cutflow[step].raw_count = sum(
+            result.cutflow[step].raw_count for result in results
+        )
+        merged.cutflow[step].sumw = math.fsum(
+            result.cutflow[step].sumw for result in results
+        )
+        merged.cutflow[step].sumw2 = math.fsum(
+            result.cutflow[step].sumw2 for result in results
+        )
+    for key, histogram in merged.histograms.items():
+        for result in results:
+            source = result.histograms[key]
+            if not np.array_equal(source.edges, histogram.edges):
+                raise ValueError(f"Shard histogram edges differ for {spec.name} {key}")
+            histogram.sumw += source.sumw
+            histogram.sumw2 += source.sumw2
+            histogram.entries += source.entries
+
+    merged.pull_total_sumw = math.fsum(result.pull_total_sumw for result in results)
+    merged.pull_beam_sumw = math.fsum(result.pull_beam_sumw for result in results)
+    merged.pull_left_sumw = math.fsum(result.pull_left_sumw for result in results)
+    merged.pull_right_sumw = math.fsum(result.pull_right_sumw for result in results)
+    merged.zero_pull_jets = sum(result.zero_pull_jets for result in results)
+    merged.zero_pull_sumw = math.fsum(result.zero_pull_sumw for result in results)
+    moment_models = {result.pull_moment_model for result in results}
+    if len(moment_models) != 1:
+        raise ValueError(f"Shard pull-moment models differ for {spec.name}")
+    merged.pull_moment_model = moment_models.pop()
+    for key, moments in merged.pull_observable_moments.items():
+        for result in results:
+            source = result.pull_observable_moments[key]
+            if not np.array_equal(source.edges, moments.edges):
+                raise ValueError(f"Shard pull-moment edges differ for {spec.name} {key}")
+            moments.bin_sumw += source.bin_sumw
+            moments.event_second_sumw += source.event_second_sumw
+            moments.mc_second_sumw2 += source.mc_second_sumw2
+    folded = merged.pull_observable_moments["folded_pull_angle"]
+    merged.pull_bin_sumw = folded.bin_sumw
+    merged.pull_event_second_sumw = folded.event_second_sumw
+    merged.pull_mc_second_sumw2 = folded.mc_second_sumw2
+
+    common_presence = [result.common_events is not None for result in results]
+    if any(common_presence) and not all(common_presence):
+        raise ValueError(f"Only some shards retained XGBoost events for {spec.name}")
+    if all(common_presence):
+        tables = [result.common_events for result in results]
+        observable_keys = tables[0].observable_keys
+        if any(table.observable_keys != observable_keys for table in tables):
+            raise ValueError(f"Shard common-event feature order differs for {spec.name}")
+        merged.common_events = CommonEventTable(
+            observable_keys=observable_keys,
+            weights=np.concatenate([table.weights for table in tables]),
+            observables=np.concatenate([table.observables for table in tables], axis=0),
+            pulls=np.concatenate([table.pulls for table in tables], axis=0),
+            source_file_indices=np.concatenate(
+                [table.source_file_indices for table in tables]
+            ),
+            source_entries=np.concatenate([table.source_entries for table in tables]),
+        )
+        common = merged.common_events
+        if len(common) > 1:
+            files = common.source_file_indices.astype(np.int64, copy=False)
+            entries = common.source_entries
+            non_increasing = (files[1:] < files[:-1]) | (
+                (files[1:] == files[:-1]) & (entries[1:] <= entries[:-1])
+            )
+            if np.any(non_increasing):
+                raise RuntimeError(
+                    f"Merged common-event identities are not ordered for {spec.name}"
+                )
+    return merged
+
+
 def particles_from_root(objects: Any, numparticles: int) -> EventParticles:
     array = np.asarray(objects)
     if array.ndim == 1:
@@ -2176,6 +2386,163 @@ def cluster_selected_jets(
     return cluster, selected
 
 
+def analyze_sample_shard(
+    ROOT: Any,
+    fastjet: Any,
+    config: AnalysisConfig,
+    spec: SampleSpec,
+    total_entries: int,
+    generated_sumw: float,
+    file_metadata: Sequence[Mapping[str, Any]],
+    shard: SampleShard,
+    collect_common_events: bool = False,
+) -> SampleResult:
+    result = initialize_result(spec, total_entries, generated_sumw)
+    result.files = [dict(item) for item in file_metadata]
+    jet_definition = fastjet.JetDefinition(fastjet.antikt_algorithm, CUTS["jet_radius"])
+    common_buffer = (
+        CommonEventBuffer(common_observable_keys(spec.channel))
+        if collect_common_events
+        else None
+    )
+    processed_sumw_correction = 0.0
+    started = time.monotonic()
+    shard_label = f"{spec.name} shard {shard.index + 1}/{shard.shard_count}"
+    logging.info(
+        "%s: entries [%d, %d), %d events; full sample sumw %.12g",
+        shard_label,
+        shard.global_start,
+        shard.global_stop,
+        shard.event_count,
+        generated_sumw,
+    )
+    attempted = 0
+    report_every = max(1000, shard.event_count // 20) if shard.event_count else 1
+
+    for event_range in shard.ranges:
+        source_file_index = event_range.source_file_index
+        filename = spec.files[source_file_index]
+        root_file = ROOT.TFile.Open(filename, "READ")
+        if not root_file or root_file.IsZombie():
+            raise RuntimeError(f"Unable to open ROOT input: {filename}")
+        try:
+            tree = root_file.Get(config.tree_name)
+            if tree is None:
+                raise RuntimeError(f"Tree {config.tree_name!r} not found in {filename}")
+            entries = int(tree.GetEntries())
+            if event_range.start < 0 or event_range.stop > entries:
+                raise ValueError(
+                    f"{shard_label} range [{event_range.start}, {event_range.stop}) "
+                    f"lies outside {filename} with {entries} entries"
+                )
+            tree.SetBranchStatus("*", 0)
+            for branch in ("numparticles", "objects", "evweight"):
+                tree.SetBranchStatus(branch, 1)
+            for entry in range(event_range.start, event_range.stop):
+                tree.GetEntry(entry)
+                attempted += 1
+                event_weight = float(tree.evweight)
+                if not math.isfinite(event_weight):
+                    result.invalid_events += 1
+                    continue
+                try:
+                    particles = particles_from_root(tree.objects, int(tree.numparticles))
+                    decision = (
+                        select_higgs_candidate(particles)
+                        if spec.channel == "higgs"
+                        else select_z_candidate(particles)
+                    )
+                    result.processed_entries += 1
+                    result.processed_sumw, processed_sumw_correction = compensated_add(
+                        result.processed_sumw,
+                        processed_sumw_correction,
+                        event_weight,
+                    )
+                    result.cutflow["all_events"].fill(event_weight)
+                    fill_cut_steps(result, decision.passed_steps, event_weight)
+                    if decision.candidate is None:
+                        continue
+                    candidate = decision.candidate
+                    cluster, jets = cluster_selected_jets(
+                        particles,
+                        (candidate.leading_index, candidate.subleading_index),
+                        fastjet,
+                        jet_definition,
+                    )
+                    if len(jets) < 2:
+                        continue
+                    result.cutflow["at_least_two_jets"].fill(event_weight)
+                    jet1, jet2 = jets[0], jets[1]
+                    jet1_y = _pseudojet_value(jet1, "rapidity")
+                    jet2_y = _pseudojet_value(jet2, "rapidity")
+                    if jet1_y * jet2_y >= 0.0:
+                        continue
+                    result.cutflow["opposite_hemispheres"].fill(event_weight)
+                    vbf = evaluate_vbf_selection(
+                        pseudojet_p4(jet1), pseudojet_p4(jet2), candidate.p4
+                    )
+                    observable_values = fill_common_histograms(
+                        result, particles, candidate, jets, vbf, event_weight
+                    )
+                    pulls: Optional[Tuple[PullVector, PullVector]] = None
+                    if common_buffer is not None:
+                        pulls = (
+                            calculate_pull_vector(jet1),
+                            calculate_pull_vector(jet2),
+                        )
+                        common_buffer.append(
+                            event_weight,
+                            observable_values,
+                            pulls,
+                            source_file_index,
+                            entry,
+                        )
+                    fill_cut_steps(result, vbf.passed_steps, event_weight)
+                    if len(vbf.passed_steps) != 3:
+                        continue
+                    if pulls is None:
+                        pulls = (
+                            calculate_pull_vector(jet1),
+                            calculate_pull_vector(jet2),
+                        )
+                    fill_pull_histograms(result, pulls, event_weight)
+                    del cluster
+                except (ArithmeticError, ValueError, RuntimeError) as error:
+                    result.invalid_events += 1
+                    logging.debug(
+                        "%s file %d entry %d rejected as invalid: %s",
+                        shard_label,
+                        source_file_index,
+                        entry,
+                        error,
+                    )
+                finally:
+                    if attempted and attempted % report_every == 0:
+                        logging.info(
+                            "%s: processed %d/%d assigned entries",
+                            shard_label,
+                            attempted,
+                            shard.event_count,
+                        )
+        finally:
+            root_file.Close()
+    if common_buffer is not None:
+        result.common_events = common_buffer.finalize()
+        logging.info(
+            "%s: retained %d common-selected events for XGBoost",
+            shard_label,
+            len(result.common_events),
+        )
+    logging.info(
+        "%s complete: %d processed in %.1f s; final sumw %.12g",
+        shard_label,
+        result.processed_entries,
+        time.monotonic() - started,
+        result.cutflow[cutflow_steps(spec.channel, result.strategy)[-1]].sumw,
+    )
+    return result
+
+
 def analyze_sample(
     ROOT: Any,
     fastjet: Any,
@@ -2184,111 +2551,20 @@ def analyze_sample(
     max_events: Optional[int],
     collect_common_events: bool = False,
 ) -> SampleResult:
+    """Backward-compatible unsharded sample analysis."""
     total_entries, generated_sumw, file_metadata = inspect_sample(ROOT, config, spec)
-    result = initialize_result(spec, total_entries, generated_sumw)
-    result.files = file_metadata
-    jet_definition = fastjet.JetDefinition(fastjet.antikt_algorithm, CUTS["jet_radius"])
-    common_buffer = (
-        CommonEventBuffer(common_observable_keys(spec.channel))
-        if collect_common_events
-        else None
+    shard = build_sample_shards(file_metadata, max_events, 1)[0]
+    return analyze_sample_shard(
+        ROOT,
+        fastjet,
+        config,
+        spec,
+        total_entries,
+        generated_sumw,
+        file_metadata,
+        shard,
+        collect_common_events,
     )
-    remaining = max_events
-    processed_sumw_correction = 0.0
-    started = time.monotonic()
-    logging.info("%s: %d generated events, sumw %.12g", spec.name, total_entries, generated_sumw)
-
-    for source_file_index, filename in enumerate(spec.files):
-        if remaining is not None and remaining <= 0:
-            break
-        root_file = ROOT.TFile.Open(filename, "READ")
-        tree = root_file.Get(config.tree_name)
-        entries = int(tree.GetEntries())
-        to_process = entries if remaining is None else min(entries, remaining)
-        tree.SetBranchStatus("*", 0)
-        for branch in ("numparticles", "objects", "evweight"):
-            tree.SetBranchStatus(branch, 1)
-        report_every = max(1000, to_process // 20) if to_process else 1
-        for entry in range(to_process):
-            tree.GetEntry(entry)
-            event_weight = float(tree.evweight)
-            if not math.isfinite(event_weight):
-                result.invalid_events += 1
-                continue
-            try:
-                particles = particles_from_root(tree.objects, int(tree.numparticles))
-                decision = (
-                    select_higgs_candidate(particles)
-                    if spec.channel == "higgs"
-                    else select_z_candidate(particles)
-                )
-                result.processed_entries += 1
-                result.processed_sumw, processed_sumw_correction = compensated_add(
-                    result.processed_sumw,
-                    processed_sumw_correction,
-                    event_weight,
-                )
-                result.cutflow["all_events"].fill(event_weight)
-                fill_cut_steps(result, decision.passed_steps, event_weight)
-                if decision.candidate is None:
-                    continue
-                candidate = decision.candidate
-                cluster, jets = cluster_selected_jets(
-                    particles,
-                    (candidate.leading_index, candidate.subleading_index),
-                    fastjet,
-                    jet_definition,
-                )
-                if len(jets) < 2:
-                    continue
-                result.cutflow["at_least_two_jets"].fill(event_weight)
-                jet1, jet2 = jets[0], jets[1]
-                jet1_y = _pseudojet_value(jet1, "rapidity")
-                jet2_y = _pseudojet_value(jet2, "rapidity")
-                if jet1_y * jet2_y >= 0.0:
-                    continue
-                result.cutflow["opposite_hemispheres"].fill(event_weight)
-                vbf = evaluate_vbf_selection(pseudojet_p4(jet1), pseudojet_p4(jet2), candidate.p4)
-                observable_values = fill_common_histograms(
-                    result, particles, candidate, jets, vbf, event_weight
-                )
-                pulls: Optional[Tuple[PullVector, PullVector]] = None
-                if common_buffer is not None:
-                    pulls = (calculate_pull_vector(jet1), calculate_pull_vector(jet2))
-                    common_buffer.append(
-                        event_weight,
-                        observable_values,
-                        pulls,
-                        source_file_index,
-                        entry,
-                    )
-                fill_cut_steps(result, vbf.passed_steps, event_weight)
-                if len(vbf.passed_steps) != 3:
-                    continue
-                if pulls is None:
-                    pulls = (calculate_pull_vector(jet1), calculate_pull_vector(jet2))
-                fill_pull_histograms(result, pulls, event_weight)
-                del cluster
-            except (ArithmeticError, ValueError, RuntimeError) as error:
-                result.invalid_events += 1
-                logging.debug("%s entry %d rejected as invalid: %s", spec.name, entry, error)
-            finally:
-                if entry and entry % report_every == 0:
-                    logging.info("%s: processed %d/%d entries", spec.name, entry, to_process)
-        root_file.Close()
-        if remaining is not None:
-            remaining -= to_process
-    if common_buffer is not None:
-        result.common_events = common_buffer.finalize()
-        logging.info("%s: retained %d common-selected events for XGBoost", spec.name, len(result.common_events))
-    logging.info(
-        "%s complete: %d processed in %.1f s; final sumw %.12g",
-        spec.name,
-        result.processed_entries,
-        time.monotonic() - started,
-        result.cutflow[cutflow_steps(spec.channel, result.strategy)[-1]].sumw,
-    )
-    return result
 
 
 def analyze_sample_worker(
@@ -2311,6 +2587,225 @@ def analyze_sample_worker(
         max_events,
         collect_common_events=collect_common_events,
     )
+
+
+def inspect_sample_worker(
+    config: AnalysisConfig,
+    spec: SampleSpec,
+    log_level: str,
+) -> Tuple[int, float, List[Dict[str, Any]]]:
+    logging.basicConfig(
+        level=getattr(logging, log_level),
+        format="%(asctime)s %(processName)s %(levelname)s %(message)s",
+    )
+    ROOT, _ = load_runtime()
+    return inspect_sample(ROOT, config, spec)
+
+
+def analyze_sample_shard_worker(
+    config: AnalysisConfig,
+    spec: SampleSpec,
+    total_entries: int,
+    generated_sumw: float,
+    file_metadata: Sequence[Mapping[str, Any]],
+    shard: SampleShard,
+    log_level: str,
+    collect_common_events: bool = False,
+) -> SampleResult:
+    logging.basicConfig(
+        level=getattr(logging, log_level),
+        format="%(asctime)s %(processName)s %(levelname)s %(message)s",
+    )
+    ROOT, fastjet = load_runtime()
+    return analyze_sample_shard(
+        ROOT,
+        fastjet,
+        config,
+        spec,
+        total_entries,
+        generated_sumw,
+        file_metadata,
+        shard,
+        collect_common_events,
+    )
+
+
+def process_root_samples(
+    config: AnalysisConfig,
+    max_events: Optional[int],
+    event_shards_per_sample: int,
+    requested_workers: int,
+    log_level: str,
+    collect_common_events: bool,
+) -> Tuple[List[SampleResult], Dict[str, Any], int]:
+    """Inspect once, process event ranges concurrently, then merge by event order."""
+    if event_shards_per_sample <= 0 or requested_workers <= 0:
+        raise ValueError("Event shards and workers must be positive")
+    context = multiprocessing.get_context("spawn")
+    inspection_by_name: Dict[
+        str, Tuple[int, float, List[Dict[str, Any]]]
+    ] = {}
+    inspection_workers = min(requested_workers, len(config.samples))
+    if inspection_workers == 1:
+        ROOT, _ = load_runtime()
+        for spec in config.samples:
+            inspection_by_name[spec.name] = inspect_sample(ROOT, config, spec)
+    else:
+        logging.info(
+            "Inspecting %d samples with %d workers before event sharding",
+            len(config.samples),
+            inspection_workers,
+        )
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=inspection_workers,
+            mp_context=context,
+        ) as executor:
+            futures = {
+                executor.submit(inspect_sample_worker, config, spec, log_level): spec.name
+                for spec in config.samples
+            }
+            for future in concurrent.futures.as_completed(futures):
+                name = futures[future]
+                inspection_by_name[name] = future.result()
+                logging.info("Inspected sample %s", name)
+
+    plans: Dict[str, Tuple[SampleShard, ...]] = {}
+    sample_plan_payload: Dict[str, Any] = {}
+    jobs: List[
+        Tuple[SampleSpec, int, float, List[Dict[str, Any]], SampleShard]
+    ] = []
+    for sample_order, spec in enumerate(config.samples):
+        total_entries, generated_sumw, file_metadata = inspection_by_name[spec.name]
+        shards = build_sample_shards(
+            file_metadata,
+            max_events,
+            event_shards_per_sample,
+        )
+        plans[spec.name] = shards
+        sample_plan_payload[spec.name] = {
+            "sample_order": sample_order,
+            "total_entries": total_entries,
+            "processed_prefix_entries": sum(shard.event_count for shard in shards),
+            "requested_shards": event_shards_per_sample,
+            "actual_shards": len(shards),
+            "shards": [
+                {
+                    "index": shard.index,
+                    "global_start": shard.global_start,
+                    "global_stop": shard.global_stop,
+                    "event_count": shard.event_count,
+                    "file_ranges": [asdict(event_range) for event_range in shard.ranges],
+                }
+                for shard in shards
+            ],
+        }
+        jobs.extend(
+            (spec, total_entries, generated_sumw, file_metadata, shard)
+            for shard in shards
+        )
+    sample_order_by_name = {
+        sample.name: index for index, sample in enumerate(config.samples)
+    }
+    jobs.sort(
+        key=lambda item: (
+            -item[4].event_count,
+            sample_order_by_name[item[0].name],
+            item[4].index,
+        )
+    )
+    worker_count = min(requested_workers, len(jobs))
+    logging.info(
+        "Processing %d event shards from %d samples with %d workers",
+        len(jobs),
+        len(config.samples),
+        worker_count,
+    )
+
+    merged_by_name: Dict[str, SampleResult] = {}
+    buckets: Dict[str, List[Optional[SampleResult]]] = {
+        spec.name: [None] * len(plans[spec.name]) for spec in config.samples
+    }
+
+    def accept_result(spec: SampleSpec, shard: SampleShard, result: SampleResult) -> None:
+        bucket = buckets[spec.name]
+        if bucket[shard.index] is not None:
+            raise RuntimeError(f"Duplicate completed shard {spec.name} {shard.index}")
+        bucket[shard.index] = result
+        logging.info(
+            "Collected %s shard %d/%d",
+            spec.name,
+            shard.index + 1,
+            shard.shard_count,
+        )
+        if all(item is not None for item in bucket):
+            total_entries, generated_sumw, file_metadata = inspection_by_name[spec.name]
+            pairs = [
+                (plans[spec.name][index], item)
+                for index, item in enumerate(bucket)
+                if item is not None
+            ]
+            merged_by_name[spec.name] = merge_sample_shard_results(
+                spec,
+                total_entries,
+                generated_sumw,
+                file_metadata,
+                pairs,
+            )
+            del buckets[spec.name]
+            logging.info(
+                "Merged %d ordered event shards for %s",
+                len(pairs),
+                spec.name,
+            )
+
+    if worker_count == 1:
+        ROOT, fastjet = load_runtime()
+        for spec, total_entries, generated_sumw, file_metadata, shard in jobs:
+            result = analyze_sample_shard(
+                ROOT,
+                fastjet,
+                config,
+                spec,
+                total_entries,
+                generated_sumw,
+                file_metadata,
+                shard,
+                collect_common_events,
+            )
+            accept_result(spec, shard, result)
+    else:
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=context,
+        ) as executor:
+            future_jobs = {
+                executor.submit(
+                    analyze_sample_shard_worker,
+                    config,
+                    spec,
+                    total_entries,
+                    generated_sumw,
+                    file_metadata,
+                    shard,
+                    log_level,
+                    collect_common_events,
+                ): (spec, shard)
+                for spec, total_entries, generated_sumw, file_metadata, shard in jobs
+            }
+            for future in concurrent.futures.as_completed(future_jobs):
+                spec, shard = future_jobs.pop(future)
+                accept_result(spec, shard, future.result())
+
+    if buckets or set(merged_by_name) != {spec.name for spec in config.samples}:
+        raise RuntimeError("Not all event shards were merged into sample results")
+    plan_payload = {
+        "requested_shards_per_sample": event_shards_per_sample,
+        "inspection_workers": inspection_workers,
+        "analysis_workers": worker_count,
+        "total_shards": len(jobs),
+        "samples": sample_plan_payload,
+    }
+    return [merged_by_name[spec.name] for spec in config.samples], plan_payload, worker_count
 
 
 def _table_pull_vectors(table: CommonEventTable, row: int) -> Tuple[PullVector, PullVector]:
@@ -6254,7 +6749,15 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--workers",
         type=int,
         default=1,
-        help="Samples to process concurrently; each worker opens its own ROOT file (default: 1)",
+        help="Maximum concurrent ROOT event-range workers (default: 1)",
+    )
+    parser.add_argument(
+        "--event-shards",
+        type=int,
+        help=(
+            "Contiguous event ranges per sample; combine with --workers for within-sample "
+            "parallelism (default for new ROOT runs: 1)"
+        ),
     )
     parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
     args = parser.parse_args(argv)
@@ -6264,6 +6767,12 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--max-events cannot be combined with --from-run")
     if args.resume_incomplete is not None and args.max_events is not None:
         parser.error("--max-events cannot be combined with --resume-incomplete")
+    if args.from_run is not None and args.event_shards is not None:
+        parser.error("--event-shards cannot be combined with --from-run")
+    if args.resume_incomplete is not None and args.event_shards is not None:
+        parser.error("--event-shards is restored from the checkpoint when resuming")
+    if args.compare_runs is not None and args.event_shards is not None:
+        parser.error("--event-shards cannot be combined with --compare-runs")
     if args.compare_runs is not None and len(args.compare_runs) < 2:
         parser.error("--compare-runs requires a reference and at least one variation")
     if args.compare_runs is not None and args.max_events is not None:
@@ -6280,6 +6789,8 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--xgb-model-run cannot be combined with --compare-runs")
     if args.workers <= 0:
         parser.error("--workers must be positive")
+    if args.event_shards is not None and args.event_shards <= 0:
+        parser.error("--event-shards must be positive")
     return args
 
 
@@ -6472,12 +6983,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     xgboost_metadata: Optional[Dict[str, Any]] = None
     xgboost_diagnostics: Dict[str, Any] = {}
     effective_xgb_model_run: Optional[Path] = args.xgb_model_run
+    event_sharding_metadata: Optional[Dict[str, Any]] = None
 
     if args.from_run is not None:
         config, preloaded_results, source_metadata = load_completed_run(
             args.from_run, args.luminosities
         )
         effective_max_events = source_metadata.get("max_events_per_sample")
+        effective_event_shards = int(
+            source_metadata.get("configuration", {})
+            .get("event_processing", {})
+            .get("event_shards_per_sample", 1)
+        )
         analyses = tuple(
             strategy
             for strategy in ANALYSIS_STRATEGIES
@@ -6508,6 +7025,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         analyses = stored_analyses
         effective_max_events = checkpoint_configuration.get("max_events_per_sample")
+        effective_event_shards = int(
+            checkpoint_configuration.get("event_processing", {}).get(
+                "event_shards_per_sample", 1
+            )
+        )
         xgb_configuration = checkpoint_configuration.get("xgboost") or {}
         stored_model_run = xgb_configuration.get("model_run")
         effective_xgb_model_run = (
@@ -6516,6 +7038,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         config = read_manifest(args.samples, args.luminosities)
         effective_max_events = args.max_events
+        effective_event_shards = args.event_shards or 1
         analyses = tuple(
             strategy for strategy in ANALYSIS_STRATEGIES if strategy in args.analyses
         )
@@ -6527,7 +7050,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     f"XGBoost channel {channel} requires manifest signal and background roles"
                 )
     payload = resolved_config_payload(
-        config, effective_max_events, analyses, effective_xgb_model_run
+        config,
+        effective_max_events,
+        analyses,
+        effective_xgb_model_run,
+        effective_event_shards,
     )
     if source_metadata is not None:
         payload["derived_from_run_id"] = source_metadata["run_id"]
@@ -6583,52 +7110,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 payload["resumed_from_checkpoint"],
             )
         else:
-            worker_count = min(args.workers, len(config.samples))
             partial = args.max_events is not None
             collect_common_events = "xgboost" in analyses
-        if preloaded_results is None and checkpoint_results is None and worker_count == 1:
+        if preloaded_results is None and checkpoint_results is None:
             phase = "root-event-processing"
-            ROOT, fastjet = load_runtime()
-            cut_results = [
-                analyze_sample(
-                    ROOT,
-                    fastjet,
-                    config,
-                    spec,
-                    args.max_events,
-                    collect_common_events=collect_common_events,
-                )
-                for spec in config.samples
-            ]
-        elif preloaded_results is None and checkpoint_results is None:
-            phase = "root-event-processing"
-            logging.info(
-                "Processing %d samples with %d independent workers",
-                len(config.samples),
+            (
+                cut_results,
+                event_sharding_metadata,
                 worker_count,
+            ) = process_root_samples(
+                config,
+                args.max_events,
+                effective_event_shards,
+                args.workers,
+                args.log_level,
+                collect_common_events,
             )
-            context = multiprocessing.get_context("spawn")
-            by_name: Dict[str, SampleResult] = {}
-            with concurrent.futures.ProcessPoolExecutor(
-                max_workers=worker_count,
-                mp_context=context,
-            ) as executor:
-                futures = {
-                    executor.submit(
-                        analyze_sample_worker,
-                        config,
-                        spec,
-                        args.max_events,
-                        args.log_level,
-                        collect_common_events,
-                    ): spec.name
-                    for spec in config.samples
-                }
-                for future in concurrent.futures.as_completed(futures):
-                    name = futures[future]
-                    by_name[name] = future.result()
-                    logging.info("Collected completed sample %s", name)
-            cut_results = [by_name[spec.name] for spec in config.samples]
 
         checkpoint_created = False
         if preloaded_results is None and checkpoint_results is None:
@@ -6731,6 +7228,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "partial": partial,
             "max_events_per_sample": effective_max_events,
             "workers": worker_count,
+            "event_shards_per_sample": effective_event_shards,
+            "event_sharding": event_sharding_metadata,
             "analyses": list(analyses),
             "configuration_hash": config_digest(payload),
             "configuration": payload,

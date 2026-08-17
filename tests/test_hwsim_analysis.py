@@ -372,6 +372,250 @@ class PullAndWeightTests(unittest.TestCase):
 
 
 class RunManagementTests(unittest.TestCase):
+    def test_event_shards_cover_multifile_prefix_without_overlap(self):
+        files = (
+            {"entries": 3},
+            {"entries": 5},
+            {"entries": 2},
+        )
+        shards = analysis.build_sample_shards(files, max_events=7, requested_shards=3)
+        self.assertEqual(
+            [(shard.global_start, shard.global_stop) for shard in shards],
+            [(0, 2), (2, 4), (4, 7)],
+        )
+        self.assertEqual(
+            [
+                [
+                    (event_range.source_file_index, event_range.start, event_range.stop)
+                    for event_range in shard.ranges
+                ]
+                for shard in shards
+            ],
+            [[(0, 0, 2)], [(0, 2, 3), (1, 0, 1)], [(1, 1, 4)]],
+        )
+        self.assertEqual(sum(shard.event_count for shard in shards), 7)
+
+    def test_shard_merge_matches_monolithic_weighted_result_and_event_order(self):
+        spec = analysis.SampleSpec(
+            "VBFH",
+            "higgs",
+            ("first.root", "second.root"),
+            1.0,
+            "VBF H",
+            "#275DAD",
+            0,
+            "signal",
+        )
+        files = [
+            {"path": "first.root", "entries": 3, "sumw": 4.0},
+            {"path": "second.root", "entries": 3, "sumw": 5.0},
+        ]
+        weights = (1.0, 2.0, 1.0, 2.0, 1.0, 2.0)
+        identities = ((0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2))
+        observable_keys = analysis.common_observable_keys("higgs")
+
+        def make_result(indices):
+            result = analysis.initialize_result(spec, 6, 9.0)
+            common_weights = []
+            common_observables = []
+            common_pulls = []
+            source_files = []
+            source_entries = []
+            for index in indices:
+                weight = weights[index]
+                angle = 0.1 + 0.35 * index
+                pull = analysis.PullVector(
+                    0.01 * math.cos(angle),
+                    0.01 * math.sin(angle),
+                    0.01 * math.cos(angle),
+                    0.01,
+                    angle,
+                    False,
+                )
+                result.processed_entries += 1
+                result.processed_sumw += weight
+                for step in analysis.cutflow_steps("higgs"):
+                    result.cutflow[step].fill(weight)
+                analysis.fill_pull_histograms(result, (pull, pull), weight)
+                common_weights.append(weight)
+                common_observables.append(
+                    [float(index + offset) for offset in range(len(observable_keys))]
+                )
+                pull_values = [
+                    pull.t_beam,
+                    pull.t_phi,
+                    pull.magnitude,
+                    pull.signed_angle,
+                    float(pull.zero_magnitude),
+                ]
+                common_pulls.append([pull_values, pull_values])
+                source_files.append(identities[index][0])
+                source_entries.append(identities[index][1])
+            result.common_events = analysis.CommonEventTable(
+                observable_keys=observable_keys,
+                weights=np.asarray(common_weights, dtype=np.float64),
+                observables=np.asarray(common_observables, dtype=np.float64).reshape(
+                    len(indices), len(observable_keys)
+                ),
+                pulls=np.asarray(common_pulls, dtype=np.float64).reshape(
+                    len(indices), 2, len(analysis.PULL_VALUE_NAMES)
+                ),
+                source_file_indices=np.asarray(source_files, dtype=np.int32),
+                source_entries=np.asarray(source_entries, dtype=np.int64),
+            )
+            return result
+
+        shards = analysis.build_sample_shards(files, None, 2)
+        shard_results = [
+            (shards[0], make_result(range(0, 3))),
+            (shards[1], make_result(range(3, 6))),
+        ]
+        merged = analysis.merge_sample_shard_results(
+            spec, 6, 9.0, files, shard_results
+        )
+        monolithic = make_result(range(6))
+        monolithic.files = files
+        self.assertEqual(merged.processed_entries, monolithic.processed_entries)
+        self.assertEqual(merged.processed_sumw, monolithic.processed_sumw)
+        for step in analysis.cutflow_steps("higgs"):
+            self.assertEqual(
+                analysis.asdict(merged.cutflow[step]),
+                analysis.asdict(monolithic.cutflow[step]),
+            )
+        for key in merged.histograms:
+            np.testing.assert_allclose(
+                merged.histograms[key].sumw, monolithic.histograms[key].sumw
+            )
+            np.testing.assert_allclose(
+                merged.histograms[key].sumw2, monolithic.histograms[key].sumw2
+            )
+            self.assertEqual(
+                merged.histograms[key].entries, monolithic.histograms[key].entries
+            )
+        for key in analysis.PULL_OBSERVABLE_KEYS:
+            np.testing.assert_allclose(
+                merged.pull_observable_moments[key].event_second_sumw,
+                monolithic.pull_observable_moments[key].event_second_sumw,
+            )
+            np.testing.assert_allclose(
+                merged.pull_observable_moments[key].mc_second_sumw2,
+                monolithic.pull_observable_moments[key].mc_second_sumw2,
+            )
+        np.testing.assert_allclose(
+            merged.common_events.observables,
+            monolithic.common_events.observables,
+        )
+        np.testing.assert_array_equal(
+            merged.common_events.source_file_indices,
+            monolithic.common_events.source_file_indices,
+        )
+        np.testing.assert_array_equal(
+            merged.common_events.source_entries,
+            monolithic.common_events.source_entries,
+        )
+        self.assertEqual(
+            analysis.result_summary(merged, (300.0,))["pull"]["f_beam"],
+            analysis.result_summary(monolithic, (300.0,))["pull"]["f_beam"],
+        )
+
+    def test_sample_shard_event_loop_reads_only_assigned_entry_range(self):
+        class FakeTree:
+            def __init__(self):
+                self.evweight = 0.0
+                self.numparticles = 1
+                self.objects = np.zeros((8, 1), dtype=np.float64)
+                self.objects[0, 0] = 1.0
+                self.objects[4, 0] = 211.0
+
+            def GetEntries(self):
+                return 10
+
+            def SetBranchStatus(self, *_):
+                return None
+
+            def GetEntry(self, entry):
+                self.evweight = float(entry + 1)
+                return 1
+
+        class FakeFile:
+            def __init__(self):
+                self.tree = FakeTree()
+
+            def IsZombie(self):
+                return False
+
+            def Get(self, _):
+                return self.tree
+
+            def Close(self):
+                return None
+
+        class FakeTFile:
+            @staticmethod
+            def Open(*_):
+                return FakeFile()
+
+        class FakeROOT:
+            TFile = FakeTFile
+
+        class FakeFastjet:
+            antikt_algorithm = object()
+
+            @staticmethod
+            def JetDefinition(*_):
+                return object()
+
+        spec = analysis.SampleSpec(
+            "VBFH", "higgs", ("unused.root",), 1.0, "VBF H", "#000000", 0
+        )
+        config = analysis.AnalysisConfig("Data", (300.0,), (spec,), "synthetic.json")
+        shard = analysis.SampleShard(
+            index=1,
+            shard_count=3,
+            global_start=3,
+            global_stop=7,
+            ranges=(analysis.EventRange(0, 3, 7),),
+        )
+        result = analysis.analyze_sample_shard(
+            FakeROOT,
+            FakeFastjet,
+            config,
+            spec,
+            total_entries=10,
+            generated_sumw=55.0,
+            file_metadata=({"path": "unused.root", "entries": 10, "sumw": 55.0},),
+            shard=shard,
+            collect_common_events=True,
+        )
+        self.assertEqual(result.processed_entries, 4)
+        self.assertEqual(result.processed_sumw, 22.0)
+        self.assertEqual(result.cutflow["all_events"].raw_count, 4)
+        self.assertEqual(result.cutflow["all_events"].sumw, 22.0)
+        self.assertEqual(len(result.common_events), 0)
+
+    def test_event_shard_cli_validation_and_provenance(self):
+        parsed = analysis.parse_arguments(
+            ["--samples", "samples.json", "--event-shards", "8", "--workers", "12"]
+        )
+        self.assertEqual(parsed.event_shards, 8)
+        self.assertEqual(parsed.workers, 12)
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            analysis.parse_arguments(
+                ["--resume-incomplete", ".incomplete-run", "--event-shards", "2"]
+            )
+        spec = analysis.SampleSpec(
+            "VBFH", "higgs", ("unused.root",), 1.0, "VBF H", "#000000", 0
+        )
+        config = analysis.AnalysisConfig("Data", (300.0,), (spec,), "synthetic.json")
+        payload = analysis.resolved_config_payload(
+            config, None, ("cutbased",), None, event_shards_per_sample=8
+        )
+        self.assertEqual(payload["event_processing"]["event_shards_per_sample"], 8)
+        self.assertEqual(
+            payload["event_processing"]["partition"],
+            "contiguous_global_entry_ranges",
+        )
+
     def test_physics_legend_is_opaque_and_inside_data_axes(self):
         os.environ.setdefault(
             "MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "pullpheno-matplotlib-tests")

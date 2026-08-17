@@ -201,8 +201,31 @@ For a non-physical smoke test, use `--max-events N`.  Such output is visibly
 marked as partial and retains the full generated sum of weights in its
 normalisation metadata.  The default luminosities are $300$ and
 $3000\,\mathrm{fb}^{-1}$; they may be replaced with
-`--luminosities L1 L2 ...`.  `--workers N` processes independent samples in
-separate processes; one worker remains the conservative default.
+`--luminosities L1 L2 ...`.  `--workers N` sets the maximum number of ROOT
+event-range processes; one worker remains the conservative default.
+
+Large samples can be divided into deterministic contiguous entry ranges with
+`--event-shards S`.  Shards retain the original manifest file/entry identity
+and are merged in global event order, so generated `sumw`, weighted cutflows,
+histogram `sumw2`, same-event pull covariances and XGBoost fold assignments are
+unchanged apart from floating-point reduction order.  For example:
+
+```bash
+.venv-odysseus/bin/python HwSimPythonAnalysis.py \
+  --samples <manifest.json> \
+  --analyses cutbased xgboost \
+  --event-shards 8 \
+  --workers 8 \
+  --output-root /data/Projects/PullPheno/analysis-results \
+  --run-name <name>
+```
+
+Every sample receives up to eight shards in this example.  Jobs are scheduled
+largest-first, so the ranges of a dominant sample such as QCDZjj occupy the
+worker pool before small samples.  Reading many ranges from one rotating disk
+can limit the speedup; staging the input ROOT files on NVMe is recommended for
+production sharded runs.  The complete shard plan and effective worker counts
+are recorded in `run.json`.
 
 Every invocation creates a new immutable directory beneath `results/runs/`.
 The run identifier contains a UTC timestamp, the optional run name and a hash

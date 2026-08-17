@@ -1186,7 +1186,25 @@ class RunManagementTests(unittest.TestCase):
             self.assertTrue((completed[0] / "summaries" / "comparison.csv").is_file())
             self.assertTrue((completed[0] / "summaries" / "comparison.npz").is_file())
             plots = json.loads((completed[0] / "summaries" / "plots.json").read_text())
-            self.assertEqual(len(plots), 20)
+            self.assertEqual(len(plots), 22)
+            stack_overlays = [
+                record
+                for record in plots
+                if record["kind"] == "reference-stack-plus-total"
+            ]
+            self.assertEqual(len(stack_overlays), 2)
+            self.assertEqual(
+                {record["channel"] for record in stack_overlays}, {"higgs", "z"}
+            )
+            self.assertTrue(
+                all(
+                    record["observable"] == "folded_pull_angle"
+                    and record["uncertainty"] == "mc-stat"
+                    and (completed[0] / record["png"]).is_file()
+                    and (completed[0] / record["pdf"]).is_file()
+                    for record in stack_overlays
+                )
+            )
             analysis.validate_html_links(completed[0] / "index.html")
             catalog = json.loads((output_root / "runs.json").read_text())
             self.assertEqual(catalog[0]["run_type"], "comparison")

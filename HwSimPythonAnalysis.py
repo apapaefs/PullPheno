@@ -5370,7 +5370,7 @@ def generate_comparison_plots(
     luminosities: Sequence[float],
     numerical: Mapping[Tuple[str, str, float, str, str], Mapping[str, np.ndarray]],
 ) -> List[Dict[str, Any]]:
-    """Draw non-stacked total pull predictions with data- or MC-stat errors."""
+    """Draw total comparisons and nominal-stack overlays for pull predictions."""
     matplotlib_config = Path(tempfile.gettempdir()) / "pullpheno-matplotlib"
     matplotlib_config.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("MPLCONFIGDIR", str(matplotlib_config))
@@ -5387,6 +5387,214 @@ def generate_comparison_plots(
     for strategy in analyses:
         for channel in ("higgs", "z"):
             for luminosity in luminosities:
+                folded_spec = registry[(channel, "folded_pull_angle")]
+                reference_folded = numerical[
+                    (
+                        strategy,
+                        channel,
+                        float(luminosity),
+                        "folded_pull_angle",
+                        reference_id,
+                    )
+                ]
+                folded_edges = np.asarray(reference_folded["edges"], dtype=np.float64)
+                folded_centers = 0.5 * (folded_edges[:-1] + folded_edges[1:])
+                folded_widths = np.diff(folded_edges)
+                relative_base = (
+                    Path("plots")
+                    / "comparison"
+                    / strategy
+                    / "yields"
+                    / _format_luminosity(luminosity)
+                    / channel
+                    / "reference-stack"
+                    / "folded_pull_angle"
+                )
+                for extension in ("png", "pdf"):
+                    candidate = str(relative_base.with_suffix(f".{extension}"))
+                    if candidate in planned_paths:
+                        raise RuntimeError(
+                            f"Duplicate comparison plot path: {candidate}"
+                        )
+                    planned_paths.add(candidate)
+
+                figure, axis = plt.subplots(figsize=(7.2, 5.2))
+                reference_results = sorted(
+                    (
+                        result
+                        for result in sources[0].results
+                        if result.strategy == strategy
+                        and result.spec.channel == channel
+                    ),
+                    key=lambda result: result.spec.stack_order,
+                )
+                if not reference_results:
+                    raise ValueError(
+                        f"Reference run has no {channel} {strategy} process results"
+                    )
+                stack_total = np.zeros(len(folded_edges) - 1, dtype=np.float64)
+                for result in reference_results:
+                    histogram = result.histograms["folded_pull_angle"]
+                    if not np.array_equal(histogram.edges, folded_edges):
+                        raise ValueError(
+                            f"Reference folded-angle binning differs for {result.spec.name}"
+                        )
+                    factor = normalization_factor(
+                        luminosity,
+                        result.spec.cross_section_pb,
+                        result.generated_sumw,
+                    )
+                    process_values = factor * histogram.sumw
+                    axis.bar(
+                        folded_edges[:-1],
+                        process_values,
+                        width=folded_widths,
+                        align="edge",
+                        bottom=stack_total,
+                        color=result.spec.color,
+                        edgecolor="none",
+                        linewidth=0.0,
+                        label=result.spec.label,
+                        zorder=2,
+                    )
+                    stack_total += process_values
+
+                reference_total = np.asarray(
+                    reference_folded["yield"], dtype=np.float64
+                )
+                if not np.allclose(
+                    stack_total,
+                    reference_total,
+                    rtol=1.0e-11,
+                    atol=1.0e-8,
+                ):
+                    raise RuntimeError(
+                        f"Reference stack does not close to the total {channel} "
+                        f"{strategy} folded-angle prediction"
+                    )
+                reference_mc_covariance = np.asarray(
+                    reference_folded["mc_covariance"], dtype=np.float64
+                )
+                reference_mc_error = np.sqrt(
+                    np.maximum(np.diag(reference_mc_covariance), 0.0)
+                )
+                axis.fill_between(
+                    folded_edges,
+                    _step_values(reference_total - reference_mc_error),
+                    _step_values(reference_total + reference_mc_error),
+                    step="post",
+                    color="#20242b",
+                    alpha=0.18,
+                    linewidth=0.0,
+                    label=(
+                        f"{sources[0].scenario.label} total MC statistical uncertainty"
+                    ),
+                    zorder=5,
+                )
+
+                variations = sources[1:]
+                for variation_index, source in enumerate(variations):
+                    scenario_id = source.scenario.identifier
+                    statistics = numerical[
+                        (
+                            strategy,
+                            channel,
+                            float(luminosity),
+                            "folded_pull_angle",
+                            scenario_id,
+                        )
+                    ]
+                    values = np.asarray(statistics["yield"], dtype=np.float64)
+                    covariance = np.asarray(
+                        statistics["mc_covariance"], dtype=np.float64
+                    )
+                    errors = np.sqrt(np.maximum(np.diag(covariance), 0.0))
+                    offset_fraction = (
+                        variation_index - 0.5 * (len(variations) - 1)
+                    ) * min(0.12, 0.55 / max(len(variations), 1))
+                    shifted_centers = folded_centers + offset_fraction * folded_widths
+                    color = str(source.scenario.color)
+                    marker = COMPARISON_MARKERS[
+                        (variation_index + 1) % len(COMPARISON_MARKERS)
+                    ]
+                    axis.errorbar(
+                        shifted_centers,
+                        values,
+                        yerr=errors,
+                        fmt=marker,
+                        linestyle="none",
+                        markersize=5.2,
+                        markerfacecolor="white",
+                        markeredgecolor=color,
+                        markeredgewidth=1.35,
+                        capsize=2.6,
+                        elinewidth=1.15,
+                        color=color,
+                        label=f"{source.scenario.label} total (MC stat.)",
+                        zorder=12,
+                    )
+
+                display_title = folded_spec.title + (
+                    " · XGBoost selection" if strategy == "xgboost" else ""
+                )
+                axis.set_xlim(folded_edges[0], folded_edges[-1])
+                axis.set_ylim(bottom=0.0)
+                axis.set_xlabel(folded_spec.xlabel)
+                axis.set_ylabel(
+                    rf"Expected events / bin at {luminosity:g} fb$^{{-1}}$"
+                )
+                axis.set_title(
+                    display_title, loc="left", pad=34, fontweight="semibold"
+                )
+                subtitle = (
+                    f"Particle level · {sources[0].scenario.label} processes stacked · "
+                    "CR totals as points"
+                )
+                if bool(sources[0].metadata.get("partial")):
+                    subtitle += " · PARTIAL RUN"
+                axis.text(
+                    1.0,
+                    1.015,
+                    subtitle,
+                    transform=axis.transAxes,
+                    fontsize=8.8,
+                    color="#555b66",
+                    ha="right",
+                )
+                formatter = ScalarFormatter(useMathText=True)
+                formatter.set_scientific(True)
+                formatter.set_powerlimits((-4, 4))
+                formatter.set_useOffset(False)
+                axis.yaxis.set_major_formatter(formatter)
+                axis.yaxis.get_offset_text().set_x(-0.08)
+                axis.yaxis.get_offset_text().set_y(1.01)
+                axis.grid(False)
+                _place_plot_legend(axis)
+                figure.tight_layout()
+                png_path = run_dir / relative_base.with_suffix(".png")
+                pdf_path = run_dir / relative_base.with_suffix(".pdf")
+                _save_figure_exclusive(
+                    figure, png_path, dpi=170, bbox_inches="tight"
+                )
+                _save_figure_exclusive(figure, pdf_path, bbox_inches="tight")
+                plt.close(figure)
+                records.append(
+                    {
+                        "strategy": strategy,
+                        "observable": "folded_pull_angle",
+                        "title": (
+                            f"{display_title} · reference process stack + CR totals"
+                        ),
+                        "channel": channel,
+                        "stage": "comparison",
+                        "kind": "reference-stack-plus-total",
+                        "uncertainty": "mc-stat",
+                        "luminosity_fb": luminosity,
+                        "png": png_path.relative_to(run_dir).as_posix(),
+                        "pdf": pdf_path.relative_to(run_dir).as_posix(),
+                    }
+                )
+
                 for observable in PULL_OBSERVABLE_KEYS:
                     plot_spec = registry[(channel, observable)]
                     reference = numerical[
@@ -6388,11 +6596,11 @@ def generate_comparison_index(
 *{{box-sizing:border-box}}body{{margin:0;background:var(--wash);color:var(--ink);font:15px/1.5 Inter,system-ui,sans-serif}}a{{color:var(--accent);text-decoration:none}}a:hover{{text-decoration:underline}}header{{padding:3rem max(1rem,calc((100vw - 1280px)/2));background:linear-gradient(125deg,#12213c,#244b78 62%,#11776d);color:white}}header p{{color:#dce9f8}}h1{{font-size:clamp(2rem,5vw,3.7rem);margin:.3rem 0}}main{{max-width:1320px;margin:auto;padding:1.5rem}}section{{margin:1.2rem 0}}.panel,.plot-card{{background:white;border:1px solid var(--line);border-radius:14px;box-shadow:0 5px 18px #2435510c}}.panel{{padding:1rem}}.table-wrap{{overflow:auto}}table{{border-collapse:collapse;width:100%;font-size:.87rem}}th,td{{padding:.5rem .65rem;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}}th:first-child,td:first-child{{text-align:left}}.swatch{{display:inline-block;width:.75rem;height:.75rem;border-radius:50%;margin-right:.4rem}}.controls{{display:grid;grid-template-columns:repeat(5,minmax(130px,1fr));gap:.7rem;position:sticky;top:0;z-index:2;background:#f3f6faed;backdrop-filter:blur(8px);padding:.8rem 0}}label{{font-size:.78rem;color:var(--muted);font-weight:700}}select,input{{display:block;width:100%;margin-top:.2rem;padding:.5rem;border:1px solid #bfc8d5;border-radius:8px;background:white}}.gallery{{display:grid;grid-template-columns:repeat(auto-fit,minmax(315px,1fr));gap:1rem}}.plot-card{{overflow:hidden}}.plot-card[hidden]{{display:none}}.thumb-link{{display:block;aspect-ratio:1.25;background:white;overflow:hidden}}.thumb-link img{{width:100%;height:100%;object-fit:contain}}.plot-copy{{padding:.85rem}}.plot-copy h3{{font-size:1rem;margin:.45rem 0}}.badges{{display:flex;gap:.35rem;flex-wrap:wrap}}.badges span{{font-size:.68rem;text-transform:uppercase;font-weight:750;border-radius:999px;padding:.18rem .45rem;background:#e7eef8;color:#274b79}}code{{overflow-wrap:anywhere}}footer{{padding:2.5rem;text-align:center;color:var(--muted)}}@media(max-width:760px){{.controls{{grid-template-columns:1fr 1fr;position:static}}}}
 </style></head><body><header><div>PullPheno particle-level analysis</div>
 <h1>Independent CR scenarios</h1><p><strong>Comparison run:</strong> {html.escape(str(run_metadata['run_id']))}<br>
-Each point is the total prediction from one complete, independently generated scenario. All process samples, including backgrounds, are scenario-specific; no background sample is shared. The first run fixes the process cross sections and is the ratio reference.</p></header><main>
+In total-scenario plots, each point is the complete prediction from one independently generated scenario. Folded-angle stack overlays instead retain the first run's process stack and draw every CR variation only as total-yield error bars. All process samples, including backgrounds, are scenario-specific; no background sample is shared. The first run fixes the process cross sections and is the ratio reference.</p></header><main>
 <section class="panel"><h2>Source runs</h2><div class="table-wrap"><table><thead><tr><th>Role</th><th>Scenario</th><th>Parameters</th><th>Immutable source</th></tr></thead><tbody>{''.join(source_rows)}</tbody></table></div><h3>Common reference cross sections</h3><p>Every scenario uses the first run's final-state cross sections; scenario-specific efficiencies and generated sums of weights remain independent.</p><div class="table-wrap"><table><thead><tr><th>Process</th><th>Cross section [pb]</th></tr></thead><tbody>{cross_section_rows}</tbody></table></div></section>
 <section class="panel"><h2>Folded-angle numerical comparison</h2><p>Directional f<sub>beam</sub> values retain their signs. Six-bin D² values are Mahalanobis distances in the supported covariance subspace; √D² is not labelled as a one-dimensional Gaussian significance.</p><div class="table-wrap"><table><thead><tr><th>Analysis</th><th>Channel</th><th>Variation</th><th>fb⁻¹</th><th>f<sub>beam</sub> ref.</th><th>f<sub>beam</sub> var.</th><th>Δf<sub>beam</sub></th><th>Z (ref. truth)</th><th>Z (var. truth)</th><th>D² (ref. truth)</th></tr></thead><tbody>{''.join(summary_rows)}</tbody></table></div><p><a href="summaries/comparison.json">JSON</a> · <a href="summaries/comparison.csv">CSV</a> · <a href="summaries/comparison.npz">NPZ arrays and covariances</a></p></section>
 {score_pull_html}
-<section><h2>Total pull-observable plots and diagnostics</h2><div class="controls">
+<section><h2>Pull-observable comparisons, reference stacks and diagnostics</h2><div class="controls">
 <label>Analysis<select id="strategy"><option value="all">All</option>{''.join(f'<option value="{name}">{name}</option>' for name in analyses)}</select></label>
 <label>Channel<select id="channel"><option value="all">All</option><option value="higgs">Higgs</option><option value="z">Z</option></select></label>
 <label>Plot type<select id="kind"><option value="all">All</option>{''.join(f'<option value="{html.escape(name)}">{html.escape(name)}</option>' for name in kinds)}</select></label>

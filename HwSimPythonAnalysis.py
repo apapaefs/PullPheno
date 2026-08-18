@@ -3085,6 +3085,16 @@ def build_xgboost_results(
         roles = {result.spec.role for result in channel_results}
         if roles != {"signal", "background"}:
             raise ValueError(f"Channel {channel} requires both signal and background roles")
+        channel_event_count = sum(
+            len(result.common_events or ()) for result in channel_results
+        )
+        logging.info(
+            "Starting XGBoost %s channel with %d common-selected events across %d samples (%s)",
+            channel,
+            channel_event_count,
+            len(channel_results),
+            "nominal five-fold training" if source_metadata is None else "frozen-model application",
+        )
         channel_source = source_metadata["channels"][channel] if source_metadata is not None else None
         source_models = list(channel_source.get("models", ())) if channel_source is not None else []
         if source_models:
@@ -3184,6 +3194,15 @@ def build_xgboost_results(
                 balanced_weights, balance = xgbtools.balanced_training_weights(
                     train_physical_w, train_y
                 )
+                logging.info(
+                    "Training XGBoost %s fold %d/%d (train=%d, validation=%d, application=%d)",
+                    channel,
+                    fold + 1,
+                    xgbtools.CROSS_FIT_FOLDS,
+                    len(train_x),
+                    len(validation_x),
+                    len(test_x),
+                )
                 classifier = xgbtools.train_classifier(train_x, train_y, balanced_weights)
                 train_scores = xgbtools.signal_scores(classifier, train_x)
                 validation_scores = xgbtools.signal_scores(classifier, validation_x)
@@ -3235,6 +3254,14 @@ def build_xgboost_results(
                 validation_diagnostic_parts.append(
                     (validation_scores, validation_y, validation_physical_w)
                 )
+                logging.info(
+                    "Completed XGBoost %s fold %d/%d (score cut=%.8g, validation S/sqrt(S+B)=%.8g)",
+                    channel,
+                    fold + 1,
+                    xgbtools.CROSS_FIT_FOLDS,
+                    optimum.threshold,
+                    optimum.significance,
+                )
             application_scope = "five_fold_out_of_fold_all_events"
             validation_signal = float(
                 np.mean([optimum.signal_weight for optimum in fold_optima], dtype=np.float64)
@@ -3265,6 +3292,12 @@ def build_xgboost_results(
                 )
             for fold in range(xgbtools.CROSS_FIT_FOLDS):
                 source_record = by_fold[fold]
+                logging.info(
+                    "Applying frozen XGBoost %s fold %d/%d",
+                    channel,
+                    fold + 1,
+                    xgbtools.CROSS_FIT_FOLDS,
+                )
                 classifier = xgbtools.load_classifier(
                     model_run.resolve() / str(source_record["model_path"])
                 )
@@ -3303,6 +3336,14 @@ def build_xgboost_results(
                         "model_sha256": model_hash,
                         "reload_predictions_identical": reload_identical,
                     }
+                )
+                logging.info(
+                    "Completed frozen XGBoost %s fold %d/%d (application=%d, score cut=%.8g)",
+                    channel,
+                    fold + 1,
+                    xgbtools.CROSS_FIT_FOLDS,
+                    len(test_x),
+                    threshold,
                 )
             training_balances = [
                 dict(values.get("training_balance", {})) for values in model_records
@@ -3549,6 +3590,13 @@ def build_xgboost_results(
             "feature_importance": feature_importance,
             "splits": diagnostic_splits,
         }
+        logging.info(
+            "Completed XGBoost %s channel (AUC=%.8g, selected signal=%.8g pb, selected background=%.8g pb)",
+            channel,
+            auc,
+            signal_selected,
+            background_selected,
+        )
     return xgboost_results, metadata, diagnostics
 
 
@@ -6709,6 +6757,65 @@ def update_top_level_catalog(output_root: Path) -> Tuple[Path, Path]:
     return top_index, runs_json
 
 
+def reduction_roundoff_tolerance(
+    reference: float,
+    term_count: int,
+    additions_per_term: int = 1,
+    relative_floor: float = 1.0e-12,
+    absolute_floor: float = 1.0e-10,
+) -> float:
+    """Bound harmless differences between positive floating-point reductions.
+
+    ROOT shards, the full XGBoost application loop and joint score-pull bins
+    reduce the same positive event weights in different orders. A fixed
+    relative tolerance eventually rejects valid closures as the event count
+    grows. The standard ``gamma_n`` summation bound scales with the number of
+    additions, while the explicit floors retain the historical tolerance for
+    small samples.
+    """
+    value = float(reference)
+    terms = int(term_count)
+    multiplicity = int(additions_per_term)
+    if not math.isfinite(value):
+        raise ValueError("Roundoff reference must be finite")
+    if terms < 0 or multiplicity <= 0:
+        raise ValueError("Roundoff term counts must be non-negative and positive")
+    operation_count = max(1, terms * multiplicity)
+    accumulated_epsilon = operation_count * np.finfo(np.float64).eps
+    if accumulated_epsilon >= 1.0:
+        raise ValueError("Too many floating-point additions for a finite gamma_n bound")
+    gamma_n = accumulated_epsilon / (1.0 - accumulated_epsilon)
+    scale = abs(value)
+    return max(
+        float(absolute_floor),
+        float(relative_floor) * scale,
+        4.0 * gamma_n * scale,
+    )
+
+
+def reductions_close(
+    first: float,
+    second: float,
+    term_count: int,
+    additions_per_term: int = 1,
+    relative_floor: float = 1.0e-12,
+    absolute_floor: float = 1.0e-10,
+) -> bool:
+    """Compare two positive reductions with an event-count-aware tolerance."""
+    left = float(first)
+    right = float(second)
+    if not math.isfinite(left) or not math.isfinite(right):
+        return False
+    tolerance = reduction_roundoff_tolerance(
+        max(abs(left), abs(right)),
+        term_count,
+        additions_per_term,
+        relative_floor,
+        absolute_floor,
+    )
+    return abs(left - right) <= tolerance
+
+
 def validate_results(results: Sequence[SampleResult], partial: bool) -> Dict[str, Any]:
     checks: List[Dict[str, Any]] = []
     failures = []
@@ -6837,14 +6944,28 @@ def validate_results(results: Sequence[SampleResult], partial: bool) -> Dict[str
             application = result.cutflow["xgboost_application_sample"]
             full_xgboost_application = (
                 common.raw_count == application.raw_count
-                and math.isclose(common.sumw, application.sumw, rel_tol=1.0e-12, abs_tol=1.0e-10)
-                and math.isclose(common.sumw2, application.sumw2, rel_tol=1.0e-12, abs_tol=1.0e-10)
+                and reductions_close(common.sumw, application.sumw, common.raw_count)
+                and reductions_close(common.sumw2, application.sumw2, common.raw_count)
             )
             if result.score_pull_moments is not None:
                 joint = result.score_pull_moments
-                joint_tolerance = max(1.0e-10, 1.0e-10 * abs(application.sumw))
-                joint_sumw2_tolerance = max(
-                    1.0e-10, 1.0e-10 * abs(application.sumw2)
+                joint_bin_tolerance = reduction_roundoff_tolerance(
+                    application.sumw,
+                    joint.event_count,
+                    additions_per_term=2,
+                    relative_floor=1.0e-10,
+                )
+                joint_event_tolerance = reduction_roundoff_tolerance(
+                    application.sumw,
+                    joint.event_count,
+                    additions_per_term=4,
+                    relative_floor=1.0e-10,
+                )
+                joint_sumw2_tolerance = reduction_roundoff_tolerance(
+                    application.sumw2,
+                    joint.event_count,
+                    additions_per_term=4,
+                    relative_floor=1.0e-10,
                 )
                 score_pull_moments_valid = (
                     result.score_pull_moment_model == SCORE_PULL_MOMENT_MODEL
@@ -6858,7 +6979,7 @@ def validate_results(results: Sequence[SampleResult], partial: bool) -> Dict[str
                         joint.event_second_sumw,
                         joint.event_second_sumw.T,
                         rtol=0.0,
-                        atol=joint_tolerance,
+                        atol=joint_event_tolerance,
                     )
                     and np.allclose(
                         joint.mc_second_sumw2,
@@ -6869,19 +6990,19 @@ def validate_results(results: Sequence[SampleResult], partial: bool) -> Dict[str
                     and math.isclose(
                         float(np.sum(joint.bin_sumw, dtype=np.float64)),
                         application.sumw,
-                        rel_tol=1.0e-10,
-                        abs_tol=joint_tolerance,
+                        rel_tol=0.0,
+                        abs_tol=joint_bin_tolerance,
                     )
                     and math.isclose(
                         float(np.sum(joint.event_second_sumw, dtype=np.float64)),
                         application.sumw,
-                        rel_tol=1.0e-10,
-                        abs_tol=joint_tolerance,
+                        rel_tol=0.0,
+                        abs_tol=joint_event_tolerance,
                     )
                     and math.isclose(
                         float(np.sum(joint.mc_second_sumw2, dtype=np.float64)),
                         application.sumw2,
-                        rel_tol=1.0e-10,
+                        rel_tol=0.0,
                         abs_tol=joint_sumw2_tolerance,
                     )
                 )

@@ -1342,6 +1342,28 @@ class XGBoostHelperTests(unittest.TestCase):
         self.assertEqual(selected.cutflow["xgboost_score"].raw_count, 1)
         self.assertEqual(selected.cutflow["xgboost_score"].sumw, 1.0)
 
+    def test_large_sharded_weight_reductions_allow_only_roundoff_scale_drift(self):
+        common_sumw = 410016.3649312152
+        sequential_sumw = 410016.36495686654
+        common_sumw2 = 27974.748970358647
+        sequential_sumw2 = 27974.748973052174
+        event_count = 6086046
+
+        self.assertTrue(
+            analysis.reductions_close(common_sumw, sequential_sumw, event_count)
+        )
+        self.assertTrue(
+            analysis.reductions_close(common_sumw2, sequential_sumw2, event_count)
+        )
+        typical_event_weight = common_sumw / event_count
+        self.assertFalse(
+            analysis.reductions_close(
+                common_sumw,
+                sequential_sumw + typical_event_weight,
+                event_count,
+            )
+        )
+
     def test_crossfit_build_scores_every_nominal_event_once(self):
         class FakeBooster:
             def get_score(self, importance_type="gain"):

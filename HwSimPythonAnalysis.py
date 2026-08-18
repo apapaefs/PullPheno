@@ -39,7 +39,7 @@ import numpy as np
 import xgboost_root_varfiles_module as xgbtools
 
 
-ANALYSIS_VERSION = "2.4.0"
+ANALYSIS_VERSION = "2.5.0"
 ROOT_PASS_CHECKPOINT_VERSION = 1
 ROOT_PASS_CHECKPOINT_RELATIVE = Path("checkpoints") / "root-pass"
 RUN_LOG_NAME = "run.log"
@@ -721,13 +721,28 @@ def normalized_fraction_covariance(
     covariance = np.asarray(unnormalized_covariance, dtype=np.float64)
     if values.shape != (PULL_BIN_COUNT,) or covariance.shape != (PULL_BIN_COUNT, PULL_BIN_COUNT):
         raise ValueError("Unexpected R_i moment dimensions")
+    _, result = normalized_binned_prediction(values, covariance)
+    return result
+
+
+def normalized_binned_prediction(
+    bin_sums: np.ndarray,
+    unnormalized_covariance: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return unit-area bin fractions and their delta-method covariance."""
+    values = np.asarray(bin_sums, dtype=np.float64)
+    covariance = np.asarray(unnormalized_covariance, dtype=np.float64)
+    if values.ndim != 1 or covariance.shape != (len(values), len(values)):
+        raise ValueError("Histogram values and covariance dimensions differ")
+    if not np.all(np.isfinite(values)) or not np.all(np.isfinite(covariance)):
+        raise ValueError("Histogram normalization inputs must be finite")
     total = float(np.sum(values, dtype=np.float64))
     if total <= 0.0 or not math.isfinite(total):
-        raise ValueError("R_i normalization must be finite and positive")
+        raise ValueError("Histogram normalization must be finite and positive")
     fractions = values / total
-    jacobian = (np.eye(PULL_BIN_COUNT) - fractions[:, None]) / total
+    jacobian = (np.eye(len(values), dtype=np.float64) - fractions[:, None]) / total
     result = jacobian @ covariance @ jacobian.T
-    return 0.5 * (result + result.T)
+    return fractions, 0.5 * (result + result.T)
 
 
 def differential_pull_statistics(
@@ -4005,6 +4020,96 @@ def propagated_independent_ratio_errors(
     return ratios, errors
 
 
+def chi_square_log_survival(d_squared: float, degrees_of_freedom: int) -> float:
+    """Return log P(chi2_k >= D2) without requiring SciPy.
+
+    The regularized upper incomplete gamma function is evaluated with a series
+    for its complement at small arguments and a continued fraction otherwise.
+    Returning the logarithm keeps extremely small expected p-values usable.
+    """
+    value = float(d_squared)
+    dof = int(degrees_of_freedom)
+    if dof < 1:
+        raise ValueError("Chi-square degrees of freedom must be positive")
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError("Chi-square statistic must be finite and non-negative")
+    if value == 0.0:
+        return 0.0
+    shape = 0.5 * dof
+    argument = 0.5 * value
+    epsilon = 3.0e-14
+    max_iterations = 10000
+
+    if argument < shape + 1.0:
+        current_shape = shape
+        term = 1.0 / shape
+        total = term
+        for _ in range(max_iterations):
+            current_shape += 1.0
+            term *= argument / current_shape
+            total += term
+            if abs(term) <= abs(total) * epsilon:
+                break
+        else:
+            raise RuntimeError("Chi-square lower-gamma series did not converge")
+        log_lower = (
+            -argument
+            + shape * math.log(argument)
+            - math.lgamma(shape)
+            + math.log(total)
+        )
+        log_lower = min(log_lower, 0.0)
+        if log_lower < math.log(0.5):
+            log_upper = math.log1p(-math.exp(log_lower))
+        else:
+            upper = -math.expm1(log_lower)
+            if upper <= 0.0:
+                return -math.inf
+            log_upper = math.log(upper)
+        return min(log_upper, 0.0)
+
+    tiny = np.finfo(np.float64).tiny / epsilon
+    denominator = argument + 1.0 - shape
+    if abs(denominator) < tiny:
+        denominator = tiny
+    reciprocal = 1.0 / denominator
+    continued = 1.0 / tiny
+    fraction = reciprocal
+    for iteration in range(1, max_iterations + 1):
+        coefficient = -float(iteration) * (float(iteration) - shape)
+        denominator += 2.0
+        reciprocal = coefficient * reciprocal + denominator
+        if abs(reciprocal) < tiny:
+            reciprocal = tiny
+        continued = denominator + coefficient / continued
+        if abs(continued) < tiny:
+            continued = tiny
+        reciprocal = 1.0 / reciprocal
+        update = reciprocal * continued
+        fraction *= update
+        if abs(update - 1.0) <= epsilon:
+            break
+    else:
+        raise RuntimeError("Chi-square upper-gamma continued fraction did not converge")
+    if fraction <= 0.0 or not math.isfinite(fraction):
+        raise RuntimeError("Chi-square upper-gamma continued fraction is invalid")
+    return min(
+        -argument
+        + shape * math.log(argument)
+        - math.lgamma(shape)
+        + math.log(fraction),
+        0.0,
+    )
+
+
+def chi_square_survival(d_squared: float, degrees_of_freedom: int) -> float:
+    """Return the upper-tail chi-square probability, allowing underflow to zero."""
+    log_probability = chi_square_log_survival(d_squared, degrees_of_freedom)
+    if log_probability < math.log(np.finfo(np.float64).tiny):
+        return 0.0
+    return math.exp(log_probability)
+
+
 def mahalanobis_distance(
     difference: np.ndarray,
     covariance: np.ndarray,
@@ -4026,12 +4131,89 @@ def mahalanobis_distance(
         d_squared = float(np.sum(np.square(projection) / eigenvalues[supported]))
     else:
         d_squared = 0.0
+    d_squared = max(d_squared, 0.0)
+    log_probability = (
+        chi_square_log_survival(d_squared, rank) if rank else 0.0
+    )
     return {
-        "D2": max(d_squared, 0.0),
-        "mahalanobis_separation": math.sqrt(max(d_squared, 0.0)),
+        "D2": d_squared,
+        "mahalanobis_separation": math.sqrt(d_squared),
         "covariance_rank": rank,
         "pseudoinverse_tolerance": tolerance,
         "pseudoinverse_rcond": float(rcond),
+        "p_value": (
+            math.exp(log_probability)
+            if log_probability >= math.log(np.finfo(np.float64).tiny)
+            else 0.0
+        ),
+        "log10_p_value": log_probability / math.log(10.0),
+    }
+
+
+def observable_hypothesis_tests(
+    reference: Mapping[str, np.ndarray],
+    variation: Mapping[str, np.ndarray],
+) -> Dict[str, Any]:
+    """Compare two binned predictions with rate+shape and shape-only tests."""
+    reference_yield = np.asarray(reference["yield"], dtype=np.float64)
+    variation_yield = np.asarray(variation["yield"], dtype=np.float64)
+    if reference_yield.shape != variation_yield.shape:
+        raise ValueError("Observable hypothesis-test yields have different shapes")
+    reference_data = np.asarray(reference["data_covariance"], dtype=np.float64)
+    variation_data = np.asarray(variation["data_covariance"], dtype=np.float64)
+    reference_mc = np.asarray(reference["mc_covariance"], dtype=np.float64)
+    variation_mc = np.asarray(variation["mc_covariance"], dtype=np.float64)
+
+    def covariance_tests(
+        difference: np.ndarray,
+        nominal_data: np.ndarray,
+        varied_data: np.ndarray,
+        independent_mc: np.ndarray,
+    ) -> Dict[str, Any]:
+        return {
+            "mc_stat_only": mahalanobis_distance(difference, independent_mc),
+            "nominal_truth": {
+                "data_stat_only": mahalanobis_distance(difference, nominal_data),
+                "data_plus_mc_stat": mahalanobis_distance(
+                    difference, nominal_data + independent_mc
+                ),
+            },
+            "variation_truth": {
+                "data_stat_only": mahalanobis_distance(difference, varied_data),
+                "data_plus_mc_stat": mahalanobis_distance(
+                    difference, varied_data + independent_mc
+                ),
+            },
+        }
+
+    yield_difference = variation_yield - reference_yield
+    rate_and_shape = covariance_tests(
+        yield_difference,
+        reference_data,
+        variation_data,
+        reference_mc + variation_mc,
+    )
+    reference_fraction, reference_shape_data = normalized_binned_prediction(
+        reference_yield, reference_data
+    )
+    variation_fraction, variation_shape_data = normalized_binned_prediction(
+        variation_yield, variation_data
+    )
+    _, reference_shape_mc = normalized_binned_prediction(
+        reference_yield, reference_mc
+    )
+    _, variation_shape_mc = normalized_binned_prediction(
+        variation_yield, variation_mc
+    )
+    shape_only = covariance_tests(
+        variation_fraction - reference_fraction,
+        reference_shape_data,
+        variation_shape_data,
+        reference_shape_mc + variation_shape_mc,
+    )
+    return {
+        "rate_and_shape": rate_and_shape,
+        "shape_only": shape_only,
     }
 
 
@@ -4265,7 +4447,7 @@ def build_comparison_statistics(
         for source in sources
     ]
     payload: Dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "reference_run_id": sources[0].metadata["run_id"],
         "reference_scenario_id": sources[0].scenario.identifier,
         "source_runs": source_rows,
@@ -4275,6 +4457,14 @@ def build_comparison_statistics(
             "formula": "1000 * luminosity_fb * sigma_reference_pb / generated_sumw_scenario",
         },
         "independence_assumption": "process samples and scenario samples are statistically independent",
+        "observable_hypothesis_tests": {
+            "statistic": "Mahalanobis D2 in the covariance-supported bin subspace",
+            "p_value": "upper-tail chi-square probability with covariance rank degrees of freedom",
+            "primary_ranking": "shape_only / nominal_truth / data_plus_mc_stat",
+            "rate_and_shape": "absolute expected-yield histogram, including normalization differences",
+            "shape_only": "each scenario histogram normalized independently to unit area",
+            "scope": "local expected (Asimov) p-values; no cross-observable look-elsewhere correction",
+        },
         "xgboost_model_signature": (
             _xgboost_model_signature(sources[0].xgboost_metadata)
             if "xgboost" in analyses and sources[0].xgboost_metadata is not None
@@ -4285,11 +4475,16 @@ def build_comparison_statistics(
     numerical: Dict[
         Tuple[str, str, float, str, str], Dict[str, np.ndarray]
     ] = {}
+    ranking_candidates: Dict[str, List[Dict[str, Any]]] = {
+        "shape_only": [],
+        "rate_and_shape": [],
+    }
     selector = np.zeros(PULL_BIN_COUNT, dtype=np.float64)
     selector[: PULL_BIN_COUNT // 2] = 1.0
     for strategy in analyses:
         strategy_payload: Dict[str, Any] = {}
         for channel in ("higgs", "z"):
+            reference_id = sources[0].scenario.identifier
             channel_payload: Dict[str, Any] = {
                 "scenarios": {},
                 "differences_from_reference": {},
@@ -4339,9 +4534,11 @@ def build_comparison_statistics(
                 observable_payload: Dict[str, Any] = {
                     "bin_edges": None,
                     "luminosities": {},
+                    "comparisons_to_reference": {},
                 }
                 for luminosity in luminosities:
                     luminosity_payload: Dict[str, Any] = {}
+                    luminosity_statistics: Dict[str, Dict[str, np.ndarray]] = {}
                     for source in sources:
                         statistics = total_pull_observable_statistics(
                             channel,
@@ -4359,6 +4556,7 @@ def build_comparison_statistics(
                             source.scenario.identifier,
                         )
                         numerical[key] = statistics
+                        luminosity_statistics[source.scenario.identifier] = statistics
                         if observable_payload["bin_edges"] is None:
                             observable_payload["bin_edges"] = statistics["edges"].tolist()
                         luminosity_payload[source.scenario.identifier] = {
@@ -4371,9 +4569,40 @@ def build_comparison_statistics(
                     observable_payload["luminosities"][str(float(luminosity))] = (
                         luminosity_payload
                     )
+                    reference_statistics = luminosity_statistics[reference_id]
+                    for source in sources[1:]:
+                        scenario_id = source.scenario.identifier
+                        tests = observable_hypothesis_tests(
+                            reference_statistics,
+                            luminosity_statistics[scenario_id],
+                        )
+                        comparison_values = observable_payload[
+                            "comparisons_to_reference"
+                        ].setdefault(
+                            scenario_id,
+                            {"label": source.scenario.label, "luminosities": {}},
+                        )
+                        comparison_values["luminosities"][str(float(luminosity))] = tests
+                        for test_scope in ("shape_only", "rate_and_shape"):
+                            distance = tests[test_scope]["nominal_truth"][
+                                "data_plus_mc_stat"
+                            ]
+                            ranking_candidates[test_scope].append(
+                                {
+                                    "strategy": strategy,
+                                    "channel": channel,
+                                    "observable": observable,
+                                    "scenario": scenario_id,
+                                    "scenario_label": source.scenario.label,
+                                    "luminosity_fb": float(luminosity),
+                                    "D2": distance["D2"],
+                                    "covariance_rank": distance["covariance_rank"],
+                                    "p_value": distance["p_value"],
+                                    "log10_p_value": distance["log10_p_value"],
+                                }
+                            )
                 channel_payload["observables"][observable] = observable_payload
 
-            reference_id = sources[0].scenario.identifier
             reference_differential = differentials[reference_id]
             reference_r = np.asarray(reference_differential["R"], dtype=np.float64)
             reference_mc_covariance = np.asarray(
@@ -4446,6 +4675,32 @@ def build_comparison_statistics(
                 }
             strategy_payload[channel] = channel_payload
         payload["analyses"][strategy] = strategy_payload
+    rankings: Dict[str, Any] = {}
+    for test_scope, candidates in ranking_candidates.items():
+        if not candidates:
+            continue
+        best = min(candidates, key=lambda item: float(item["log10_p_value"]))
+        trial_count = len(candidates)
+        bonferroni_log10 = min(
+            0.0,
+            float(best["log10_p_value"]) + math.log10(float(trial_count)),
+        )
+        bonferroni_probability = (
+            10.0 ** bonferroni_log10
+            if bonferroni_log10 >= math.log10(np.finfo(np.float64).tiny)
+            else 0.0
+        )
+        rankings[test_scope] = {
+            "test_count": trial_count,
+            "most_significant_local_test": dict(best),
+            "bonferroni_upper_bound_for_selected_minimum_p": bonferroni_probability,
+            "log10_bonferroni_upper_bound": bonferroni_log10,
+            "correlation_note": (
+                "The tests share events and are correlated; the Bonferroni value is a "
+                "conservative bound, not an exact global p-value."
+            ),
+        }
+    payload["observable_hypothesis_test_rankings"] = rankings
     return payload, numerical
 
 
@@ -4664,6 +4919,13 @@ def write_comparison_artifacts(
         "f_beam",
         "delta_R_i",
         "delta_f_beam",
+        "test_scope",
+        "truth_hypothesis",
+        "uncertainty_model",
+        "D2",
+        "covariance_rank",
+        "p_value",
+        "log10_p_value",
         "directional_fbeam_z_nominal_truth_data",
         "directional_fbeam_z_nominal_truth_data_plus_mc",
         "directional_fbeam_z_variation_truth_data",
@@ -4671,6 +4933,9 @@ def write_comparison_artifacts(
         "six_bin_D2_nominal_truth_data",
         "six_bin_D2_nominal_truth_data_plus_mc",
         "six_bin_covariance_rank_nominal_truth_data_plus_mc",
+        "six_bin_p_value_nominal_truth_data",
+        "six_bin_p_value_nominal_truth_data_plus_mc",
+        "six_bin_log10_p_value_nominal_truth_data_plus_mc",
     ]
     rows: List[Dict[str, Any]] = []
     arrays: Dict[str, np.ndarray] = {}
@@ -4717,6 +4982,81 @@ def write_comparison_artifacts(
     reference_id = str(payload["reference_scenario_id"])
     for strategy, strategy_values in payload["analyses"].items():
         for channel, channel_values in strategy_values.items():
+            for observable, observable_values in channel_values["observables"].items():
+                for scenario, comparison_values in observable_values[
+                    "comparisons_to_reference"
+                ].items():
+                    for lumi_key, tests in comparison_values["luminosities"].items():
+                        luminosity = float(lumi_key)
+                        lumi_tag = _format_luminosity(luminosity)
+                        prefix = (
+                            f"{strategy}__{channel}__{lumi_tag}__{observable}__"
+                            f"{scenario}__minus__{reference_id}__hypothesis_test"
+                        )
+                        for test_scope in ("shape_only", "rate_and_shape"):
+                            scope_values = tests[test_scope]
+                            test_variants = (
+                                (
+                                    "independent_scenarios",
+                                    "mc_stat_only",
+                                    scope_values["mc_stat_only"],
+                                ),
+                                (
+                                    "nominal_truth",
+                                    "data_stat_only",
+                                    scope_values["nominal_truth"]["data_stat_only"],
+                                ),
+                                (
+                                    "nominal_truth",
+                                    "data_plus_mc_stat",
+                                    scope_values["nominal_truth"]["data_plus_mc_stat"],
+                                ),
+                                (
+                                    "variation_truth",
+                                    "data_stat_only",
+                                    scope_values["variation_truth"]["data_stat_only"],
+                                ),
+                                (
+                                    "variation_truth",
+                                    "data_plus_mc_stat",
+                                    scope_values["variation_truth"]["data_plus_mc_stat"],
+                                ),
+                            )
+                            for truth_hypothesis, uncertainty_model, distance in test_variants:
+                                distance_prefix = (
+                                    f"{prefix}__{test_scope}__{truth_hypothesis}__"
+                                    f"{uncertainty_model}"
+                                )
+                                arrays[f"{distance_prefix}__D2"] = np.asarray(
+                                    distance["D2"], dtype=np.float64
+                                )
+                                arrays[f"{distance_prefix}__rank"] = np.asarray(
+                                    distance["covariance_rank"], dtype=np.int64
+                                )
+                                arrays[f"{distance_prefix}__p_value"] = np.asarray(
+                                    distance["p_value"], dtype=np.float64
+                                )
+                                arrays[f"{distance_prefix}__log10_p_value"] = np.asarray(
+                                    distance["log10_p_value"], dtype=np.float64
+                                )
+                                rows.append(
+                                    {
+                                        "record_type": "hypothesis_test",
+                                        "strategy": strategy,
+                                        "channel": channel,
+                                        "luminosity_fb": luminosity,
+                                        "observable": observable,
+                                        "scenario": scenario,
+                                        "reference_scenario": reference_id,
+                                        "test_scope": test_scope,
+                                        "truth_hypothesis": truth_hypothesis,
+                                        "uncertainty_model": uncertainty_model,
+                                        "D2": distance["D2"],
+                                        "covariance_rank": distance["covariance_rank"],
+                                        "p_value": distance["p_value"],
+                                        "log10_p_value": distance["log10_p_value"],
+                                    }
+                                )
             for scenario, scenario_values in channel_values["scenarios"].items():
                 prefix = f"{strategy}__{channel}__{scenario}"
                 arrays[f"{prefix}__R"] = np.asarray(scenario_values["R"], dtype=np.float64)
@@ -4832,6 +5172,12 @@ def write_comparison_artifacts(
                             arrays[f"{distance_prefix}__pseudoinverse_tolerance"] = np.asarray(
                                 distance["pseudoinverse_tolerance"], dtype=np.float64
                             )
+                            arrays[f"{distance_prefix}__p_value"] = np.asarray(
+                                distance["p_value"], dtype=np.float64
+                            )
+                            arrays[f"{distance_prefix}__log10_p_value"] = np.asarray(
+                                distance["log10_p_value"], dtype=np.float64
+                            )
                     for index, delta_fraction in enumerate(difference["delta_R"]):
                         rows.append(
                             {
@@ -4868,6 +5214,15 @@ def write_comparison_artifacts(
                                 "six_bin_covariance_rank_nominal_truth_data_plus_mc": nominal[
                                     "six_bin_data_plus_mc_stat"
                                 ]["covariance_rank"],
+                                "six_bin_p_value_nominal_truth_data": nominal[
+                                    "six_bin_data_stat_only"
+                                ]["p_value"],
+                                "six_bin_p_value_nominal_truth_data_plus_mc": nominal[
+                                    "six_bin_data_plus_mc_stat"
+                                ]["p_value"],
+                                "six_bin_log10_p_value_nominal_truth_data_plus_mc": nominal[
+                                    "six_bin_data_plus_mc_stat"
+                                ]["log10_p_value"],
                             }
                         )
     csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -6527,6 +6882,15 @@ def generate_comparison_index(
     def format_optional(value: Any, format_spec: str) -> str:
         return "—" if value is None else format(float(value), format_spec)
 
+    def format_p_value(distance: Mapping[str, Any]) -> str:
+        probability = float(distance["p_value"])
+        log10_probability = float(distance["log10_p_value"])
+        if probability >= 1.0e-3:
+            return f"{probability:.4g}"
+        if probability > 0.0:
+            return f"{probability:.3e}"
+        return f"10<sup>{log10_probability:.2f}</sup>"
+
     source_rows = []
     for index, source in enumerate(sources):
         role = "Reference" if index == 0 else "Variation"
@@ -6578,8 +6942,92 @@ def generate_comparison_index(
                         f"<td>{difference['delta_f_beam']:+.6f}</td>"
                         f"<td>{format_optional(nominal_z, '+.3f')}</td>"
                         f"<td>{format_optional(variation_z, '+.3f')}</td>"
-                        f"<td>{d2['D2']:.3f} (rank {d2['covariance_rank']})</td></tr>"
+                        f"<td>{d2['D2']:.3f} (rank {d2['covariance_rank']})</td>"
+                        f"<td>{format_p_value(d2)}</td></tr>"
                     )
+    registry = {
+        (spec.channel, spec.key): spec for spec in plot_registry()
+    }
+    hypothesis_rows: Dict[str, List[str]] = {
+        "shape_only": [],
+        "rate_and_shape": [],
+    }
+    for strategy, strategy_values in comparison["analyses"].items():
+        for channel, channel_values in strategy_values.items():
+            for observable, observable_values in channel_values["observables"].items():
+                observable_title = registry[(channel, observable)].title
+                for scenario_id, scenario_values in observable_values[
+                    "comparisons_to_reference"
+                ].items():
+                    for luminosity_key, tests in scenario_values["luminosities"].items():
+                        for test_scope in ("shape_only", "rate_and_shape"):
+                            values = tests[test_scope]
+                            nominal_data = values["nominal_truth"]["data_stat_only"]
+                            nominal_combined = values["nominal_truth"][
+                                "data_plus_mc_stat"
+                            ]
+                            variation_data = values["variation_truth"]["data_stat_only"]
+                            variation_combined = values["variation_truth"][
+                                "data_plus_mc_stat"
+                            ]
+                            mc_only = values["mc_stat_only"]
+                            hypothesis_rows[test_scope].append(
+                                f"<tr><td>{html.escape(strategy)}</td>"
+                                f"<td>{html.escape(channel)}</td>"
+                                f"<td>{html.escape(observable_title)}</td>"
+                                f"<td>{html.escape(str(scenario_values['label']))}</td>"
+                                f"<td>{float(luminosity_key):g}</td>"
+                                f"<td>{nominal_combined['D2']:.3f} / "
+                                f"{nominal_combined['covariance_rank']}</td>"
+                                f"<td>{format_p_value(nominal_data)}</td>"
+                                f"<td>{format_p_value(nominal_combined)}</td>"
+                                f"<td>{format_p_value(variation_data)}</td>"
+                                f"<td>{format_p_value(variation_combined)}</td>"
+                                f"<td>{format_p_value(mc_only)}</td></tr>"
+                            )
+
+    ranking = comparison["observable_hypothesis_test_rankings"]["shape_only"]
+    best = ranking["most_significant_local_test"]
+    best_label = registry[(best["channel"], best["observable"])].title
+    best_distance = {
+        "p_value": best["p_value"],
+        "log10_p_value": best["log10_p_value"],
+    }
+    bonferroni = float(ranking["bonferroni_upper_bound_for_selected_minimum_p"])
+    bonferroni_log10 = float(ranking["log10_bonferroni_upper_bound"])
+    bonferroni_text = (
+        f"{bonferroni:.3e}"
+        if bonferroni > 0.0
+        else f"10<sup>{bonferroni_log10:.2f}</sup>"
+    )
+    hypothesis_header = (
+        "<thead><tr><th>Analysis</th><th>Channel</th><th>Observable</th>"
+        "<th>Variation</th><th>fb⁻¹</th><th>D² / rank (ref., data+MC)</th>"
+        "<th>p data (ref.)</th><th>p data+MC (ref.)</th>"
+        "<th>p data (var.)</th><th>p data+MC (var.)</th>"
+        "<th>p MC only</th></tr></thead>"
+    )
+    hypothesis_html = (
+        '<section class="panel"><h2>Pairwise Herwig–CR histogram p-values</h2>'
+        '<p>These are local expected (Asimov) upper-tail χ² p-values using the full '
+        'event-level bin covariance. The primary comparison is shape only, with each '
+        'scenario normalized independently; rate+shape tests correspond to the absolute '
+        'event-count panels. “Data+MC” adds the two statistically independent scenario-MC '
+        'covariances. No modelling or experimental systematic uncertainty is included.</p>'
+        f'<p><strong>Most significant local shape test:</strong> {html.escape(str(best["strategy"]))} '
+        f'{html.escape(str(best["channel"]))}, {html.escape(best_label)}, '
+        f'{float(best["luminosity_fb"]):g} fb⁻¹: D²={float(best["D2"]):.3f} with '
+        f'rank {int(best["covariance_rank"])}, p={format_p_value(best_distance)}. '
+        f'There are {int(ranking["test_count"])} correlated tests; the conservative '
+        f'Bonferroni bound is p≤{bonferroni_text}.</p>'
+        '<h3>Shape-only tests (primary)</h3><div class="table-wrap"><table>'
+        + hypothesis_header
+        + '<tbody>' + ''.join(hypothesis_rows["shape_only"]) + '</tbody></table></div>'
+        '<details><summary>Rate-and-shape tests matching the absolute-yield plots</summary>'
+        '<div class="table-wrap"><table>' + hypothesis_header + '<tbody>'
+        + ''.join(hypothesis_rows["rate_and_shape"])
+        + '</tbody></table></div></details></section>'
+    )
     score_pull_html = ""
     if score_pull_diagnostic is not None:
         recommendation_rows = []
@@ -6646,7 +7094,8 @@ def generate_comparison_index(
 <h1>Independent CR scenarios</h1><p><strong>Comparison run:</strong> {html.escape(str(run_metadata['run_id']))}<br>
 In total-scenario plots, each point is the complete prediction from one independently generated scenario. Absolute signed-pull-angle stack overlays instead retain the first run's process stack and draw every CR variation only as total-yield error bars. All process samples, including backgrounds, are scenario-specific; no background sample is shared. The first run fixes the process cross sections and is the ratio reference.</p></header><main>
 <section class="panel"><h2>Source runs</h2><div class="table-wrap"><table><thead><tr><th>Role</th><th>Scenario</th><th>Parameters</th><th>Immutable source</th></tr></thead><tbody>{''.join(source_rows)}</tbody></table></div><h3>Common reference cross sections</h3><p>Every scenario uses the first run's final-state cross sections; scenario-specific efficiencies and generated sums of weights remain independent.</p><div class="table-wrap"><table><thead><tr><th>Process</th><th>Cross section [pb]</th></tr></thead><tbody>{cross_section_rows}</tbody></table></div></section>
-<section class="panel"><h2>Absolute signed-pull-angle numerical comparison</h2><p>Directional f<sub>beam</sub> values retain their signs. Six-bin D² values are Mahalanobis distances in the supported covariance subspace; √D² is not labelled as a one-dimensional Gaussian significance.</p><div class="table-wrap"><table><thead><tr><th>Analysis</th><th>Channel</th><th>Variation</th><th>fb⁻¹</th><th>f<sub>beam</sub> ref.</th><th>f<sub>beam</sub> var.</th><th>Δf<sub>beam</sub></th><th>Z (ref. truth)</th><th>Z (var. truth)</th><th>D² (ref. truth)</th></tr></thead><tbody>{''.join(summary_rows)}</tbody></table></div><p><a href="summaries/comparison.json">JSON</a> · <a href="summaries/comparison.csv">CSV</a> · <a href="summaries/comparison.npz">NPZ arrays and covariances</a></p></section>
+<section class="panel"><h2>Absolute signed-pull-angle numerical comparison</h2><p>Directional f<sub>beam</sub> values retain their signs. Six-bin D² values are Mahalanobis distances in the supported covariance subspace; √D² is not labelled as a one-dimensional Gaussian significance.</p><div class="table-wrap"><table><thead><tr><th>Analysis</th><th>Channel</th><th>Variation</th><th>fb⁻¹</th><th>f<sub>beam</sub> ref.</th><th>f<sub>beam</sub> var.</th><th>Δf<sub>beam</sub></th><th>Z (ref. truth)</th><th>Z (var. truth)</th><th>D² (ref. truth)</th><th>p (ref., data+MC)</th></tr></thead><tbody>{''.join(summary_rows)}</tbody></table></div><p><a href="summaries/comparison.json">JSON</a> · <a href="summaries/comparison.csv">CSV</a> · <a href="summaries/comparison.npz">NPZ arrays, tests and covariances</a></p></section>
+{hypothesis_html}
 {score_pull_html}
 <section><h2>Pull-observable comparisons, reference stacks and diagnostics</h2><div class="controls">
 <label>Analysis<select id="strategy"><option value="all">All</option>{''.join(f'<option value="{name}">{name}</option>' for name in analyses)}</select></label>

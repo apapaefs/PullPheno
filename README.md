@@ -143,7 +143,15 @@ non-stacked error-bar plots for the five pull observables, separately for
 projected counting and finite-MC uncertainties.  Its lower panels show each
 scenario relative to the first run.  It also stores full covariance matrices,
 $R_i$, $f_{\rm beam}$, differences, directional $f_{\rm beam}$ sensitivities
-and six-bin Mahalanobis $D^2$.  To add another complete CR scenario, analyze it
+and six-bin Mahalanobis $D^2$.  It also performs pairwise reference-versus-CR
+hypothesis tests for every pull histogram.  The primary ranking uses unit-area
+shape differences with the full projected-data plus independent-scenario MC
+covariance; a separate rate-and-shape result corresponds to the absolute-yield
+plots.  Each $D^2$ is converted to a local expected upper-tail chi-square
+$p$-value using the supported covariance rank.  These statistical-only values
+do not include experimental or modelling systematics, and selecting the
+smallest value across correlated plots incurs a look-elsewhere effect.
+To add another complete CR scenario, analyze it
 with the same `NOMINAL_RUN` models and append its completed path to
 `--compare-runs`; the existing source runs remain untouched.
 

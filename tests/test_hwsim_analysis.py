@@ -373,6 +373,47 @@ class PullAndWeightTests(unittest.TestCase):
         )
         self.assertEqual(distance["covariance_rank"], 1)
         self.assertAlmostEqual(distance["D2"], 1.0)
+        self.assertAlmostEqual(
+            distance["p_value"], math.erfc(math.sqrt(0.5)), places=13
+        )
+        self.assertAlmostEqual(
+            distance["log10_p_value"],
+            math.log10(math.erfc(math.sqrt(0.5))),
+            places=13,
+        )
+
+    def test_chi_square_tail_remains_finite_for_tiny_p_values(self):
+        log_probability = analysis.chi_square_log_survival(707.721, 5)
+        self.assertAlmostEqual(log_probability / math.log(10.0), -149.97821093097087)
+        self.assertAlmostEqual(
+            analysis.chi_square_survival(2.0, 2), math.exp(-1.0), places=14
+        )
+
+    def test_observable_hypothesis_tests_separate_shape_from_rate(self):
+        reference = {
+            "yield": np.asarray([100.0, 100.0, 100.0]),
+            "data_covariance": np.diag([100.0, 100.0, 100.0]),
+            "mc_covariance": np.diag([4.0, 4.0, 4.0]),
+        }
+        pure_rate_variation = {
+            "yield": np.asarray([120.0, 120.0, 120.0]),
+            "data_covariance": np.diag([120.0, 120.0, 120.0]),
+            "mc_covariance": np.diag([5.0, 5.0, 5.0]),
+        }
+        tests = analysis.observable_hypothesis_tests(reference, pure_rate_variation)
+        self.assertGreater(
+            tests["rate_and_shape"]["nominal_truth"]["data_plus_mc_stat"]["D2"],
+            0.0,
+        )
+        self.assertAlmostEqual(
+            tests["shape_only"]["nominal_truth"]["data_plus_mc_stat"]["D2"],
+            0.0,
+            places=13,
+        )
+        self.assertEqual(
+            tests["shape_only"]["nominal_truth"]["data_plus_mc_stat"]["p_value"],
+            1.0,
+        )
 
     def test_histogram_folds_underflow_and_overflow_and_tracks_sumw2(self):
         histogram = analysis.WeightedHistogram(np.asarray([0.0, 1.0, 2.0]))
@@ -1081,6 +1122,20 @@ class RunManagementTests(unittest.TestCase):
         )
         key = ("cutbased", "higgs", 300.0, "signed_pull_angle", "variation")
         self.assertIn(key, numerical)
+        observable_tests = payload["analyses"]["cutbased"]["higgs"][
+            "observables"
+        ]["signed_pull_angle"]["comparisons_to_reference"]["variation"][
+            "luminosities"
+        ]["300.0"]
+        self.assertIn("shape_only", observable_tests)
+        self.assertIn("rate_and_shape", observable_tests)
+        self.assertGreaterEqual(
+            observable_tests["shape_only"]["nominal_truth"][
+                "data_plus_mc_stat"
+            ]["p_value"],
+            0.0,
+        )
+        self.assertIn("shape_only", payload["observable_hypothesis_test_rankings"])
 
     def test_comparison_mode_creates_immutable_catalogued_run_without_root_io(self):
         def write_source(output_root, run_id, scenario, beam_events):
@@ -1196,6 +1251,10 @@ class RunManagementTests(unittest.TestCase):
             self.assertEqual(comparison["reference_run_id"], "nominal-run")
             self.assertTrue((completed[0] / "summaries" / "comparison.csv").is_file())
             self.assertTrue((completed[0] / "summaries" / "comparison.npz").is_file())
+            csv_text = (completed[0] / "summaries" / "comparison.csv").read_text()
+            self.assertIn("hypothesis_test", csv_text)
+            index_text = (completed[0] / "index.html").read_text()
+            self.assertIn("Pairwise Herwig–CR histogram p-values", index_text)
             plots = json.loads((completed[0] / "summaries" / "plots.json").read_text())
             self.assertEqual(len(plots), 22)
             stack_overlays = [

@@ -1256,7 +1256,7 @@ class RunManagementTests(unittest.TestCase):
             index_text = (completed[0] / "index.html").read_text()
             self.assertIn("Pairwise Herwig–CR histogram p-values", index_text)
             plots = json.loads((completed[0] / "summaries" / "plots.json").read_text())
-            self.assertEqual(len(plots), 22)
+            self.assertEqual(len(plots), 24)
             stack_overlays = [
                 record
                 for record in plots
@@ -1273,6 +1273,26 @@ class RunManagementTests(unittest.TestCase):
                     and (completed[0] / record["png"]).is_file()
                     and (completed[0] / record["pdf"]).is_file()
                     for record in stack_overlays
+                )
+            )
+            stack_ratio_overlays = [
+                record
+                for record in plots
+                if record["kind"] == "reference-stack-plus-total-ratio"
+            ]
+            self.assertEqual(len(stack_ratio_overlays), 2)
+            self.assertEqual(
+                {record["channel"] for record in stack_ratio_overlays},
+                {"higgs", "z"},
+            )
+            self.assertTrue(
+                all(
+                    record["observable"] == "folded_pull_angle"
+                    and record["uncertainty"] == "independent-mc-stat"
+                    and "reference-stack-ratio" in record["png"]
+                    and (completed[0] / record["png"]).is_file()
+                    and (completed[0] / record["pdf"]).is_file()
+                    for record in stack_ratio_overlays
                 )
             )
             analysis.validate_html_links(completed[0] / "index.html")

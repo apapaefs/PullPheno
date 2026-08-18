@@ -160,7 +160,10 @@ single-run expected-yield presentation: the reference Herwig processes remain
 stacked in their configured order, while every independent CR variation is
 overlaid only as its complete total prediction with event-level MC-statistical
 error bars.  Variation processes are never stacked and are neither added to
-nor substituted inside the nominal stack.
+nor substituted inside the nominal stack.  A separate companion plot adds a
+lower variation/reference ratio panel.  Its CR-point error bars propagate the
+finite-MC uncertainties of the statistically independent variation and
+reference samples; bins with zero nominal yield are masked.
 
 Analysis version 2.3 additionally stores an event-level joint observable with
 ten frozen XGBoost-score quantiles and the six absolute signed-pull-angle bins.  The

@@ -1349,9 +1349,12 @@ class XGBoostHelperTests(unittest.TestCase):
         sequential_sumw2 = 27974.748973052174
         event_count = 6086046
 
-        self.assertTrue(
-            analysis.reductions_close(common_sumw, sequential_sumw, event_count)
+        closure = analysis.reductions_close(
+            common_sumw, sequential_sumw, event_count
         )
+        self.assertIs(type(closure), bool)
+        self.assertTrue(closure)
+        self.assertEqual(json.dumps({"closure": closure}), '{"closure": true}')
         self.assertTrue(
             analysis.reductions_close(common_sumw2, sequential_sumw2, event_count)
         )

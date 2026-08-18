@@ -6786,10 +6786,12 @@ def reduction_roundoff_tolerance(
         raise ValueError("Too many floating-point additions for a finite gamma_n bound")
     gamma_n = accumulated_epsilon / (1.0 - accumulated_epsilon)
     scale = abs(value)
-    return max(
-        float(absolute_floor),
-        float(relative_floor) * scale,
-        4.0 * gamma_n * scale,
+    return float(
+        max(
+            float(absolute_floor),
+            float(relative_floor) * scale,
+            4.0 * gamma_n * scale,
+        )
     )
 
 
@@ -6813,7 +6815,7 @@ def reductions_close(
         relative_floor,
         absolute_floor,
     )
-    return abs(left - right) <= tolerance
+    return bool(abs(left - right) <= tolerance)
 
 
 def validate_results(results: Sequence[SampleResult], partial: bool) -> Dict[str, Any]:

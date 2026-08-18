@@ -107,6 +107,17 @@ class SelectionTests(unittest.TestCase):
 
 
 class PullAndWeightTests(unittest.TestCase):
+    def test_absolute_signed_pull_angle_plot_presentation(self):
+        specs = {
+            (spec.channel, spec.key): spec
+            for spec in analysis.plot_registry()
+            if spec.key == "folded_pull_angle"
+        }
+        self.assertEqual(set(specs), {("higgs", "folded_pull_angle"), ("z", "folded_pull_angle")})
+        for spec in specs.values():
+            self.assertEqual(spec.title, "Absolute signed pull angle")
+            self.assertEqual(spec.xlabel, r"$|\theta_s|$ [rad]")
+
     def test_positive_and_negative_rapidity_point_to_beam_at_zero_angle(self):
         positive_constituent = FakeJet(10.0, 2.1, 0.0)
         positive = analysis.calculate_pull_vector(FakeJet(100.0, 2.0, 0.0, [positive_constituent]))

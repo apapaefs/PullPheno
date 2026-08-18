@@ -147,7 +147,7 @@ and six-bin Mahalanobis $D^2$.  To add another complete CR scenario, analyze it
 with the same `NOMINAL_RUN` models and append its completed path to
 `--compare-runs`; the existing source runs remain untouched.
 
-For the folded signed pull angle, the comparison additionally reproduces the
+For the absolute signed pull angle, the comparison additionally reproduces the
 single-run expected-yield presentation: the reference Herwig processes remain
 stacked in their configured order, while every independent CR variation is
 overlaid only as its complete total prediction with event-level MC-statistical
@@ -155,7 +155,7 @@ error bars.  Variation processes are never stacked and are neither added to
 nor substituted inside the nominal stack.
 
 Analysis version 2.3 additionally stores an event-level joint observable with
-ten frozen XGBoost-score quantiles and the six folded pull-angle bins.  The
+ten frozen XGBoost-score quantiles and the six absolute signed-pull-angle bins.  The
 quantile boundaries are fixed from the nominal total prediction after common
 selection and copied unchanged into every independent CR run.  The comparison
 therefore produces score-by-pull maps, $\Delta f_{\rm beam}$ in every score

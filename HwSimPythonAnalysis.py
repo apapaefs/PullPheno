@@ -1079,7 +1079,7 @@ def plot_registry() -> Tuple[PlotSpec, ...]:
                 PlotSpec("pull_t_phi", channel, "vbf", "Azimuthal pull component", r"$t_{\phi}$", _linspace(-0.03, 0.03, 40)),
                 PlotSpec("pull_magnitude", channel, "vbf", "Pull-vector magnitude", r"$|\vec{t}|$", _linspace(0.0, 0.06, 40)),
                 PlotSpec("signed_pull_angle", channel, "vbf", "Signed pull angle", r"Signed pull angle [rad]", _linspace(-math.pi, math.pi, 12)),
-                PlotSpec("folded_pull_angle", channel, "vbf", "Folded signed pull angle", r"$|\theta_{\mathrm{signed}}|$ [rad]", _linspace(0.0, math.pi, 6)),
+                PlotSpec("folded_pull_angle", channel, "vbf", "Absolute signed pull angle", r"$|\theta_s|$ [rad]", _linspace(0.0, math.pi, 6)),
             ]
         )
     specs.append(
@@ -4466,7 +4466,7 @@ def build_score_pull_diagnostic(
         "moment_model": SCORE_PULL_MOMENT_MODEL,
         "selection": "common selection through opposite hemispheres; no VBF or score cut",
         "score_binning": "ten total-prediction weighted quantiles frozen by the nominal run",
-        "pull_binning": "six equal folded signed-pull-angle bins on [0, pi]",
+        "pull_binning": "six equal absolute signed-pull-angle bins on [0, pi]",
         "category_objective": (
             "conditional pull-shape Mahalanobis D2; each score category is normalized "
             "independently, with nominal-truth projected-data covariance plus independent "
@@ -5333,7 +5333,7 @@ def generate_ri_plots(
                 )
             ax.axvline(0.5 * math.pi, color="#657086", linestyle="--", linewidth=1.0)
             ax.set_xlim(0.0, math.pi)
-            ax.set_xlabel(r"Folded signed pull angle $|\theta_{\mathrm{signed}}|$ [rad]")
+            ax.set_xlabel(r"$|\theta_s|$ [rad]")
             ax.set_ylabel(r"$R_i$")
             ax.set_title(f"Differential pull fractions · {title_suffix}", loc="left", pad=34,
                          fontweight="semibold")
@@ -5385,7 +5385,7 @@ def generate_ri_plots(
                           label="Total prediction")
                 ax.axvline(0.5 * math.pi, color="#657086", linestyle="--", linewidth=1.0)
                 ax.set_xlim(0.0, math.pi)
-                ax.set_xlabel(r"Folded signed pull angle $|\theta_{\mathrm{signed}}|$ [rad]")
+                ax.set_xlabel(r"$|\theta_s|$ [rad]")
                 ax.set_ylabel(r"$R_i$")
                 ax.set_title(f"Total differential pull fractions · {title_suffix}", loc="left",
                              pad=34, fontweight="semibold")
@@ -5824,7 +5824,7 @@ def generate_score_pull_diagnostic_plots(
     payload: Mapping[str, Any],
     numerical: Mapping[Tuple[str, float, str], Mapping[str, np.ndarray]],
 ) -> List[Dict[str, Any]]:
-    """Plot the exploratory score-quantile dependence of the folded pull shape."""
+    """Plot the exploratory score-quantile dependence of the absolute pull shape."""
     matplotlib_config = Path(tempfile.gettempdir()) / "pullpheno-matplotlib"
     matplotlib_config.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("MPLCONFIGDIR", str(matplotlib_config))
@@ -5936,7 +5936,7 @@ def generate_score_pull_diagnostic_plots(
                         range(SCORE_PULL_BIN_COUNT),
                         [f"Q{index}" for index in range(1, SCORE_PULL_BIN_COUNT + 1)],
                     )
-                    axis.set_xlabel("Folded pull-angle bin")
+                    axis.set_xlabel(r"$|\theta_s|$ bin")
                     axis.grid(False)
                     figure.colorbar(image, ax=axis, shrink=0.82, label=colorbar_label)
                 axes[0].set_ylabel("Frozen nominal score quantile (low → high)")
@@ -6644,9 +6644,9 @@ def generate_comparison_index(
 *{{box-sizing:border-box}}body{{margin:0;background:var(--wash);color:var(--ink);font:15px/1.5 Inter,system-ui,sans-serif}}a{{color:var(--accent);text-decoration:none}}a:hover{{text-decoration:underline}}header{{padding:3rem max(1rem,calc((100vw - 1280px)/2));background:linear-gradient(125deg,#12213c,#244b78 62%,#11776d);color:white}}header p{{color:#dce9f8}}h1{{font-size:clamp(2rem,5vw,3.7rem);margin:.3rem 0}}main{{max-width:1320px;margin:auto;padding:1.5rem}}section{{margin:1.2rem 0}}.panel,.plot-card{{background:white;border:1px solid var(--line);border-radius:14px;box-shadow:0 5px 18px #2435510c}}.panel{{padding:1rem}}.table-wrap{{overflow:auto}}table{{border-collapse:collapse;width:100%;font-size:.87rem}}th,td{{padding:.5rem .65rem;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}}th:first-child,td:first-child{{text-align:left}}.swatch{{display:inline-block;width:.75rem;height:.75rem;border-radius:50%;margin-right:.4rem}}.controls{{display:grid;grid-template-columns:repeat(5,minmax(130px,1fr));gap:.7rem;position:sticky;top:0;z-index:2;background:#f3f6faed;backdrop-filter:blur(8px);padding:.8rem 0}}label{{font-size:.78rem;color:var(--muted);font-weight:700}}select,input{{display:block;width:100%;margin-top:.2rem;padding:.5rem;border:1px solid #bfc8d5;border-radius:8px;background:white}}.gallery{{display:grid;grid-template-columns:repeat(auto-fit,minmax(315px,1fr));gap:1rem}}.plot-card{{overflow:hidden}}.plot-card[hidden]{{display:none}}.thumb-link{{display:block;aspect-ratio:1.25;background:white;overflow:hidden}}.thumb-link img{{width:100%;height:100%;object-fit:contain}}.plot-copy{{padding:.85rem}}.plot-copy h3{{font-size:1rem;margin:.45rem 0}}.badges{{display:flex;gap:.35rem;flex-wrap:wrap}}.badges span{{font-size:.68rem;text-transform:uppercase;font-weight:750;border-radius:999px;padding:.18rem .45rem;background:#e7eef8;color:#274b79}}code{{overflow-wrap:anywhere}}footer{{padding:2.5rem;text-align:center;color:var(--muted)}}@media(max-width:760px){{.controls{{grid-template-columns:1fr 1fr;position:static}}}}
 </style></head><body><header><div>PullPheno particle-level analysis</div>
 <h1>Independent CR scenarios</h1><p><strong>Comparison run:</strong> {html.escape(str(run_metadata['run_id']))}<br>
-In total-scenario plots, each point is the complete prediction from one independently generated scenario. Folded-angle stack overlays instead retain the first run's process stack and draw every CR variation only as total-yield error bars. All process samples, including backgrounds, are scenario-specific; no background sample is shared. The first run fixes the process cross sections and is the ratio reference.</p></header><main>
+In total-scenario plots, each point is the complete prediction from one independently generated scenario. Absolute signed-pull-angle stack overlays instead retain the first run's process stack and draw every CR variation only as total-yield error bars. All process samples, including backgrounds, are scenario-specific; no background sample is shared. The first run fixes the process cross sections and is the ratio reference.</p></header><main>
 <section class="panel"><h2>Source runs</h2><div class="table-wrap"><table><thead><tr><th>Role</th><th>Scenario</th><th>Parameters</th><th>Immutable source</th></tr></thead><tbody>{''.join(source_rows)}</tbody></table></div><h3>Common reference cross sections</h3><p>Every scenario uses the first run's final-state cross sections; scenario-specific efficiencies and generated sums of weights remain independent.</p><div class="table-wrap"><table><thead><tr><th>Process</th><th>Cross section [pb]</th></tr></thead><tbody>{cross_section_rows}</tbody></table></div></section>
-<section class="panel"><h2>Folded-angle numerical comparison</h2><p>Directional f<sub>beam</sub> values retain their signs. Six-bin D² values are Mahalanobis distances in the supported covariance subspace; √D² is not labelled as a one-dimensional Gaussian significance.</p><div class="table-wrap"><table><thead><tr><th>Analysis</th><th>Channel</th><th>Variation</th><th>fb⁻¹</th><th>f<sub>beam</sub> ref.</th><th>f<sub>beam</sub> var.</th><th>Δf<sub>beam</sub></th><th>Z (ref. truth)</th><th>Z (var. truth)</th><th>D² (ref. truth)</th></tr></thead><tbody>{''.join(summary_rows)}</tbody></table></div><p><a href="summaries/comparison.json">JSON</a> · <a href="summaries/comparison.csv">CSV</a> · <a href="summaries/comparison.npz">NPZ arrays and covariances</a></p></section>
+<section class="panel"><h2>Absolute signed-pull-angle numerical comparison</h2><p>Directional f<sub>beam</sub> values retain their signs. Six-bin D² values are Mahalanobis distances in the supported covariance subspace; √D² is not labelled as a one-dimensional Gaussian significance.</p><div class="table-wrap"><table><thead><tr><th>Analysis</th><th>Channel</th><th>Variation</th><th>fb⁻¹</th><th>f<sub>beam</sub> ref.</th><th>f<sub>beam</sub> var.</th><th>Δf<sub>beam</sub></th><th>Z (ref. truth)</th><th>Z (var. truth)</th><th>D² (ref. truth)</th></tr></thead><tbody>{''.join(summary_rows)}</tbody></table></div><p><a href="summaries/comparison.json">JSON</a> · <a href="summaries/comparison.csv">CSV</a> · <a href="summaries/comparison.npz">NPZ arrays and covariances</a></p></section>
 {score_pull_html}
 <section><h2>Pull-observable comparisons, reference stacks and diagnostics</h2><div class="controls">
 <label>Analysis<select id="strategy"><option value="all">All</option>{''.join(f'<option value="{name}">{name}</option>' for name in analyses)}</select></label>

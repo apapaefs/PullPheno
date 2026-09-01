@@ -33,9 +33,12 @@ def massless(pt, rapidity, phi, pid):
 
 
 class FakeJet:
-    def __init__(self, pt, rapidity, phi, constituents=()):
+    def __init__(self, pt, rapidity, phi, constituents=(), pseudorapidity=None):
         self._pt = pt
         self._rapidity = rapidity
+        self._pseudorapidity = (
+            rapidity if pseudorapidity is None else pseudorapidity
+        )
         self._phi = phi
         self._constituents = tuple(constituents)
 
@@ -45,6 +48,9 @@ class FakeJet:
     def rapidity(self):
         return self._rapidity
 
+    def eta(self):
+        return self._pseudorapidity
+
     def phi(self):
         return self._phi
 
@@ -53,6 +59,61 @@ class FakeJet:
 
 
 class SelectionTests(unittest.TestCase):
+    def test_alternative_cut_profiles_use_eta_and_wide_dilepton_window(self):
+        for profile, eta_max in (
+            ("eta2-mll71-111", 2.0),
+            ("eta3-mll71-111", 3.0),
+        ):
+            with self.subTest(profile=profile):
+                cuts, jet_variable = analysis.resolved_cuts_for_profile(profile)
+                self.assertEqual(jet_variable, "pseudorapidity")
+                self.assertNotIn("jet_abs_y_max", cuts)
+                self.assertEqual(cuts["jet_abs_eta_max"], eta_max)
+                self.assertEqual(cuts["lepton_mass_min_gev"], 71.0)
+                self.assertEqual(cuts["lepton_mass_max_gev"], 111.0)
+
+    def test_wide_dilepton_profile_accepts_mass_below_nominal_window(self):
+        particles = particle_event(
+            [
+                massless(37.5, 0.0, 0.0, 11),
+                massless(37.5, 0.0, math.pi, -11),
+            ]
+        )
+        nominal = analysis.select_z_candidate(particles)
+        wide_cuts, _ = analysis.resolved_cuts_for_profile("eta2-mll71-111")
+        wide = analysis.select_z_candidate(particles, wide_cuts)
+        self.assertIsNone(nominal.candidate)
+        self.assertNotIn("dilepton_mass_window", nominal.passed_steps)
+        self.assertIsNotNone(wide.candidate)
+        self.assertIn("dilepton_mass_window", wide.passed_steps)
+
+    def test_jet_profiles_cut_on_pseudorapidity_not_rapidity(self):
+        jet = FakeJet(50.0, rapidity=1.5, phi=0.0, pseudorapidity=2.5)
+        eta2_cuts, eta_variable = analysis.resolved_cuts_for_profile(
+            "eta2-mll71-111"
+        )
+        eta3_cuts, _ = analysis.resolved_cuts_for_profile("eta3-mll71-111")
+        nominal_cuts, nominal_variable = analysis.resolved_cuts_for_profile("nominal")
+        self.assertFalse(
+            analysis.jet_passes_acceptance(jet, eta2_cuts, eta_variable)
+        )
+        self.assertTrue(
+            analysis.jet_passes_acceptance(jet, eta3_cuts, eta_variable)
+        )
+        self.assertTrue(
+            analysis.jet_passes_acceptance(jet, nominal_cuts, nominal_variable)
+        )
+
+    def test_wide_dilepton_profile_expands_histogram_range(self):
+        cuts, _ = analysis.resolved_cuts_for_profile("eta2-mll71-111")
+        z_mass = next(
+            spec
+            for spec in analysis.plot_registry(cuts)
+            if spec.channel == "z" and spec.key == "boson_mass"
+        )
+        self.assertEqual(z_mass.edges[0], 71.0)
+        self.assertEqual(z_mass.edges[-1], 111.0)
+
     def test_delta_phi_wraps_at_pi(self):
         self.assertAlmostEqual(analysis.delta_phi(-math.pi + 0.1, math.pi - 0.1), 0.2)
         self.assertAlmostEqual(analysis.delta_phi(math.pi - 0.1, -math.pi + 0.1), -0.2)
@@ -667,6 +728,54 @@ class RunManagementTests(unittest.TestCase):
             payload["event_processing"]["partition"],
             "contiguous_global_entry_ranges",
         )
+
+    def test_cut_profile_cli_and_provenance(self):
+        parsed = analysis.parse_arguments(
+            [
+                "--samples",
+                "samples.json",
+                "--analyses",
+                "cutbased",
+                "--cut-profile",
+                "eta2-mll71-111",
+            ]
+        )
+        self.assertEqual(parsed.cut_profile, "eta2-mll71-111")
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            analysis.parse_arguments(
+                ["--from-run", "completed-run", "--cut-profile", "eta2-mll71-111"]
+            )
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            analysis.parse_arguments(
+                [
+                    "--samples",
+                    "samples.json",
+                    "--analyses",
+                    "cutbased",
+                    "xgboost",
+                    "--cut-profile",
+                    "eta2-mll71-111",
+                ]
+            )
+
+        spec = analysis.SampleSpec(
+            "VBFH", "higgs", ("unused.root",), 1.0, "VBF H", "#000000", 0
+        )
+        config = analysis.analysis_config_with_cut_profile(
+            analysis.AnalysisConfig(
+                "Data", (300.0,), (spec,), "synthetic.json"
+            ),
+            parsed.cut_profile,
+        )
+        payload = analysis.resolved_config_payload(
+            config, None, ("cutbased",), None
+        )
+        self.assertEqual(payload["cut_profile"], "eta2-mll71-111")
+        self.assertEqual(payload["jet_acceptance_variable"], "pseudorapidity")
+        self.assertEqual(payload["cuts"]["jet_abs_eta_max"], 2.0)
+        self.assertNotIn("jet_abs_y_max", payload["cuts"])
+        self.assertEqual(payload["cuts"]["lepton_mass_min_gev"], 71.0)
+        self.assertEqual(payload["cuts"]["lepton_mass_max_gev"], 111.0)
 
     def test_physics_legend_is_opaque_and_inside_data_axes(self):
         os.environ.setdefault(

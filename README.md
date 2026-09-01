@@ -186,6 +186,62 @@ must be rerun once from their ROOT events.  After that one-time pass, all maps,
 partition scans and later multi-scenario comparisons are generated without
 reopening ROOT files.
 
+### Campaign 14 central-jet alternatives
+
+Two named cut-based profiles rerun the common event selection with a genuine
+jet-pseudorapidity acceptance and a wider Z window:
+
+- `eta2-mll71-111`: $|\eta_{\rm jet}|<2.0$ and
+  $71<m_{\ell\ell}<111\,\mathrm{GeV}$;
+- `eta3-mll71-111`: $|\eta_{\rm jet}|<3.0$ and
+  $71<m_{\ell\ell}<111\,\mathrm{GeV}$.
+
+The acceptance is applied to every reconstructed anti-$k_T$ jet before the
+two leading-$p_T$ tagging jets are chosen.  All other Higgs, Z and VBF cuts
+remain unchanged.  In particular, the nominal profile still uses
+$|y_{\rm jet}|<4.5$ and $80<m_{\ell\ell}<100\,\mathrm{GeV}$.  The selected
+profile, resolved cuts and choice of jet acceptance variable are stored in
+`run.json` and displayed in the run index.
+
+The latest completed production inputs are the two campaign-14 cached
+manifests.  On Odysseus, run both alternatives sequentially on the nominal
+Herwig samples with:
+
+```bash
+cd /home/apapaefs/Projects/PullPheno
+source /home/apapaefs/Projects/root/root_v6.40.02/bin/thisroot.sh
+for profile in eta2-mll71-111 eta3-mll71-111; do
+  .venv-odysseus/bin/python HwSimPythonAnalysis.py \
+    --samples /micron/Projects/PullPheno/analysis-input-cache/campaign-00014/manifests/samples_odysseus_campaign00014_herwig.json \
+    --analyses cutbased \
+    --cut-profile "$profile" \
+    --event-shards 256 \
+    --workers 128 \
+    --output-root /data/Projects/PullPheno/analysis-results \
+    --run-name "campaign00014-herwig-$profile"
+done
+```
+
+To retain the latest independent colour-reconnection comparison, repeat both
+profiles on the `pReco=0.25` samples:
+
+```bash
+for profile in eta2-mll71-111 eta3-mll71-111; do
+  .venv-odysseus/bin/python HwSimPythonAnalysis.py \
+    --samples /micron/Projects/PullPheno/analysis-input-cache/campaign-00014/manifests/samples_odysseus_campaign00014_herwig_preco025.json \
+    --analyses cutbased \
+    --cut-profile "$profile" \
+    --event-shards 256 \
+    --workers 128 \
+    --output-root /data/Projects/PullPheno/analysis-results \
+    --run-name "campaign00014-herwig-preco025-$profile"
+done
+```
+
+`--cut-profile` deliberately requires a fresh `--samples` ROOT pass and, for
+these alternatives, `--analyses cutbased`; selection-changing profiles cannot
+be applied with `--from-run`.
+
 The manifest assigns each process an XGBoost `role` of `signal` or
 `background`.  The classifiers use only $m_{jj}$,
 $|\Delta y_{jj}|$, the two tagging-jet transverse momenta, boson $p_T$ and
@@ -250,7 +306,7 @@ The run identifier contains a UTC timestamp, the optional run name and a hash
 of the resolved analysis configuration.  Existing runs and plots are never
 overwritten.  A completed run contains:
 
-- expected-yield and unit-area PNG/PDF plots;
+- publication-quality 300-dpi PNG and vector PDF expected-yield and unit-area plots;
 - differential $R_i$ plots with separate projected-data and MC uncertainties;
 - saved Higgs and Z models, frozen thresholds and classifier diagnostics;
 - long-form CSV and Markdown cutflows;

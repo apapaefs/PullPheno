@@ -28,7 +28,7 @@ import time
 import traceback
 import uuid
 from collections import OrderedDict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
@@ -39,10 +39,11 @@ import numpy as np
 import xgboost_root_varfiles_module as xgbtools
 
 
-ANALYSIS_VERSION = "2.6.0"
+ANALYSIS_VERSION = "2.7.0"
 ROOT_PASS_CHECKPOINT_VERSION = 1
 ROOT_PASS_CHECKPOINT_RELATIVE = Path("checkpoints") / "root-pass"
 RUN_LOG_NAME = "run.log"
+PNG_PLOT_DPI = 300
 MZ_GEV = 91.1876
 NEUTRINO_IDS = frozenset((12, 14, 16))
 ANALYSIS_STRATEGIES = ("cutbased", "xgboost")
@@ -91,6 +92,32 @@ CUTS: Dict[str, float] = {
     "mjj_min_gev": 400.0,
     "abs_delta_y_min": 2.5,
 }
+
+NOMINAL_CUT_PROFILE = "nominal"
+CUT_PROFILE_NAMES = (
+    NOMINAL_CUT_PROFILE,
+    "eta2-mll71-111",
+    "eta3-mll71-111",
+)
+CUT_PROFILE_LABELS = {
+    NOMINAL_CUT_PROFILE: "Nominal |y_jet| < 4.5 and 80 < m(ll) < 100 GeV",
+    "eta2-mll71-111": "Central jets |eta_jet| < 2.0 and 71 < m(ll) < 111 GeV",
+    "eta3-mll71-111": "Central jets |eta_jet| < 3.0 and 71 < m(ll) < 111 GeV",
+}
+
+
+def resolved_cuts_for_profile(identifier: str) -> Tuple[Dict[str, float], str]:
+    """Return an independent cut dictionary and its jet acceptance variable."""
+    if identifier not in CUT_PROFILE_NAMES:
+        raise ValueError(f"Unknown cut profile: {identifier}")
+    cuts = dict(CUTS)
+    if identifier == NOMINAL_CUT_PROFILE:
+        return cuts, "rapidity"
+    cuts.pop("jet_abs_y_max")
+    cuts["jet_abs_eta_max"] = 2.0 if identifier == "eta2-mll71-111" else 3.0
+    cuts["lepton_mass_min_gev"] = 71.0
+    cuts["lepton_mass_max_gev"] = 111.0
+    return cuts, "pseudorapidity"
 
 HIGGS_CUTFLOW = (
     "all_events",
@@ -319,6 +346,109 @@ class AnalysisConfig:
     samples: Tuple[SampleSpec, ...]
     source_manifest: str
     scenario: Optional[ScenarioSpec] = None
+    cut_profile: str = NOMINAL_CUT_PROFILE
+    cuts: Mapping[str, float] = field(default_factory=lambda: dict(CUTS))
+    jet_acceptance_variable: str = "rapidity"
+
+
+def validate_cut_configuration(
+    cuts: Mapping[str, float], jet_acceptance_variable: str
+) -> Dict[str, float]:
+    resolved = {str(key): float(value) for key, value in cuts.items()}
+    common_required = set(CUTS) - {"jet_abs_y_max"}
+    missing = sorted(common_required - set(resolved))
+    if missing:
+        raise ValueError(f"Cut configuration is missing {missing}")
+    if any(not math.isfinite(value) or value <= 0.0 for value in resolved.values()):
+        raise ValueError("All cut values must be finite and positive")
+    if resolved["photon_mass_min_gev"] >= resolved["photon_mass_max_gev"]:
+        raise ValueError("Diphoton mass-window limits are not ordered")
+    if resolved["lepton_mass_min_gev"] >= resolved["lepton_mass_max_gev"]:
+        raise ValueError("Dilepton mass-window limits are not ordered")
+    acceptance_key = {
+        "rapidity": "jet_abs_y_max",
+        "pseudorapidity": "jet_abs_eta_max",
+    }.get(jet_acceptance_variable)
+    if acceptance_key is None:
+        raise ValueError(
+            f"Unsupported jet acceptance variable: {jet_acceptance_variable}"
+        )
+    if acceptance_key not in resolved:
+        raise ValueError(
+            f"Jet acceptance {jet_acceptance_variable} requires {acceptance_key}"
+        )
+    other_key = (
+        "jet_abs_eta_max"
+        if acceptance_key == "jet_abs_y_max"
+        else "jet_abs_y_max"
+    )
+    if other_key in resolved:
+        raise ValueError(
+            f"Cut configuration cannot contain both {acceptance_key} and {other_key}"
+        )
+    return resolved
+
+
+def analysis_config_with_cut_profile(
+    config: AnalysisConfig, identifier: str
+) -> AnalysisConfig:
+    cuts, jet_acceptance_variable = resolved_cuts_for_profile(identifier)
+    return replace(
+        config,
+        cut_profile=identifier,
+        cuts=validate_cut_configuration(cuts, jet_acceptance_variable),
+        jet_acceptance_variable=jet_acceptance_variable,
+    )
+
+
+def cut_labels_for_config(config: AnalysisConfig) -> Dict[str, str]:
+    cuts = config.cuts
+    labels = dict(CUT_LABELS)
+    labels.update(
+        {
+            "photon_acceptance": (
+                f"Two photons with |eta| < {cuts['photon_abs_eta_max']:g}"
+            ),
+            "leading_photon_pt": (
+                f"Leading photon pT > {cuts['photon_pt_lead_min_gev']:g} GeV"
+            ),
+            "subleading_photon_pt": (
+                f"Subleading photon pT > {cuts['photon_pt_sublead_min_gev']:g} GeV"
+            ),
+            "photon_isolation": (
+                "Two isolated photons "
+                f"(Irel < {cuts['photon_relative_isolation_max']:g})"
+            ),
+            "diphoton_mass_window": (
+                f"{cuts['photon_mass_min_gev']:g} < m(gamma gamma) < "
+                f"{cuts['photon_mass_max_gev']:g} GeV"
+            ),
+            "lepton_acceptance": (
+                f"Two leptons with |eta| < {cuts['lepton_abs_eta_max']:g}"
+            ),
+            "leading_lepton_pt": (
+                f"Leading lepton pT > {cuts['lepton_pt_lead_min_gev']:g} GeV"
+            ),
+            "subleading_lepton_pt": (
+                f"Subleading lepton pT > {cuts['lepton_pt_sublead_min_gev']:g} GeV"
+            ),
+            "dilepton_mass_window": (
+                f"{cuts['lepton_mass_min_gev']:g} < m(ll) < "
+                f"{cuts['lepton_mass_max_gev']:g} GeV"
+            ),
+            "mjj": f"mjj > {cuts['mjj_min_gev']:g} GeV",
+            "delta_yjj": f"|Delta yjj| > {cuts['abs_delta_y_min']:g}",
+        }
+    )
+    if config.jet_acceptance_variable == "pseudorapidity":
+        acceptance = f"|eta| < {cuts['jet_abs_eta_max']:g}"
+    else:
+        acceptance = f"|y| < {cuts['jet_abs_y_max']:g}"
+    labels["at_least_two_jets"] = (
+        "At least two jets "
+        f"(pT > {cuts['jet_pt_min_gev']:g} GeV, {acceptance})"
+    )
+    return labels
 
 
 @dataclass(frozen=True)
@@ -845,39 +975,41 @@ def fold_symmetric_histogram(histogram: WeightedHistogram) -> WeightedHistogram:
     return folded
 
 
-def select_higgs_candidate(particles: EventParticles) -> CandidateDecision:
+def select_higgs_candidate(
+    particles: EventParticles, cuts: Mapping[str, float] = CUTS
+) -> CandidateDecision:
     passed: List[str] = []
     photons = np.flatnonzero(particles.pid == 22)
     if len(photons) < 2:
         return CandidateDecision(tuple(passed), None)
     passed.append("at_least_two_photons")
 
-    accepted = photons[np.abs(particles.eta[photons]) < CUTS["photon_abs_eta_max"]]
+    accepted = photons[np.abs(particles.eta[photons]) < cuts["photon_abs_eta_max"]]
     if len(accepted) < 2:
         return CandidateDecision(tuple(passed), None)
     passed.append("photon_acceptance")
     accepted = accepted[np.argsort(particles.pt[accepted])[::-1]]
 
-    if particles.pt[accepted[0]] <= CUTS["photon_pt_lead_min_gev"]:
+    if particles.pt[accepted[0]] <= cuts["photon_pt_lead_min_gev"]:
         return CandidateDecision(tuple(passed), None)
     passed.append("leading_photon_pt")
-    if particles.pt[accepted[1]] <= CUTS["photon_pt_sublead_min_gev"]:
+    if particles.pt[accepted[1]] <= cuts["photon_pt_sublead_min_gev"]:
         return CandidateDecision(tuple(passed), None)
     passed.append("subleading_photon_pt")
 
-    pt_qualified = accepted[particles.pt[accepted] > CUTS["photon_pt_sublead_min_gev"]]
+    pt_qualified = accepted[particles.pt[accepted] > cuts["photon_pt_sublead_min_gev"]]
     isolated: List[Tuple[int, float]] = []
     for index in pt_qualified:
         isolation = particles.relative_photon_isolation(
-            int(index), radius=CUTS["photon_isolation_dr"]
+            int(index), radius=cuts["photon_isolation_dr"]
         )
-        if isolation < CUTS["photon_relative_isolation_max"]:
+        if isolation < cuts["photon_relative_isolation_max"]:
             isolated.append((int(index), isolation))
     isolated.sort(key=lambda item: particles.pt[item[0]], reverse=True)
     if (
         len(isolated) < 2
-        or particles.pt[isolated[0][0]] <= CUTS["photon_pt_lead_min_gev"]
-        or particles.pt[isolated[1][0]] <= CUTS["photon_pt_sublead_min_gev"]
+        or particles.pt[isolated[0][0]] <= cuts["photon_pt_lead_min_gev"]
+        or particles.pt[isolated[1][0]] <= cuts["photon_pt_sublead_min_gev"]
     ):
         return CandidateDecision(tuple(passed), None)
     passed.append("photon_isolation")
@@ -885,7 +1017,7 @@ def select_higgs_candidate(particles: EventParticles) -> CandidateDecision:
     lead_index, lead_iso = isolated[0]
     sublead_index, sublead_iso = isolated[1]
     boson = particles.p4(lead_index) + particles.p4(sublead_index)
-    if not (CUTS["photon_mass_min_gev"] < boson.mass < CUTS["photon_mass_max_gev"]):
+    if not (cuts["photon_mass_min_gev"] < boson.mass < cuts["photon_mass_max_gev"]):
         return CandidateDecision(tuple(passed), None)
     passed.append("diphoton_mass_window")
     return CandidateDecision(
@@ -901,14 +1033,16 @@ def select_higgs_candidate(particles: EventParticles) -> CandidateDecision:
     )
 
 
-def select_z_candidate(particles: EventParticles) -> CandidateDecision:
+def select_z_candidate(
+    particles: EventParticles, cuts: Mapping[str, float] = CUTS
+) -> CandidateDecision:
     passed: List[str] = []
     leptons = np.flatnonzero(np.isin(np.abs(particles.pid), (11, 13)))
     if len(leptons) < 2:
         return CandidateDecision(tuple(passed), None)
     passed.append("at_least_two_leptons")
 
-    accepted = leptons[np.abs(particles.eta[leptons]) < CUTS["lepton_abs_eta_max"]]
+    accepted = leptons[np.abs(particles.eta[leptons]) < cuts["lepton_abs_eta_max"]]
     if len(accepted) < 2:
         return CandidateDecision(tuple(passed), None)
     passed.append("lepton_acceptance")
@@ -926,13 +1060,13 @@ def select_z_candidate(particles: EventParticles) -> CandidateDecision:
     _, first, second, boson = min(pairs, key=lambda item: item[0])
     lead_index, sublead_index = sorted((first, second), key=lambda idx: particles.pt[idx], reverse=True)
 
-    if particles.pt[lead_index] <= CUTS["lepton_pt_lead_min_gev"]:
+    if particles.pt[lead_index] <= cuts["lepton_pt_lead_min_gev"]:
         return CandidateDecision(tuple(passed), None)
     passed.append("leading_lepton_pt")
-    if particles.pt[sublead_index] <= CUTS["lepton_pt_sublead_min_gev"]:
+    if particles.pt[sublead_index] <= cuts["lepton_pt_sublead_min_gev"]:
         return CandidateDecision(tuple(passed), None)
     passed.append("subleading_lepton_pt")
-    if not (CUTS["lepton_mass_min_gev"] < boson.mass < CUTS["lepton_mass_max_gev"]):
+    if not (cuts["lepton_mass_min_gev"] < boson.mass < cuts["lepton_mass_max_gev"]):
         return CandidateDecision(tuple(passed), None)
     passed.append("dilepton_mass_window")
     flavour = "ee" if abs(int(particles.pid[lead_index])) == 11 else "mu mu"
@@ -942,7 +1076,12 @@ def select_z_candidate(particles: EventParticles) -> CandidateDecision:
     )
 
 
-def evaluate_vbf_selection(jet1: FourVector, jet2: FourVector, boson: FourVector) -> VBFDecision:
+def evaluate_vbf_selection(
+    jet1: FourVector,
+    jet2: FourVector,
+    boson: FourVector,
+    cuts: Mapping[str, float] = CUTS,
+) -> VBFDecision:
     dijet = jet1 + jet2
     delta_y = abs(jet1.rapidity - jet2.rapidity)
     midpoint = 0.5 * (jet1.rapidity + jet2.rapidity)
@@ -951,10 +1090,10 @@ def evaluate_vbf_selection(jet1: FourVector, jet2: FourVector, boson: FourVector
         jet1.rapidity, jet2.rapidity
     )
     passed: List[str] = []
-    if dijet.mass <= CUTS["mjj_min_gev"]:
+    if dijet.mass <= cuts["mjj_min_gev"]:
         return VBFDecision(tuple(passed), dijet.mass, delta_y, zstar, central)
     passed.append("mjj")
-    if delta_y <= CUTS["abs_delta_y_min"]:
+    if delta_y <= cuts["abs_delta_y_min"]:
         return VBFDecision(tuple(passed), dijet.mass, delta_y, zstar, central)
     passed.append("delta_yjj")
     if not central:
@@ -981,6 +1120,34 @@ def pseudojet_pt(jet: Any) -> float:
     if hasattr(jet, "perp"):
         return _pseudojet_value(jet, "perp")
     return _pseudojet_value(jet, "pt")
+
+
+def pseudojet_pseudorapidity(jet: Any) -> float:
+    if hasattr(jet, "eta"):
+        return _pseudojet_value(jet, "eta")
+    if hasattr(jet, "pseudorapidity"):
+        return _pseudojet_value(jet, "pseudorapidity")
+    px = _pseudojet_value(jet, "px")
+    py = _pseudojet_value(jet, "py")
+    pz = _pseudojet_value(jet, "pz")
+    momentum = math.sqrt(px * px + py * py + pz * pz)
+    plus = momentum + pz
+    minus = momentum - pz
+    if plus > 0.0 and minus > 0.0:
+        return 0.5 * math.log(plus / minus)
+    return math.copysign(math.inf, pz) if pz else 0.0
+
+
+def jet_passes_acceptance(
+    jet: Any,
+    cuts: Mapping[str, float],
+    jet_acceptance_variable: str,
+) -> bool:
+    if jet_acceptance_variable == "pseudorapidity":
+        return abs(pseudojet_pseudorapidity(jet)) < cuts["jet_abs_eta_max"]
+    if jet_acceptance_variable == "rapidity":
+        return abs(_pseudojet_value(jet, "rapidity")) < cuts["jet_abs_y_max"]
+    raise ValueError(f"Unsupported jet acceptance variable: {jet_acceptance_variable}")
 
 
 def calculate_pull_vector(jet: Any) -> PullVector:
@@ -1067,24 +1234,36 @@ def _linspace(low: float, high: float, bins: int) -> np.ndarray:
     return np.linspace(low, high, bins + 1, dtype=np.float64)
 
 
-def plot_registry() -> Tuple[PlotSpec, ...]:
+def plot_registry(cuts: Mapping[str, float] = CUTS) -> Tuple[PlotSpec, ...]:
     specs: List[PlotSpec] = []
-    for channel, object_name, mass_label, mass_range in (
-        ("higgs", "photon", r"$m_{\gamma\gamma}$ [GeV]", (120.0, 130.0)),
-        ("z", "lepton", r"$m_{\ell\ell}$ [GeV]", (80.0, 100.0)),
+    for channel, object_name, mass_label, mass_range, object_eta_max in (
+        (
+            "higgs",
+            "photon",
+            r"$m_{\gamma\gamma}$ [GeV]",
+            (cuts["photon_mass_min_gev"], cuts["photon_mass_max_gev"]),
+            cuts["photon_abs_eta_max"],
+        ),
+        (
+            "z",
+            "lepton",
+            r"$m_{\ell\ell}$ [GeV]",
+            (cuts["lepton_mass_min_gev"], cuts["lepton_mass_max_gev"]),
+            cuts["lepton_abs_eta_max"],
+        ),
     ):
         specs.extend(
             [
                 PlotSpec("leading_object_pt", channel, "common", f"Leading {object_name} transverse momentum", rf"Leading {object_name} $p_T$ [GeV]", _linspace(0.0, 500.0, 40)),
                 PlotSpec("subleading_object_pt", channel, "common", f"Subleading {object_name} transverse momentum", rf"Subleading {object_name} $p_T$ [GeV]", _linspace(0.0, 400.0, 40)),
-                PlotSpec("leading_object_eta", channel, "common", f"Leading {object_name} pseudorapidity", rf"Leading {object_name} $\eta$", _linspace(-2.5, 2.5, 30)),
-                PlotSpec("subleading_object_eta", channel, "common", f"Subleading {object_name} pseudorapidity", rf"Subleading {object_name} $\eta$", _linspace(-2.5, 2.5, 30)),
+                PlotSpec("leading_object_eta", channel, "common", f"Leading {object_name} pseudorapidity", rf"Leading {object_name} $\eta$", _linspace(-object_eta_max, object_eta_max, 30)),
+                PlotSpec("subleading_object_eta", channel, "common", f"Subleading {object_name} pseudorapidity", rf"Subleading {object_name} $\eta$", _linspace(-object_eta_max, object_eta_max, 30)),
                 PlotSpec("boson_mass", channel, "common", "Reconstructed boson mass", mass_label, _linspace(mass_range[0], mass_range[1], 20)),
                 PlotSpec("boson_pt", channel, "common", "Reconstructed boson transverse momentum", r"Boson $p_T$ [GeV]", _linspace(0.0, 600.0, 40)),
                 PlotSpec("boson_y", channel, "common", "Reconstructed boson rapidity", r"Boson $y$", _linspace(-5.0, 5.0, 40)),
                 PlotSpec("n_jets", channel, "common", "Selected jet multiplicity", r"Number of jets", np.arange(1.5, 11.5, 1.0)),
-                PlotSpec("leading_jet_pt", channel, "common", "Leading tagging-jet transverse momentum", r"Leading jet $p_T$ [GeV]", _linspace(30.0, 800.0, 40)),
-                PlotSpec("subleading_jet_pt", channel, "common", "Subleading tagging-jet transverse momentum", r"Subleading jet $p_T$ [GeV]", _linspace(30.0, 600.0, 40)),
+                PlotSpec("leading_jet_pt", channel, "common", "Leading tagging-jet transverse momentum", r"Leading jet $p_T$ [GeV]", _linspace(cuts["jet_pt_min_gev"], 800.0, 40)),
+                PlotSpec("subleading_jet_pt", channel, "common", "Subleading tagging-jet transverse momentum", r"Subleading jet $p_T$ [GeV]", _linspace(cuts["jet_pt_min_gev"], 600.0, 40)),
                 PlotSpec("leading_jet_y", channel, "common", "Leading tagging-jet rapidity", r"Leading jet $y$", _linspace(-4.5, 4.5, 36)),
                 PlotSpec("subleading_jet_y", channel, "common", "Subleading tagging-jet rapidity", r"Subleading jet $y$", _linspace(-4.5, 4.5, 36)),
                 PlotSpec("mjj", channel, "common", "Tagging-jet invariant mass", r"$m_{jj}$ [GeV]", _linspace(0.0, 4000.0, 40)),
@@ -1098,10 +1277,10 @@ def plot_registry() -> Tuple[PlotSpec, ...]:
             ]
         )
     specs.append(
-        PlotSpec("leading_photon_isolation", "higgs", "common", "Leading-photon relative isolation", r"Leading photon $I_{\mathrm{rel}}$", _linspace(0.0, 0.1, 20))
+        PlotSpec("leading_photon_isolation", "higgs", "common", "Leading-photon relative isolation", r"Leading photon $I_{\mathrm{rel}}$", _linspace(0.0, cuts["photon_relative_isolation_max"], 20))
     )
     specs.append(
-        PlotSpec("subleading_photon_isolation", "higgs", "common", "Subleading-photon relative isolation", r"Subleading photon $I_{\mathrm{rel}}$", _linspace(0.0, 0.1, 20))
+        PlotSpec("subleading_photon_isolation", "higgs", "common", "Subleading-photon relative isolation", r"Subleading photon $I_{\mathrm{rel}}$", _linspace(0.0, cuts["photon_relative_isolation_max"], 20))
     )
     keys = [(spec.channel, spec.key) for spec in specs]
     if len(keys) != len(set(keys)):
@@ -1279,12 +1458,28 @@ def analysis_config_from_payload(
             parameters=dict(raw_scenario.get("parameters", {})),
         )
     )
+    cut_profile = str(configuration.get("cut_profile", NOMINAL_CUT_PROFILE))
+    if cut_profile not in CUT_PROFILE_NAMES:
+        raise ValueError(f"Resolved configuration has unknown cut profile {cut_profile}")
+    jet_acceptance_variable = str(
+        configuration.get("jet_acceptance_variable", "rapidity")
+    )
+    raw_cuts = configuration.get("cuts")
+    if raw_cuts is None:
+        raw_cuts, inferred_variable = resolved_cuts_for_profile(cut_profile)
+        jet_acceptance_variable = str(
+            configuration.get("jet_acceptance_variable", inferred_variable)
+        )
+    cuts = validate_cut_configuration(raw_cuts, jet_acceptance_variable)
     return AnalysisConfig(
         tree_name=str(configuration.get("tree_name", "Data")),
         luminosities_fb=luminosities,
         samples=samples,
         source_manifest=str(configuration.get("source_manifest", "resolved-configuration")),
         scenario=scenario,
+        cut_profile=cut_profile,
+        cuts=cuts,
+        jet_acceptance_variable=jet_acceptance_variable,
     )
 
 
@@ -1301,7 +1496,10 @@ def resolved_config_payload(
         "luminosities_fb": list(config.luminosities_fb),
         "samples": [asdict(sample) for sample in config.samples],
         "scenario": None if config.scenario is None else asdict(config.scenario),
-        "cuts": dict(CUTS),
+        "cut_profile": config.cut_profile,
+        "cut_profile_label": CUT_PROFILE_LABELS[config.cut_profile],
+        "jet_acceptance_variable": config.jet_acceptance_variable,
+        "cuts": dict(config.cuts),
         "max_events_per_sample": max_events,
         "source_manifest": config.source_manifest,
         "analyses": list(analyses),
@@ -1606,6 +1804,7 @@ def _restore_root_pass_result(
     spec: SampleSpec,
     metadata: Mapping[str, Any],
     archive_path: Path,
+    cuts: Mapping[str, float] = CUTS,
 ) -> SampleResult:
     if archive_path.stat().st_size != int(metadata["archive_size_bytes"]):
         raise ValueError(f"Checkpoint archive size differs for {spec.name}: {archive_path}")
@@ -1615,6 +1814,7 @@ def _restore_root_pass_result(
         int(metadata["total_entries"]),
         float(metadata["generated_sumw"]),
         strategy=strategy,
+        cuts=cuts,
     )
     result.application_scope = str(metadata.get("application_scope", "all_events"))
     result.processed_entries = int(metadata["processed_entries"])
@@ -1758,7 +1958,11 @@ def load_root_pass_checkpoint(
         archive_path = checkpoint_dir / str(item["archive"])
         if not archive_path.is_file():
             raise FileNotFoundError(f"Checkpoint archive is missing: {archive_path}")
-        results.append(_restore_root_pass_result(specs_by_name[sample_name], item, archive_path))
+        results.append(
+            _restore_root_pass_result(
+                specs_by_name[sample_name], item, archive_path, config.cuts
+            )
+        )
     analyses = tuple(str(value) for value in configuration.get("analyses", ("cutbased",)))
     _validate_root_pass_results(config, results, analyses)
     logging.info(
@@ -1805,8 +2009,11 @@ def initialize_result(
     total_entries: int,
     generated_sumw: float,
     strategy: str = "cutbased",
+    cuts: Mapping[str, float] = CUTS,
 ) -> SampleResult:
-    relevant_specs = [item for item in plot_registry() if item.channel == spec.channel]
+    relevant_specs = [
+        item for item in plot_registry(cuts) if item.channel == spec.channel
+    ]
     result = SampleResult(spec, total_entries, generated_sumw, strategy=strategy)
     result.cutflow = OrderedDict(
         (step, CutStat()) for step in cutflow_steps(spec.channel, strategy)
@@ -1861,6 +2068,7 @@ def load_completed_run(
                 int(source["total_entries"]),
                 float(source["generated_sumw"]),
                 strategy=strategy,
+                cuts=config.cuts,
             )
             result.processed_entries = int(source["processed_entries"])
             result.application_scope = str(source.get("application_scope", "all_events"))
@@ -1872,7 +2080,7 @@ def load_completed_run(
                 for step in cutflow_steps(spec.channel, strategy)
             )
             missing = []
-            for item in plot_registry():
+            for item in plot_registry(config.cuts):
                 if item.channel != spec.channel or item.key == "folded_pull_angle":
                     continue
                 prefix = f"{strategy}__{spec.name}__{item.key}"
@@ -2239,6 +2447,7 @@ def merge_sample_shard_results(
     generated_sumw: float,
     file_metadata: Sequence[Mapping[str, Any]],
     shard_results: Sequence[Tuple[SampleShard, SampleResult]],
+    cuts: Mapping[str, float] = CUTS,
 ) -> SampleResult:
     """Merge independently processed ranges while retaining event-level moments."""
     if not shard_results:
@@ -2270,7 +2479,9 @@ def merge_sample_shard_results(
     ):
         raise ValueError(f"Shard normalization metadata differs for {spec.name}")
 
-    merged = initialize_result(spec, int(total_entries), float(generated_sumw))
+    merged = initialize_result(
+        spec, int(total_entries), float(generated_sumw), cuts=cuts
+    )
     merged.files = [dict(item) for item in file_metadata]
     scopes = {result.application_scope for result in results}
     if len(scopes) != 1:
@@ -2376,6 +2587,8 @@ def cluster_selected_jets(
     excluded_indices: Iterable[int],
     fastjet: Any,
     jet_definition: Any,
+    cuts: Mapping[str, float] = CUTS,
+    jet_acceptance_variable: str = "rapidity",
 ) -> Tuple[Any, List[Any]]:
     excluded = set(int(value) for value in excluded_indices)
     inputs: List[Any] = []
@@ -2394,9 +2607,11 @@ def cluster_selected_jets(
         pseudojet.set_user_index(index)
         inputs.append(pseudojet)
     cluster = fastjet.ClusterSequence(inputs, jet_definition)
-    jets = fastjet.sorted_by_pt(cluster.inclusive_jets(CUTS["jet_pt_min_gev"]))
+    jets = fastjet.sorted_by_pt(cluster.inclusive_jets(cuts["jet_pt_min_gev"]))
     selected = [
-        jet for jet in jets if abs(_pseudojet_value(jet, "rapidity")) < CUTS["jet_abs_y_max"]
+        jet
+        for jet in jets
+        if jet_passes_acceptance(jet, cuts, jet_acceptance_variable)
     ]
     return cluster, selected
 
@@ -2412,9 +2627,13 @@ def analyze_sample_shard(
     shard: SampleShard,
     collect_common_events: bool = False,
 ) -> SampleResult:
-    result = initialize_result(spec, total_entries, generated_sumw)
+    result = initialize_result(
+        spec, total_entries, generated_sumw, cuts=config.cuts
+    )
     result.files = [dict(item) for item in file_metadata]
-    jet_definition = fastjet.JetDefinition(fastjet.antikt_algorithm, CUTS["jet_radius"])
+    jet_definition = fastjet.JetDefinition(
+        fastjet.antikt_algorithm, config.cuts["jet_radius"]
+    )
     common_buffer = (
         CommonEventBuffer(common_observable_keys(spec.channel))
         if collect_common_events
@@ -2463,9 +2682,9 @@ def analyze_sample_shard(
                 try:
                     particles = particles_from_root(tree.objects, int(tree.numparticles))
                     decision = (
-                        select_higgs_candidate(particles)
+                        select_higgs_candidate(particles, config.cuts)
                         if spec.channel == "higgs"
-                        else select_z_candidate(particles)
+                        else select_z_candidate(particles, config.cuts)
                     )
                     result.processed_entries += 1
                     result.processed_sumw, processed_sumw_correction = compensated_add(
@@ -2483,6 +2702,8 @@ def analyze_sample_shard(
                         (candidate.leading_index, candidate.subleading_index),
                         fastjet,
                         jet_definition,
+                        config.cuts,
+                        config.jet_acceptance_variable,
                     )
                     if len(jets) < 2:
                         continue
@@ -2494,7 +2715,10 @@ def analyze_sample_shard(
                         continue
                     result.cutflow["opposite_hemispheres"].fill(event_weight)
                     vbf = evaluate_vbf_selection(
-                        pseudojet_p4(jet1), pseudojet_p4(jet2), candidate.p4
+                        pseudojet_p4(jet1),
+                        pseudojet_p4(jet2),
+                        candidate.p4,
+                        config.cuts,
                     )
                     observable_values = fill_common_histograms(
                         result, particles, candidate, jets, vbf, event_weight
@@ -2765,6 +2989,7 @@ def process_root_samples(
                 generated_sumw,
                 file_metadata,
                 pairs,
+                config.cuts,
             )
             del buckets[spec.name]
             logging.info(
@@ -5360,6 +5585,7 @@ def write_cutflow_files(
     results: Sequence[SampleResult],
     luminosities: Sequence[float],
     strategy: str = "cutbased",
+    cut_labels: Mapping[str, str] = CUT_LABELS,
 ) -> Tuple[Path, Path]:
     channel_results = [
         result
@@ -5380,7 +5606,7 @@ def write_cutflow_files(
                 "strategy": strategy,
                 "channel": channel,
                 "cut": step,
-                "cut_label": CUT_LABELS[step],
+                "cut_label": cut_labels[step],
                 "sample": result.spec.name,
                 "role": result.spec.role,
                 "raw_count": stat.raw_count,
@@ -5482,6 +5708,7 @@ def generate_plots(
     results: Sequence[SampleResult],
     luminosities: Sequence[float],
     partial: bool,
+    cuts: Mapping[str, float] = CUTS,
 ) -> List[Dict[str, Any]]:
     matplotlib_config = Path(tempfile.gettempdir()) / "pullpheno-matplotlib"
     matplotlib_config.mkdir(parents=True, exist_ok=True)
@@ -5504,7 +5731,7 @@ def generate_plots(
     )
     plot_records: List[Dict[str, Any]] = []
     planned_paths = set()
-    registry = plot_registry()
+    registry = plot_registry(cuts)
     strategies = [name for name in ANALYSIS_STRATEGIES if any(r.strategy == name for r in results)]
     for strategy in strategies:
         for spec in registry:
@@ -5588,7 +5815,9 @@ def generate_plots(
                 fig.tight_layout()
                 png_path = run_dir / relative_base.with_suffix(".png")
                 pdf_path = run_dir / relative_base.with_suffix(".pdf")
-                _save_figure_exclusive(fig, png_path, dpi=170, bbox_inches="tight")
+                _save_figure_exclusive(
+                    fig, png_path, dpi=PNG_PLOT_DPI, bbox_inches="tight"
+                )
                 _save_figure_exclusive(fig, pdf_path, bbox_inches="tight")
                 plt.close(fig)
                 plot_records.append({
@@ -5628,7 +5857,9 @@ def generate_plots(
             fig.tight_layout()
             png_path = run_dir / relative_base.with_suffix(".png")
             pdf_path = run_dir / relative_base.with_suffix(".pdf")
-            _save_figure_exclusive(fig, png_path, dpi=170, bbox_inches="tight")
+            _save_figure_exclusive(
+                fig, png_path, dpi=PNG_PLOT_DPI, bbox_inches="tight"
+            )
             _save_figure_exclusive(fig, pdf_path, bbox_inches="tight")
             plt.close(fig)
             plot_records.append({
@@ -5698,7 +5929,9 @@ def generate_ri_plots(
             fig.tight_layout()
             png_path = run_dir / relative_base.with_suffix(".png")
             pdf_path = run_dir / relative_base.with_suffix(".pdf")
-            _save_figure_exclusive(fig, png_path, dpi=170, bbox_inches="tight")
+            _save_figure_exclusive(
+                fig, png_path, dpi=PNG_PLOT_DPI, bbox_inches="tight"
+            )
             _save_figure_exclusive(fig, pdf_path, bbox_inches="tight")
             plt.close(fig)
             records.append({
@@ -5753,7 +5986,9 @@ def generate_ri_plots(
                 fig.tight_layout()
                 png_path = run_dir / relative_base.with_suffix(".png")
                 pdf_path = run_dir / relative_base.with_suffix(".pdf")
-                _save_figure_exclusive(fig, png_path, dpi=170, bbox_inches="tight")
+                _save_figure_exclusive(
+                    fig, png_path, dpi=PNG_PLOT_DPI, bbox_inches="tight"
+                )
                 _save_figure_exclusive(fig, pdf_path, bbox_inches="tight")
                 plt.close(fig)
                 records.append({
@@ -5784,7 +6019,10 @@ def generate_comparison_plots(
     from matplotlib.ticker import ScalarFormatter
 
     records: List[Dict[str, Any]] = []
-    registry = {(spec.channel, spec.key): spec for spec in plot_registry()}
+    registry = {
+        (spec.channel, spec.key): spec
+        for spec in plot_registry(sources[0].config.cuts)
+    }
     planned_paths = set()
     reference_id = sources[0].scenario.identifier
     for strategy in analyses:
@@ -5989,7 +6227,7 @@ def generate_comparison_plots(
                 png_path = run_dir / relative_base.with_suffix(".png")
                 pdf_path = run_dir / relative_base.with_suffix(".pdf")
                 _save_figure_exclusive(
-                    figure, png_path, dpi=170, bbox_inches="tight"
+                    figure, png_path, dpi=PNG_PLOT_DPI, bbox_inches="tight"
                 )
                 _save_figure_exclusive(figure, pdf_path, bbox_inches="tight")
                 plt.close(figure)
@@ -6190,7 +6428,7 @@ def generate_comparison_plots(
                 _save_figure_exclusive(
                     ratio_figure,
                     ratio_png_path,
-                    dpi=170,
+                    dpi=PNG_PLOT_DPI,
                     bbox_inches="tight",
                 )
                 _save_figure_exclusive(
@@ -6366,7 +6604,10 @@ def generate_comparison_plots(
                         png_path = run_dir / relative_base.with_suffix(".png")
                         pdf_path = run_dir / relative_base.with_suffix(".pdf")
                         _save_figure_exclusive(
-                            figure, png_path, dpi=170, bbox_inches="tight"
+                            figure,
+                            png_path,
+                            dpi=PNG_PLOT_DPI,
+                            bbox_inches="tight",
                         )
                         _save_figure_exclusive(figure, pdf_path, bbox_inches="tight")
                         plt.close(figure)
@@ -6521,7 +6762,9 @@ def generate_score_pull_diagnostic_plots(
                 map_base = base / f"score_pull_map__{scenario_slug}"
                 map_png = run_dir / map_base.with_suffix(".png")
                 map_pdf = run_dir / map_base.with_suffix(".pdf")
-                _save_figure_exclusive(figure, map_png, dpi=170, bbox_inches="tight")
+                _save_figure_exclusive(
+                    figure, map_png, dpi=PNG_PLOT_DPI, bbox_inches="tight"
+                )
                 _save_figure_exclusive(figure, map_pdf, bbox_inches="tight")
                 plt.close(figure)
                 records.append(
@@ -6584,7 +6827,9 @@ def generate_score_pull_diagnostic_plots(
                 fbeam_base = base / f"delta_fbeam_by_score__{scenario_slug}"
                 fbeam_png = run_dir / fbeam_base.with_suffix(".png")
                 fbeam_pdf = run_dir / fbeam_base.with_suffix(".pdf")
-                _save_figure_exclusive(figure, fbeam_png, dpi=170, bbox_inches="tight")
+                _save_figure_exclusive(
+                    figure, fbeam_png, dpi=PNG_PLOT_DPI, bbox_inches="tight"
+                )
                 _save_figure_exclusive(figure, fbeam_pdf, bbox_inches="tight")
                 plt.close(figure)
                 records.append(
@@ -6658,7 +6903,9 @@ def generate_score_pull_diagnostic_plots(
             scan_base = base / "score_category_scan"
             scan_png = run_dir / scan_base.with_suffix(".png")
             scan_pdf = run_dir / scan_base.with_suffix(".pdf")
-            _save_figure_exclusive(figure, scan_png, dpi=170, bbox_inches="tight")
+            _save_figure_exclusive(
+                figure, scan_png, dpi=PNG_PLOT_DPI, bbox_inches="tight"
+            )
             _save_figure_exclusive(figure, scan_pdf, bbox_inches="tight")
             plt.close(figure)
             records.append(
@@ -6771,7 +7018,9 @@ def generate_xgboost_diagnostic_plots(
         fig.tight_layout()
         roc_png = run_dir / base / "roc.png"
         roc_pdf = run_dir / base / "roc.pdf"
-        _save_figure_exclusive(fig, roc_png, dpi=170, bbox_inches="tight")
+        _save_figure_exclusive(
+            fig, roc_png, dpi=PNG_PLOT_DPI, bbox_inches="tight"
+        )
         _save_figure_exclusive(fig, roc_pdf, bbox_inches="tight")
         plt.close(fig)
         records.append({
@@ -6816,7 +7065,9 @@ def generate_xgboost_diagnostic_plots(
         fig.tight_layout()
         score_png = run_dir / base / "score_distributions.png"
         score_pdf = run_dir / base / "score_distributions.pdf"
-        _save_figure_exclusive(fig, score_png, dpi=170, bbox_inches="tight")
+        _save_figure_exclusive(
+            fig, score_png, dpi=PNG_PLOT_DPI, bbox_inches="tight"
+        )
         _save_figure_exclusive(fig, score_pdf, bbox_inches="tight")
         plt.close(fig)
         records.append({
@@ -6838,7 +7089,9 @@ def generate_xgboost_diagnostic_plots(
         fig.tight_layout()
         importance_png = run_dir / base / "feature_importance.png"
         importance_pdf = run_dir / base / "feature_importance.pdf"
-        _save_figure_exclusive(fig, importance_png, dpi=170, bbox_inches="tight")
+        _save_figure_exclusive(
+            fig, importance_png, dpi=PNG_PLOT_DPI, bbox_inches="tight"
+        )
         _save_figure_exclusive(fig, importance_pdf, bbox_inches="tight")
         plt.close(fig)
         records.append({
@@ -6852,7 +7105,9 @@ def generate_xgboost_diagnostic_plots(
 
 
 def _html_cutflow_tables(
-    results: Sequence[SampleResult], luminosities: Sequence[float]
+    results: Sequence[SampleResult],
+    luminosities: Sequence[float],
+    cut_labels: Mapping[str, str] = CUT_LABELS,
 ) -> str:
     sections: List[str] = []
     for strategy in ANALYSIS_STRATEGIES:
@@ -6879,7 +7134,7 @@ def _html_cutflow_tables(
                         )
                         cells.append(f"<td>{factor * result.cutflow[step].sumw:,.4g}</td>")
                     body_rows.append(
-                        f"<tr><th>{html.escape(CUT_LABELS[step])}</th>{''.join(cells)}</tr>"
+                        f"<tr><th>{html.escape(cut_labels[step])}</th>{''.join(cells)}</tr>"
                     )
                 sections.append(
                     f"<details><summary>{strategy.capitalize()} · {channel.capitalize()} cutflow · "
@@ -6898,6 +7153,7 @@ def generate_run_index(
     plot_records: Sequence[Mapping[str, Any]],
     luminosities: Sequence[float],
     xgboost_metadata: Optional[Mapping[str, Any]] = None,
+    cut_labels: Mapping[str, str] = CUT_LABELS,
 ) -> Path:
     cards: List[str] = []
     for record in plot_records:
@@ -6974,7 +7230,22 @@ def generate_run_index(
             f"(<code>{html.escape(str(raw_scenario['identifier']))}</code>; "
             f"{html.escape(parameters)})"
         )
-    cutflow_html = _html_cutflow_tables(results, luminosities)
+    cut_profile = str(
+        run_metadata.get("configuration", {}).get(
+            "cut_profile", NOMINAL_CUT_PROFILE
+        )
+    )
+    cut_profile_label = str(
+        run_metadata.get("configuration", {}).get(
+            "cut_profile_label", CUT_PROFILE_LABELS.get(cut_profile, cut_profile)
+        )
+    )
+    cut_profile_html = (
+        "<br><strong>Cut profile:</strong> "
+        f"{html.escape(cut_profile_label)} "
+        f"(<code>{html.escape(cut_profile)}</code>)"
+    )
+    cutflow_html = _html_cutflow_tables(results, luminosities, cut_labels)
     cutflow_links = " · ".join(
         f'<a href="cutflows/{strategy}/{channel}.csv">{strategy} {channel} CSV</a>'
         for strategy in strategies for channel in ("higgs", "z")
@@ -7062,7 +7333,7 @@ header p{{max-width:70rem;color:#dce9f8}} .eyebrow{{font-size:.76rem;letter-spac
 <body>
 <header><div class="eyebrow">PullPheno particle-level analysis</div><h1>Signed pull-angle results</h1>
 <span class="status {partial_class}">{status_label}</span>
-<p><strong>Run:</strong> {html.escape(str(run_metadata['run_id']))}<br><strong>Completed:</strong> {html.escape(str(run_metadata['completed_utc']))}{scenario_html}{derivation_html}<br><strong>Configuration:</strong> anti-kT R=0.4, leading-pT tagging jets; cut-based and XGBoost branches share the common selection.</p></header>
+<p><strong>Run:</strong> {html.escape(str(run_metadata['run_id']))}<br><strong>Completed:</strong> {html.escape(str(run_metadata['completed_utc']))}{scenario_html}{cut_profile_html}{derivation_html}<br><strong>Configuration:</strong> anti-kT R=0.4, leading-pT tagging jets; cut-based and XGBoost branches share the common selection.</p></header>
 <main>
 <section><h2>Numerical summary</h2><div class="metrics">{''.join(summary_cards)}</div>
 <p class="method-note"><strong>Uncertainties:</strong> both projected-data and current-MC errors use event-level six-bin covariance matrices, retaining the correlation between the two tagging jets. The MC term does not decrease with displayed luminosity.
@@ -7163,7 +7434,8 @@ def generate_comparison_index(
                         f"<td>{format_p_value(d2)}</td></tr>"
                     )
     registry = {
-        (spec.channel, spec.key): spec for spec in plot_registry()
+        (spec.channel, spec.key): spec
+        for spec in plot_registry(sources[0].config.cuts)
     }
     hypothesis_rows: Dict[str, List[str]] = {
         "shape_only": [],
@@ -7736,6 +8008,14 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Analysis branches to produce in one immutable run (default: cutbased)",
     )
     parser.add_argument(
+        "--cut-profile",
+        choices=CUT_PROFILE_NAMES,
+        help=(
+            "Named cut configuration for a new ROOT-event cut-based run; "
+            "the default is nominal"
+        ),
+    )
+    parser.add_argument(
         "--xgb-model-run",
         type=Path,
         help="Completed nominal run supplying frozen XGBoost models and thresholds",
@@ -7776,6 +8056,10 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--max-events cannot be combined with --compare-runs")
     if len(set(args.analyses)) != len(args.analyses):
         parser.error("--analyses contains a duplicate strategy")
+    if args.cut_profile is not None and args.samples is None:
+        parser.error("--cut-profile requires --samples and a new ROOT-event pass")
+    if args.cut_profile is not None and tuple(args.analyses) != ("cutbased",):
+        parser.error("--cut-profile currently supports only --analyses cutbased")
     if args.xgb_model_run is not None and "xgboost" not in args.analyses:
         parser.error("--xgb-model-run requires --analyses to include xgboost")
     if args.from_run is not None and args.xgb_model_run is not None:
@@ -7810,6 +8094,10 @@ def run_comparison(args: argparse.Namespace, started: datetime) -> int:
         "run_type": "comparison",
         "analyses": list(analyses),
         "luminosities_fb": list(luminosities),
+        "cut_profile": sources[0].config.cut_profile,
+        "cut_profile_label": CUT_PROFILE_LABELS[sources[0].config.cut_profile],
+        "jet_acceptance_variable": sources[0].config.jet_acceptance_variable,
+        "cuts": dict(sources[0].config.cuts),
         "source_runs": [
             {
                 "run_id": source.metadata["run_id"],
@@ -8033,7 +8321,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             None if stored_model_run is None else Path(str(stored_model_run))
         )
     else:
-        config = read_manifest(args.samples, args.luminosities)
+        config = analysis_config_with_cut_profile(
+            read_manifest(args.samples, args.luminosities),
+            args.cut_profile or NOMINAL_CUT_PROFILE,
+        )
         effective_max_events = args.max_events
         effective_event_shards = args.event_shards or 1
         analyses = tuple(
@@ -8192,6 +8483,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     results,
                     config.luminosities_fb,
                     strategy,
+                    cut_labels_for_config(config),
                 )
         phase = "plot-generation"
         plot_records = generate_plots(
@@ -8199,6 +8491,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             results,
             config.luminosities_fb,
             partial,
+            config.cuts,
         )
         plot_records.extend(
             generate_ri_plots(
@@ -8290,6 +8583,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             plot_records,
             config.luminosities_fb,
             xgboost_metadata,
+            cut_labels_for_config(config),
         )
         write_json_exclusive(reservation.incomplete_dir / "run.json", run_metadata)
         phase = "final-link-validation"

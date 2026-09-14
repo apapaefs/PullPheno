@@ -98,11 +98,13 @@ CUT_PROFILE_NAMES = (
     NOMINAL_CUT_PROFILE,
     "eta2-mll71-111",
     "eta3-mll71-111",
+    "y45-mll71-111",
 )
 CUT_PROFILE_LABELS = {
     NOMINAL_CUT_PROFILE: "Nominal |y_jet| < 4.5 and 80 < m(ll) < 100 GeV",
     "eta2-mll71-111": "Central jets |eta_jet| < 2.0 and 71 < m(ll) < 111 GeV",
     "eta3-mll71-111": "Central jets |eta_jet| < 3.0 and 71 < m(ll) < 111 GeV",
+    "y45-mll71-111": "Full acceptance |y_jet| < 4.5 and 71 < m(ll) < 111 GeV",
 }
 
 
@@ -113,10 +115,12 @@ def resolved_cuts_for_profile(identifier: str) -> Tuple[Dict[str, float], str]:
     cuts = dict(CUTS)
     if identifier == NOMINAL_CUT_PROFILE:
         return cuts, "rapidity"
-    cuts.pop("jet_abs_y_max")
-    cuts["jet_abs_eta_max"] = 2.0 if identifier == "eta2-mll71-111" else 3.0
     cuts["lepton_mass_min_gev"] = 71.0
     cuts["lepton_mass_max_gev"] = 111.0
+    if identifier == "y45-mll71-111":
+        return cuts, "rapidity"
+    cuts.pop("jet_abs_y_max")
+    cuts["jet_abs_eta_max"] = 2.0 if identifier == "eta2-mll71-111" else 3.0
     return cuts, "pseudorapidity"
 
 HIGGS_CUTFLOW = (
@@ -5709,6 +5713,7 @@ def generate_plots(
     luminosities: Sequence[float],
     partial: bool,
     cuts: Mapping[str, float] = CUTS,
+    scenario_label: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     matplotlib_config = Path(tempfile.gettempdir()) / "pullpheno-matplotlib"
     matplotlib_config.mkdir(parents=True, exist_ok=True)
@@ -5787,7 +5792,10 @@ def generate_plots(
                 ax.set_xlabel(spec.xlabel)
                 ax.set_ylabel(rf"Expected events / bin at {luminosity:g} fb$^{{-1}}$")
                 ax.set_title(display_title, loc="left", pad=34, fontweight="semibold")
-                subtitle = "Particle level · Herwig · 13.6 TeV"
+                subtitle = "Particle level · "
+                if scenario_label:
+                    subtitle += f"{scenario_label} · "
+                subtitle += "13.6 TeV"
                 if strategy == "xgboost":
                     scopes = {item.application_scope for item in channel_results}
                     scope_labels = {
@@ -6007,6 +6015,8 @@ def generate_comparison_plots(
     analyses: Sequence[str],
     luminosities: Sequence[float],
     numerical: Mapping[Tuple[str, str, float, str, str], Mapping[str, np.ndarray]],
+    *,
+    include_reference_stacks: bool = True,
 ) -> List[Dict[str, Any]]:
     """Draw total comparisons and nominal-stack overlays for pull predictions."""
     matplotlib_config = Path(tempfile.gettempdir()) / "pullpheno-matplotlib"
@@ -6025,9 +6035,20 @@ def generate_comparison_plots(
     }
     planned_paths = set()
     reference_id = sources[0].scenario.identifier
+    stack_luminosities = luminosities if include_reference_stacks else ()
     for strategy in analyses:
         for channel in ("higgs", "z"):
-            for luminosity in luminosities:
+            for luminosity, uncertainty_kind in itertools.product(
+                stack_luminosities, ("mc-stat", "data-stat")
+            ):
+                is_data_stat = uncertainty_kind == "data-stat"
+                covariance_key = "data_covariance" if is_data_stat else "mc_covariance"
+                path_suffix = "-data-stat" if is_data_stat else ""
+                error_label = "expected stat." if is_data_stat else "MC stat."
+                band_label = (
+                    "expected statistical uncertainty"
+                    if is_data_stat else "MC statistical uncertainty"
+                )
                 folded_spec = registry[(channel, "folded_pull_angle")]
                 reference_folded = numerical[
                     (
@@ -6048,7 +6069,7 @@ def generate_comparison_plots(
                     / "yields"
                     / _format_luminosity(luminosity)
                     / channel
-                    / "reference-stack"
+                    / f"reference-stack{path_suffix}"
                     / "folded_pull_angle"
                 )
                 for extension in ("png", "pdf"):
@@ -6113,22 +6134,22 @@ def generate_comparison_plots(
                         f"Reference stack does not close to the total {channel} "
                         f"{strategy} folded-angle prediction"
                     )
-                reference_mc_covariance = np.asarray(
-                    reference_folded["mc_covariance"], dtype=np.float64
+                reference_covariance = np.asarray(
+                    reference_folded[covariance_key], dtype=np.float64
                 )
-                reference_mc_error = np.sqrt(
-                    np.maximum(np.diag(reference_mc_covariance), 0.0)
+                reference_error = np.sqrt(
+                    np.maximum(np.diag(reference_covariance), 0.0)
                 )
                 axis.fill_between(
                     folded_edges,
-                    _step_values(reference_total - reference_mc_error),
-                    _step_values(reference_total + reference_mc_error),
+                    _step_values(reference_total - reference_error),
+                    _step_values(reference_total + reference_error),
                     step="post",
                     color="#20242b",
                     alpha=0.18,
                     linewidth=0.0,
                     label=(
-                        f"{sources[0].scenario.label} total MC statistical uncertainty"
+                        f"{sources[0].scenario.label} total {band_label}"
                     ),
                     zorder=5,
                 )
@@ -6148,7 +6169,7 @@ def generate_comparison_plots(
                     ]
                     values = np.asarray(statistics["yield"], dtype=np.float64)
                     covariance = np.asarray(
-                        statistics["mc_covariance"], dtype=np.float64
+                        statistics[covariance_key], dtype=np.float64
                     )
                     errors = np.sqrt(np.maximum(np.diag(covariance), 0.0))
                     offset_fraction = (
@@ -6183,7 +6204,7 @@ def generate_comparison_plots(
                         capsize=2.6,
                         elinewidth=1.15,
                         color=color,
-                        label=f"{source.scenario.label} total (MC stat.)",
+                        label=f"{source.scenario.label} total ({error_label})",
                         zorder=12,
                     )
 
@@ -6201,7 +6222,7 @@ def generate_comparison_plots(
                 )
                 subtitle = (
                     f"Particle level · {sources[0].scenario.label} processes stacked · "
-                    "CR totals as points"
+                    "Scenario totals as points"
                 )
                 if bool(sources[0].metadata.get("partial")):
                     subtitle += " · PARTIAL RUN"
@@ -6236,12 +6257,13 @@ def generate_comparison_plots(
                         "strategy": strategy,
                         "observable": "folded_pull_angle",
                         "title": (
-                            f"{display_title} · reference process stack + CR totals"
+                            f"{display_title} · reference process stack + scenario totals "
+                            f"· {uncertainty_kind}"
                         ),
                         "channel": channel,
                         "stage": "comparison",
-                        "kind": "reference-stack-plus-total",
-                        "uncertainty": "mc-stat",
+                        "kind": f"reference-stack-plus-total{path_suffix}",
+                        "uncertainty": uncertainty_kind,
                         "luminosity_fb": luminosity,
                         "png": png_path.relative_to(run_dir).as_posix(),
                         "pdf": pdf_path.relative_to(run_dir).as_posix(),
@@ -6255,7 +6277,7 @@ def generate_comparison_plots(
                     / "yields"
                     / _format_luminosity(luminosity)
                     / channel
-                    / "reference-stack-ratio"
+                    / f"reference-stack-ratio{path_suffix}"
                     / "folded_pull_angle"
                 )
                 for extension in ("png", "pdf"):
@@ -6310,14 +6332,14 @@ def generate_comparison_plots(
                     )
                 ratio_stack_axis.fill_between(
                     folded_edges,
-                    _step_values(reference_total - reference_mc_error),
-                    _step_values(reference_total + reference_mc_error),
+                    _step_values(reference_total - reference_error),
+                    _step_values(reference_total + reference_error),
                     step="post",
                     color="#20242b",
                     alpha=0.18,
                     linewidth=0.0,
                     label=(
-                        f"{sources[0].scenario.label} total MC statistical uncertainty"
+                        f"{sources[0].scenario.label} total {band_label}"
                     ),
                     zorder=5,
                 )
@@ -6345,15 +6367,17 @@ def generate_comparison_plots(
                         capsize=2.6,
                         elinewidth=1.15,
                         color=color,
-                        label=f"{source.scenario.label} total (MC stat.)",
+                        label=f"{source.scenario.label} total ({error_label})",
                         zorder=12,
                     )
                     ratios, ratio_errors = propagated_independent_ratio_errors(
                         values,
                         covariance,
                         reference_total,
-                        reference_mc_covariance,
-                        include_reference=True,
+                        reference_covariance,
+                        # Alternative data hypotheses share a fixed nominal prediction;
+                        # do not add the counting errors of two hypothetical datasets.
+                        include_reference=not is_data_stat,
                     )
                     finite_ratio = np.isfinite(ratios) & np.isfinite(ratio_errors)
                     ratio_extent_values.extend(
@@ -6387,8 +6411,10 @@ def generate_comparison_plots(
                     display_title, loc="left", pad=34, fontweight="semibold"
                 )
                 ratio_subtitle = (
+                    "Particle level · Expected data statistics · Fixed nominal ratio reference"
+                    if is_data_stat else
                     f"Particle level · {sources[0].scenario.label} processes stacked · "
-                    "CR totals and ratio with MC uncertainty"
+                    "Scenario totals and ratio with MC uncertainty"
                 )
                 if bool(sources[0].metadata.get("partial")):
                     ratio_subtitle += " · PARTIAL RUN"
@@ -6412,7 +6438,7 @@ def generate_comparison_plots(
                 _place_plot_legend(ratio_stack_axis)
 
                 ratio_axis.axhline(1.0, color="#657086", linewidth=1.0, zorder=1)
-                ratio_axis.set_ylabel("CR / default")
+                ratio_axis.set_ylabel("Scenario / ref.")
                 ratio_axis.set_xlabel(folded_spec.xlabel)
                 ratio_axis.set_xlim(folded_edges[0], folded_edges[-1])
                 ratio_axis.grid(False)
@@ -6440,19 +6466,26 @@ def generate_comparison_plots(
                         "strategy": strategy,
                         "observable": "folded_pull_angle",
                         "title": (
-                            f"{display_title} · reference process stack + CR totals "
-                            "+ independent-MC ratio"
+                            f"{display_title} · reference process stack + scenario totals "
+                            + ("+ expected-statistical ratio" if is_data_stat
+                               else "+ independent-MC ratio")
                         ),
                         "channel": channel,
                         "stage": "comparison",
-                        "kind": "reference-stack-plus-total-ratio",
-                        "uncertainty": "independent-mc-stat",
+                        "kind": f"reference-stack-plus-total-ratio{path_suffix}",
+                        "uncertainty": "data-stat" if is_data_stat else "independent-mc-stat",
+                        "ratio_reference_uncertainty": (
+                            "fixed" if is_data_stat else "independent-mc-stat"
+                        ),
                         "luminosity_fb": luminosity,
                         "png": ratio_png_path.relative_to(run_dir).as_posix(),
                         "pdf": ratio_pdf_path.relative_to(run_dir).as_posix(),
                     }
                 )
 
+    for strategy in analyses:
+        for channel in ("higgs", "z"):
+            for luminosity in luminosities:
                 for observable in PULL_OBSERVABLE_KEYS:
                     plot_spec = registry[(channel, observable)]
                     reference = numerical[
@@ -6561,7 +6594,7 @@ def generate_comparison_plots(
                             rf"Expected events / bin at {luminosity:g} fb$^{{-1}}$"
                         )
                         axis.set_title(
-                            f"{plot_spec.title} · total CR-scenario comparison",
+                            f"{plot_spec.title} · total scenario comparison",
                             loc="left",
                             pad=28,
                             fontweight="semibold",
@@ -7497,7 +7530,7 @@ def generate_comparison_index(
         "<th>p MC only</th></tr></thead>"
     )
     hypothesis_html = (
-        '<section class="panel"><h2>Pairwise Herwig–CR histogram p-values</h2>'
+        '<section class="panel"><h2>Pairwise scenario histogram p-values</h2>'
         '<p>These are local expected (Asimov) upper-tail χ² p-values using the full '
         'event-level bin covariance. The primary comparison is shape only, with each '
         'scenario normalized independently; rate+shape tests correspond to the absolute '
@@ -7541,7 +7574,7 @@ def generate_comparison_index(
             'after common selection. Pull shapes are normalized independently inside each '
             'candidate score category, so the scan is not driven by category-rate changes. '
             'The listed boundaries maximize the worst-case conditional-shape D² across all '
-            'supplied CR variations. They require confirmation with independent simulations.</p>'
+            'supplied variations. They require confirmation with independent simulations.</p>'
             '<div class="table-wrap"><table><thead><tr><th>Channel</th><th>fb⁻¹</th>'
             '<th>Categories</th><th>Score boundaries</th><th>Worst D² data+MC</th>'
             '<th>Worst D² data only</th></tr></thead><tbody>'
@@ -7573,20 +7606,29 @@ def generate_comparison_index(
         )
     analyses = list(comparison["analyses"])
     kinds = sorted({str(record["kind"]) for record in plot_records})
+    stack_description = (
+        "Absolute signed-pull-angle stack overlays retain the first run's process stack "
+        "and draw every variation as total-yield error bars; companion plots add "
+        "variation/reference ratios. Separate sets show expected data-counting errors "
+        "and finite-MC errors, both retaining within-event tagging-jet correlations. "
+        "Expected-data ratio errors hold the nominal prediction fixed; MC ratio errors "
+        "propagate the independent variation and reference MC uncertainties. "
+        if any(kind.startswith("reference-stack") for kind in kinds) else ""
+    )
     document = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PullPheno CR comparison · {html.escape(str(run_metadata['run_id']))}</title>
+<title>PullPheno scenario comparison · {html.escape(str(run_metadata['run_id']))}</title>
 <style>
 :root{{--ink:#172033;--muted:#657086;--line:#dce2eb;--paper:#fff;--wash:#f3f6fa;--accent:#275dad}}
 *{{box-sizing:border-box}}body{{margin:0;background:var(--wash);color:var(--ink);font:15px/1.5 Inter,system-ui,sans-serif}}a{{color:var(--accent);text-decoration:none}}a:hover{{text-decoration:underline}}header{{padding:3rem max(1rem,calc((100vw - 1280px)/2));background:linear-gradient(125deg,#12213c,#244b78 62%,#11776d);color:white}}header p{{color:#dce9f8}}h1{{font-size:clamp(2rem,5vw,3.7rem);margin:.3rem 0}}main{{max-width:1320px;margin:auto;padding:1.5rem}}section{{margin:1.2rem 0}}.panel,.plot-card{{background:white;border:1px solid var(--line);border-radius:14px;box-shadow:0 5px 18px #2435510c}}.panel{{padding:1rem}}.table-wrap{{overflow:auto}}table{{border-collapse:collapse;width:100%;font-size:.87rem}}th,td{{padding:.5rem .65rem;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}}th:first-child,td:first-child{{text-align:left}}.swatch{{display:inline-block;width:.75rem;height:.75rem;border-radius:50%;margin-right:.4rem}}.controls{{display:grid;grid-template-columns:repeat(5,minmax(130px,1fr));gap:.7rem;position:sticky;top:0;z-index:2;background:#f3f6faed;backdrop-filter:blur(8px);padding:.8rem 0}}label{{font-size:.78rem;color:var(--muted);font-weight:700}}select,input{{display:block;width:100%;margin-top:.2rem;padding:.5rem;border:1px solid #bfc8d5;border-radius:8px;background:white}}.gallery{{display:grid;grid-template-columns:repeat(auto-fit,minmax(315px,1fr));gap:1rem}}.plot-card{{overflow:hidden}}.plot-card[hidden]{{display:none}}.thumb-link{{display:block;aspect-ratio:1.25;background:white;overflow:hidden}}.thumb-link img{{width:100%;height:100%;object-fit:contain}}.plot-copy{{padding:.85rem}}.plot-copy h3{{font-size:1rem;margin:.45rem 0}}.badges{{display:flex;gap:.35rem;flex-wrap:wrap}}.badges span{{font-size:.68rem;text-transform:uppercase;font-weight:750;border-radius:999px;padding:.18rem .45rem;background:#e7eef8;color:#274b79}}code{{overflow-wrap:anywhere}}footer{{padding:2.5rem;text-align:center;color:var(--muted)}}@media(max-width:760px){{.controls{{grid-template-columns:1fr 1fr;position:static}}}}
 </style></head><body><header><div>PullPheno particle-level analysis</div>
-<h1>Independent CR scenarios</h1><p><strong>Comparison run:</strong> {html.escape(str(run_metadata['run_id']))}<br>
-In total-scenario plots, each point is the complete prediction from one independently generated scenario. Absolute signed-pull-angle stack overlays instead retain the first run's process stack and draw every CR variation only as total-yield error bars; companion plots add variation/reference ratios with independent-sample MC errors. All process samples, including backgrounds, are scenario-specific; no background sample is shared. The first run fixes the process cross sections and is the ratio reference.</p></header><main>
+<h1>Independent generator scenarios</h1><p><strong>Comparison run:</strong> {html.escape(str(run_metadata['run_id']))}<br>
+In total-scenario plots, each point with error bars is the complete prediction from one independently generated scenario, with no connecting lines. {stack_description}All process samples, including backgrounds, are scenario-specific; no background sample is shared. The first run fixes the process cross sections and is the ratio reference.</p></header><main>
 <section class="panel"><h2>Source runs</h2><div class="table-wrap"><table><thead><tr><th>Role</th><th>Scenario</th><th>Parameters</th><th>Immutable source</th></tr></thead><tbody>{''.join(source_rows)}</tbody></table></div><h3>Common reference cross sections</h3><p>Every scenario uses the first run's final-state cross sections; scenario-specific efficiencies and generated sums of weights remain independent.</p><div class="table-wrap"><table><thead><tr><th>Process</th><th>Cross section [pb]</th></tr></thead><tbody>{cross_section_rows}</tbody></table></div></section>
 <section class="panel"><h2>Absolute signed-pull-angle numerical comparison</h2><p>Directional f<sub>beam</sub> values retain their signs. Six-bin D² values are Mahalanobis distances in the supported covariance subspace; √D² is not labelled as a one-dimensional Gaussian significance.</p><div class="table-wrap"><table><thead><tr><th>Analysis</th><th>Channel</th><th>Variation</th><th>fb⁻¹</th><th>f<sub>beam</sub> ref.</th><th>f<sub>beam</sub> var.</th><th>Δf<sub>beam</sub></th><th>Z (ref. truth)</th><th>Z (var. truth)</th><th>D² (ref. truth)</th><th>p (ref., data+MC)</th></tr></thead><tbody>{''.join(summary_rows)}</tbody></table></div><p><a href="summaries/comparison.json">JSON</a> · <a href="summaries/comparison.csv">CSV</a> · <a href="summaries/comparison.npz">NPZ arrays, tests and covariances</a></p></section>
 {hypothesis_html}
 {score_pull_html}
-<section><h2>Pull-observable comparisons, reference stacks and diagnostics</h2><div class="controls">
+<section><h2>Pull-observable comparisons and diagnostics</h2><div class="controls">
 <label>Analysis<select id="strategy"><option value="all">All</option>{''.join(f'<option value="{name}">{name}</option>' for name in analyses)}</select></label>
 <label>Channel<select id="channel"><option value="all">All</option><option value="higgs">Higgs</option><option value="z">Z</option></select></label>
 <label>Plot type<select id="kind"><option value="all">All</option>{''.join(f'<option value="{html.escape(name)}">{html.escape(name)}</option>' for name in kinds)}</select></label>
@@ -7617,7 +7659,7 @@ def validate_html_links(index_path: Path) -> None:
     parser.feed(index_path.read_text(encoding="utf-8"))
     missing = []
     for link in parser.links:
-        if link.startswith(("#", "http://", "https://", "mailto:", "javascript:")):
+        if link.startswith(("#", "http://", "https://", "mailto:", "javascript:", "data:")):
             continue
         target = (index_path.parent / link.split("#", 1)[0]).resolve()
         if not target.exists():
@@ -7971,6 +8013,13 @@ def validate_results(results: Sequence[SampleResult], partial: bool) -> Dict[str
     return {"status": "passed", "checks": checks}
 
 
+def parse_scenario_color(value: str) -> Tuple[str, str]:
+    identifier, separator, color = value.partition("=")
+    if not identifier or not separator or not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+        raise argparse.ArgumentTypeError("expected SCENARIO=#RRGGBB (quote the argument)")
+    return identifier, color
+
+
 def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
@@ -8000,6 +8049,19 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--output-root", type=Path, default=Path("results"), help="Root directory containing immutable runs")
     parser.add_argument("--run-name", help="Optional human-readable label included in the unique run ID")
+    parser.add_argument(
+        "--scenario-color",
+        type=parse_scenario_color,
+        action="append",
+        default=[],
+        metavar="SCENARIO=#RRGGBB",
+        help="Override a scenario colour in this comparison only; may be repeated",
+    )
+    parser.add_argument(
+        "--comparison-points-only",
+        action="store_true",
+        help="Show scenario totals as points with error bars; omit reference-stack plots",
+    )
     parser.add_argument(
         "--analyses",
         nargs="+",
@@ -8038,6 +8100,10 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
     args = parser.parse_args(argv)
+    if (args.scenario_color or args.comparison_points_only) and args.compare_runs is None:
+        parser.error("--scenario-color and --comparison-points-only require --compare-runs")
+    if len(dict(args.scenario_color)) != len(args.scenario_color):
+        parser.error("--scenario-color specifies the same scenario more than once")
     if args.max_events is not None and args.max_events <= 0:
         parser.error("--max-events must be positive")
     if args.from_run is not None and args.max_events is not None:
@@ -8085,6 +8151,22 @@ def run_comparison(args: argparse.Namespace, started: datetime) -> int:
         for index, path in enumerate(args.compare_runs)
     )
     reference_cross_sections = validate_comparison_sources(sources, analyses)
+    scenario_colors = dict(args.scenario_color)
+    unknown_scenarios = set(scenario_colors) - {
+        source.scenario.identifier for source in sources
+    }
+    if unknown_scenarios:
+        raise ValueError(f"Unknown comparison scenario ids: {sorted(unknown_scenarios)}")
+    sources = tuple(
+        replace(
+            source,
+            scenario=replace(
+                source.scenario, color=scenario_colors[source.scenario.identifier]
+            ),
+        )
+        if source.scenario.identifier in scenario_colors else source
+        for source in sources
+    )
     luminosities = tuple(
         float(value)
         for value in (args.luminosities or sources[0].config.luminosities_fb)
@@ -8108,6 +8190,13 @@ def run_comparison(args: argparse.Namespace, started: datetime) -> int:
         ],
         "reference_cross_sections_pb": reference_cross_sections,
         "pull_moment_model": PULL_MOMENT_MODEL,
+        "presentation": {
+            "points_only": args.comparison_points_only,
+            "scenario_colors": scenario_colors,
+            "reference_stack_uncertainties": (
+                [] if args.comparison_points_only else ["mc-stat", "data-stat"]
+            ),
+        },
     }
     reservation = reserve_run_directory(
         output_root, make_run_id(payload, args.run_name, started)
@@ -8122,6 +8211,7 @@ def run_comparison(args: argparse.Namespace, started: datetime) -> int:
             luminosities,
             reference_cross_sections,
         )
+        comparison["presentation"] = payload["presentation"]
         score_pull_payload: Optional[Dict[str, Any]] = None
         score_pull_numerical: Dict[Tuple[str, float, str], Dict[str, np.ndarray]] = {}
         if "xgboost" in analyses:
@@ -8151,6 +8241,7 @@ def run_comparison(args: argparse.Namespace, started: datetime) -> int:
             analyses,
             luminosities,
             numerical,
+            include_reference_stacks=not args.comparison_points_only,
         )
         if score_pull_payload is not None:
             plot_records.extend(
@@ -8492,6 +8583,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             config.luminosities_fb,
             partial,
             config.cuts,
+            scenario_label=config.scenario.label if config.scenario is not None else None,
         )
         plot_records.extend(
             generate_ri_plots(

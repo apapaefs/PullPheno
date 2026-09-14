@@ -59,6 +59,65 @@ class FakeJet:
 
 
 class SelectionTests(unittest.TestCase):
+    def test_matched_window_profiles_have_identical_lepton_cuts(self):
+        expected = {
+            "lepton_pt_lead_min_gev": 25.0,
+            "lepton_pt_sublead_min_gev": 20.0,
+            "lepton_abs_eta_max": 2.5,
+            "lepton_mass_min_gev": 71.0,
+            "lepton_mass_max_gev": 111.0,
+        }
+        for profile in ("eta2-mll71-111", "eta3-mll71-111", "y45-mll71-111"):
+            with self.subTest(profile=profile):
+                cuts, _ = analysis.resolved_cuts_for_profile(profile)
+                self.assertEqual(
+                    {key: value for key, value in cuts.items() if key.startswith("lepton_")},
+                    expected,
+                )
+
+    def test_matched_window_profiles_use_the_same_strict_mass_boundaries(self):
+        for profile in ("eta2-mll71-111", "eta3-mll71-111", "y45-mll71-111"):
+            cuts, _ = analysis.resolved_cuts_for_profile(profile)
+            for pid in (11, 13):
+                for mass, accepted in (
+                    (70.999, False), (71.0, False), (71.001, True),
+                    (91.0, True),
+                    (110.999, True), (111.0, False), (111.001, False),
+                ):
+                    with self.subTest(profile=profile, pid=pid, mass=mass):
+                        particles = particle_event([
+                            massless(mass / 2, 0.0, 0.0, pid),
+                            massless(mass / 2, 0.0, math.pi, -pid),
+                        ])
+                        decision = analysis.select_z_candidate(particles, cuts)
+                        self.assertEqual(decision.candidate is not None, accepted)
+                        self.assertEqual("dilepton_mass_window" in decision.passed_steps, accepted)
+
+    def test_full_acceptance_wide_window_changes_only_dilepton_mass(self):
+        nominal, nominal_variable = analysis.resolved_cuts_for_profile("nominal")
+        wide, wide_variable = analysis.resolved_cuts_for_profile("y45-mll71-111")
+        self.assertEqual(wide_variable, nominal_variable)
+        self.assertEqual(wide_variable, "rapidity")
+        self.assertEqual(wide["jet_abs_y_max"], 4.5)
+        self.assertNotIn("jet_abs_eta_max", wide)
+        self.assertEqual({key for key in nominal if nominal[key] != wide[key]},
+                         {"lepton_mass_min_gev", "lepton_mass_max_gev"})
+        self.assertEqual((wide["lepton_mass_min_gev"], wide["lepton_mass_max_gev"]), (71.0, 111.0))
+        self.assertEqual(nominal, analysis.CUTS)
+        jet = FakeJet(50.0, rapidity=4.0, phi=0.0, pseudorapidity=4.8)
+        self.assertTrue(analysis.jet_passes_acceptance(jet, wide, wide_variable))
+
+    def test_full_acceptance_wide_window_accepts_both_added_mass_regions(self):
+        wide, _ = analysis.resolved_cuts_for_profile("y45-mll71-111")
+        for mass in (75.0, 105.0):
+            with self.subTest(mass=mass):
+                particles = particle_event([
+                    massless(mass / 2, 0.0, 0.0, 11),
+                    massless(mass / 2, 0.0, math.pi, -11),
+                ])
+                self.assertIsNone(analysis.select_z_candidate(particles).candidate)
+                self.assertIsNotNone(analysis.select_z_candidate(particles, wide).candidate)
+
     def test_alternative_cut_profiles_use_eta_and_wide_dilepton_window(self):
         for profile, eta_max in (
             ("eta2-mll71-111", 2.0),
@@ -416,6 +475,10 @@ class PullAndWeightTests(unittest.TestCase):
             "higgs", "cutbased", "folded_pull_angle", (result,), 3000.0, {"VBFH": 2.0}
         )
         self.assertAlmostEqual(np.sum(low["yield"]), 120000.0)
+        # Two half-weight entries in different bins: variance is not simply N_i.
+        self.assertAlmostEqual(low["data_covariance"][0, 0], 30000.0)
+        self.assertAlmostEqual(low["data_covariance"][0, 3], 30000.0)
+        self.assertAlmostEqual(low["yield"][0], 60000.0)
         np.testing.assert_allclose(high["data_covariance"], 10.0 * low["data_covariance"])
         np.testing.assert_allclose(high["mc_covariance"], 100.0 * low["mc_covariance"])
 
@@ -482,6 +545,30 @@ class PullAndWeightTests(unittest.TestCase):
         histogram.fill(8.0, -3.0)
         np.testing.assert_allclose(histogram.sumw, [2.0, -3.0])
         np.testing.assert_allclose(histogram.sumw2, [4.0, 9.0])
+
+
+class HtmlLinkTests(unittest.TestCase):
+    def test_embedded_images_do_not_require_a_local_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "notes.txt").write_text("Present alongside the report.")
+            index = root / "index.html"
+            index.write_text(
+                '<img src="data:image/png;base64,iVBORw0KGgo=">'
+                '<a href="notes.txt">Notes</a>'
+            )
+            analysis.validate_html_links(index)
+
+    def test_embedded_images_do_not_hide_missing_relative_links(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            index = Path(temporary) / "index.html"
+            for missing_tag in ('<img src="missing.png">', '<a href="missing.pdf">PDF</a>'):
+                with self.subTest(missing_tag=missing_tag):
+                    index.write_text(
+                        '<img src="data:image/png;base64,iVBORw0KGgo=">' + missing_tag
+                    )
+                    with self.assertRaisesRegex(RuntimeError, "missing\\.(png|pdf)"):
+                        analysis.validate_html_links(index)
 
 
 class RunManagementTests(unittest.TestCase):
@@ -1344,10 +1431,41 @@ class RunManagementTests(unittest.TestCase):
                     "--run-name", "synthetic-comparison",
                 ]
             )
-            with mock.patch("sys.stdout"):
+            checked_expected_plots = []
+            save_figure = analysis._save_figure_exclusive
+
+            def check_expected_error_bars(figure, path, **kwargs):
+                if path.parent.name in (
+                    "reference-stack-data-stat", "reference-stack-ratio-data-stat"
+                ) and path.suffix == ".png":
+                    from matplotlib.container import ErrorbarContainer
+
+                    cross_section = 2.0 if "higgs" in path.parts else 3.0
+                    total_yield = 1000.0 * 300.0 * cross_section
+                    nominal_yield = total_yield * np.array([0.75, 0, 0, 0, 0, 0.25])
+                    variation_yield = total_yield * np.array([0.25, 0, 0, 0, 0, 0.75])
+                    for axis_index, axis in enumerate(figure.axes):
+                        points = [item for item in axis.containers
+                                  if isinstance(item, ErrorbarContainer)]
+                        self.assertEqual(len(points), 1)
+                        self.assertEqual(points[0].lines[0].get_linestyle(), "None")
+                        segments = points[0].lines[2][0].get_segments()
+                        for bin_index in (0, 5):
+                            actual_error = np.diff(segments[bin_index][:, 1])[0] / 2.0
+                            expected_error = math.sqrt(variation_yield[bin_index])
+                            if axis_index == 1:
+                                expected_error /= nominal_yield[bin_index]
+                            self.assertAlmostEqual(actual_error, expected_error, places=8)
+                    checked_expected_plots.append(path)
+                return save_figure(figure, path, **kwargs)
+
+            with mock.patch("sys.stdout"), mock.patch.object(
+                analysis, "_save_figure_exclusive", side_effect=check_expected_error_bars
+            ):
                 status = analysis.run_comparison(
                     args, datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc)
                 )
+            self.assertEqual(len(checked_expected_plots), 4)
             completed = [
                 path for path in (output_root / "runs").iterdir()
                 if path.name not in {"nominal-run", "variation-run"}
@@ -1363,9 +1481,9 @@ class RunManagementTests(unittest.TestCase):
             csv_text = (completed[0] / "summaries" / "comparison.csv").read_text()
             self.assertIn("hypothesis_test", csv_text)
             index_text = (completed[0] / "index.html").read_text()
-            self.assertIn("Pairwise Herwig–CR histogram p-values", index_text)
+            self.assertIn("Pairwise scenario histogram p-values", index_text)
             plots = json.loads((completed[0] / "summaries" / "plots.json").read_text())
-            self.assertEqual(len(plots), 24)
+            self.assertEqual(len(plots), 28)
             stack_overlays = [
                 record
                 for record in plots
@@ -1404,9 +1522,75 @@ class RunManagementTests(unittest.TestCase):
                     for record in stack_ratio_overlays
                 )
             )
+            expected_overlays = [record for record in plots
+                                 if record["kind"].startswith("reference-stack")
+                                 and record.get("uncertainty") == "data-stat"]
+            self.assertEqual(len(expected_overlays), 4)
+            self.assertTrue(all(
+                "data-stat" in record["png"]
+                and (completed[0] / record["png"]).is_file()
+                and (completed[0] / record["pdf"]).is_file()
+                for record in expected_overlays
+            ))
+            self.assertTrue(all(
+                record["ratio_reference_uncertainty"] == "fixed"
+                for record in expected_overlays if "ratio" in record["kind"]
+            ))
             analysis.validate_html_links(completed[0] / "index.html")
             catalog = json.loads((output_root / "runs.json").read_text())
             self.assertEqual(catalog[0]["run_type"], "comparison")
+
+            mg5 = write_source(
+                output_root,
+                "mg5-run",
+                analysis.ScenarioSpec("mg5-pythia8", "MG5 + Pythia", "#E15759"),
+                2,
+            )
+            source_metadata_before = (mg5 / "run.json").read_bytes()
+            point_args = analysis.parse_arguments(
+                [
+                    "--compare-runs", str(nominal), str(variation), str(mg5),
+                    "--analyses", "cutbased",
+                    "--output-root", str(output_root),
+                    "--run-name", "synthetic-three-way-points",
+                    "--comparison-points-only",
+                    "--scenario-color", "mg5-pythia8=#8A5FBF",
+                ]
+            )
+            saved_figures = []
+            save_figure = analysis._save_figure_exclusive
+
+            def check_points(figure, path, **kwargs):
+                for axis in figure.axes:
+                    self.assertFalse(axis.patches, "points-only plots must not contain bars")
+                    point_lines = [container.lines[0] for container in axis.containers]
+                    self.assertEqual(len(point_lines), 3)
+                    self.assertTrue(all(line.get_linestyle() == "None" for line in point_lines))
+                    self.assertEqual(point_lines[2].get_color(), "#8A5FBF")
+                saved_figures.append(path)
+                return save_figure(figure, path, **kwargs)
+
+            with mock.patch("sys.stdout"), mock.patch.object(
+                analysis, "_save_figure_exclusive", side_effect=check_points
+            ):
+                point_status = analysis.run_comparison(
+                    point_args, datetime(2026, 8, 15, 12, 1, tzinfo=timezone.utc)
+                )
+            self.assertEqual(point_status, 0)
+            self.assertEqual(len(saved_figures), 40)
+            point_run = next((output_root / "runs").glob("*synthetic-three-way-points*"))
+            point_plots = json.loads((point_run / "summaries" / "plots.json").read_text())
+            self.assertEqual(len(point_plots), 20)
+            self.assertEqual({record["kind"] for record in point_plots}, {"data-stat", "mc-stat"})
+            point_comparison = json.loads(
+                (point_run / "summaries" / "comparison.json").read_text()
+            )
+            self.assertTrue(point_comparison["presentation"]["points_only"])
+            self.assertEqual(
+                point_comparison["source_runs"][2]["scenario"]["color"], "#8A5FBF"
+            )
+            self.assertEqual((mg5 / "run.json").read_bytes(), source_metadata_before)
+            analysis.validate_html_links(point_run / "index.html")
 
 
 class XGBoostHelperTests(unittest.TestCase):

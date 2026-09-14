@@ -155,6 +155,29 @@ To add another complete CR scenario, analyze it
 with the same `NOMINAL_RUN` models and append its completed path to
 `--compare-runs`; the existing source runs remain untouched.
 
+To compare nominal Herwig, pReco and MG5+Pythia together using only total-scenario
+points with error bars (no reference-stack plots), use:
+
+```bash
+python3 HwSimPythonAnalysis.py \
+  --compare-runs "$NOMINAL_RUN" "$PRECO_RUN" "$MG5_RUN" \
+  --analyses cutbased xgboost \
+  --comparison-points-only \
+  --scenario-color 'mg5-pythia8=#8A5FBF' \
+  --output-root /data/Projects/PullPheno/analysis-results \
+  --run-name herwig-vs-preco025-vs-mg5-pythia-points
+```
+
+The three source runs must be inside the selected output root and have identical
+cuts, analysis versions, frozen models, thresholds and binning. The scenario ID
+is taken from the source run metadata; `--scenario-color ID=#RRGGBB` may be
+repeated. Colour overrides and the points-only setting are recorded in the new
+comparison without editing any source run. Ratio panels, numerical tests and
+score–pull diagnostics are retained. Histogram points are never joined by lines.
+Omit `--comparison-points-only` to include the nominal process-stack plots,
+with pReco and MG5+Pythia shown as total predictions with error bars. The
+`--scenario-color` override applies to these overlays and their ratio panels too.
+
 For the absolute signed pull angle, the comparison additionally reproduces the
 single-run expected-yield presentation: the reference Herwig processes remain
 stacked in their configured order, while every independent CR variation is
@@ -164,6 +187,16 @@ nor substituted inside the nominal stack.  A separate companion plot adds a
 lower variation/reference ratio panel.  Its CR-point error bars propagate the
 finite-MC uncertainties of the statistically independent variation and
 reference samples; bins with zero nominal yield are masked.
+
+A second stack-and-points set, labelled `data-stat`, shows expected counting
+errors at each requested luminosity instead of finite-MC errors. These errors
+use the saved event-level covariance, including the correlation between the two
+half-weight tagging-jet entries. Each scenario represents an alternative
+expected dataset, not observed data. In these ratio panels the nominal yield is
+held fixed, so the point error is the variation's expected counting error divided
+by the nominal yield; no second hypothetical dataset or MC error is added.
+The band on the nominal stack shows its own expected counting uncertainty.
+Experimental and modelling systematics are not included.
 
 Analysis version 2.3 additionally stores an event-level joint observable with
 ten frozen XGBoost-score quantiles and the six absolute signed-pull-angle bins.  The
@@ -186,15 +219,21 @@ must be rerun once from their ROOT events.  After that one-time pass, all maps,
 partition scans and later multi-scenario comparisons are generated without
 reopening ROOT files.
 
-### Campaign 14 central-jet alternatives
+### Campaigns 14 and 20: matched-window jet-acceptance profiles
 
-Two named cut-based profiles rerun the common event selection with a genuine
-jet-pseudorapidity acceptance and a wider Z window:
+Three named cut-based profiles rerun the common event selection with the same
+wider Z window and different jet acceptances:
 
 - `eta2-mll71-111`: $|\eta_{\rm jet}|<2.0$ and
   $71<m_{\ell\ell}<111\,\mathrm{GeV}$;
 - `eta3-mll71-111`: $|\eta_{\rm jet}|<3.0$ and
-  $71<m_{\ell\ell}<111\,\mathrm{GeV}$.
+  $71<m_{\ell\ell}<111\,\mathrm{GeV}$;
+- `y45-mll71-111`: $|y_{\rm jet}|<4.5$ and
+  $71<m_{\ell\ell}<111\,\mathrm{GeV}$ (rapidity, not pseudorapidity).
+
+All three have identical dilepton cuts: an opposite-sign, same-flavour electron
+or muon pair, $|\eta_\ell|<2.5$, leading/subleading lepton $p_T>25/20$ GeV, and
+the strict mass window $71<m_{\ell\ell}<111\,\mathrm{GeV}$.
 
 The acceptance is applied to every reconstructed anti-$k_T$ jet before the
 two leading-$p_T$ tagging jets are chosen.  All other Higgs, Z and VBF cuts
@@ -203,14 +242,14 @@ $|y_{\rm jet}|<4.5$ and $80<m_{\ell\ell}<100\,\mathrm{GeV}$.  The selected
 profile, resolved cuts and choice of jet acceptance variable are stored in
 `run.json` and displayed in the run index.
 
-The latest completed production inputs are the two campaign-14 cached
-manifests.  On Odysseus, run both alternatives sequentially on the nominal
+The current Herwig production inputs are the two campaign-14 cached
+manifests.  On Odysseus, run all three profiles sequentially on the nominal
 Herwig samples with:
 
 ```bash
 cd /home/apapaefs/Projects/PullPheno
 source /home/apapaefs/Projects/root/root_v6.40.02/bin/thisroot.sh
-for profile in eta2-mll71-111 eta3-mll71-111; do
+for profile in eta2-mll71-111 eta3-mll71-111 y45-mll71-111; do
   .venv-odysseus/bin/python HwSimPythonAnalysis.py \
     --samples /micron/Projects/PullPheno/analysis-input-cache/campaign-00014/manifests/samples_odysseus_campaign00014_herwig.json \
     --analyses cutbased \
@@ -222,11 +261,11 @@ for profile in eta2-mll71-111 eta3-mll71-111; do
 done
 ```
 
-To retain the latest independent colour-reconnection comparison, repeat both
+To retain the latest independent colour-reconnection comparison, repeat all three
 profiles on the `pReco=0.25` samples:
 
 ```bash
-for profile in eta2-mll71-111 eta3-mll71-111; do
+for profile in eta2-mll71-111 eta3-mll71-111 y45-mll71-111; do
   .venv-odysseus/bin/python HwSimPythonAnalysis.py \
     --samples /micron/Projects/PullPheno/analysis-input-cache/campaign-00014/manifests/samples_odysseus_campaign00014_herwig_preco025.json \
     --analyses cutbased \
@@ -241,6 +280,25 @@ done
 `--cut-profile` deliberately requires a fresh `--samples` ROOT pass and, for
 these alternatives, `--analyses cutbased`; selection-changing profiles cannot
 be applied with `--from-run`.
+
+To use the same dilepton window at the full original jet acceptance, select
+`--cut-profile y45-mll71-111`. This keeps `|y_jet| < 4.5` (rapidity, not
+pseudorapidity) and changes only the dilepton window to `71 < m(ll) < 111 GeV`.
+The original `nominal` profile remains available with its 80--100 GeV window
+for reproducing historical runs. Use `y45-mll71-111`, not the legacy `nominal`
+cut profile, for the current matched-window comparison. The nominal Herwig
+**generator scenario** is independent of this cut-profile choice.
+Use the same sample manifests, workers and output root as above; a fresh ROOT
+pass is required because the original histograms discarded the added mass regions.
+
+For campaign-20 MG5+Pythia, use the same profiles and the cached manifest
+`/micron/Projects/PullPheno/analysis-input-cache/campaign-00020/manifests/samples_odysseus_campaign00020_mg5_pythia.json`.
+For each profile, pass its three completed scenario runs to `--compare-runs`
+in the order nominal Herwig, pReco, MG5+Pythia, with `--analyses cutbased` and
+`--scenario-color 'mg5-pythia8=#8A5FBF'`. Omitting `--comparison-points-only`
+retains the nominal stack and the two variation error-bar overlays. The input
+cross sections do not change with the eta selection; its effect is included
+in the selected efficiency.
 
 The manifest assigns each process an XGBoost `role` of `signal` or
 `background`.  The classifiers use only $m_{jj}$,

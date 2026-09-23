@@ -87,7 +87,6 @@ def validate_embedded(path, records):
         assert parser.images[index] == digest(run/record['png'])
         assert parser.downloads[2*index][1] == parser.images[index]
         assert parser.downloads[2*index+1][1] == digest(run/record['pdf'])
-    analysis.validate_html_links(path)
     return {'page': path.name, 'embedded_plots': len(records), 'downloads': 2*len(records)}
 
 
@@ -264,13 +263,17 @@ def build(args, state):
     write_json(destination/'study-status.json', state)
     write_json(destination/'study-validation.json', validation)
     (destination/'README.md').write_text('# Pull-threshold scan\n\nOpen index.html for all summaries and galleries. The four selections are uncut, |t| > 0.0015, 0.003 and 0.006 per measured tagging jet. Each accepted jet contributes half the event weight. All inputs have particle pT > 0.1 GeV.\n\nThere are 18 fresh ROOT analyses and 30 new comparison runs, with 18 archived source runs and six archived three-way comparisons reused. The 24 summary pages and 36 galleries include both channels, eta 2/3/4.5 and 300/3000 fb^-1. All five pull observables, expected-data and finite-MC uncertainties, bin fractions, f_beam and shape/rate statistics are included.\n\nThe summaries hold the nominal prediction fixed for ratio errors. Generation-level m(jj) > 200 GeV and reconstructed m(jj) > 400 GeV remain distinct cuts. Original generator cross sections differ from common nominal-Herwig plotting normalization. BR(H -> gamma gamma) = 0.002270 is applied once; Z includes ee and mu mu.\n\nClick a plot to enlarge it and access embedded PNG/PDF downloads; Escape closes the viewer. Reused and newly generated run IDs, exact commands, code hashes, input configuration and validation are recorded in the JSON files.\n')
-    for path in destination.rglob('*.html'):
-        analysis.validate_html_links(path)
     manifest = {'analysis_version': analysis.ANALYSIS_VERSION, 'git': state['git'],
         'report_git': analysis.git_provenance(ROOT), 'code_sha256': state['code_sha256'],
+        'report_code_sha256': {str(p.relative_to(ROOT)): digest(p) for p in (
+            Path(__file__).resolve(), ROOT/'scripts/build_pullcut_report.py', ROOT/'scripts/pullcut_study_config.py')},
         'source_runs': sorted(sources), 'comparisons': {comparison_key(*key): value[0].name for key,value in comparisons.items()},
         'summaries': summaries, 'files': {str(p.relative_to(destination)): digest(p) for p in sorted(destination.rglob('*')) if p.is_file() and p.name != 'manifest.json'}}
     write_json(destination/'manifest.json', manifest)
+    # Galleries link to the landing page, which in turn links to the manifest.
+    # Check the complete artifact graph only after all targets exist.
+    for path in destination.rglob('*.html'):
+        analysis.validate_html_links(path)
     landing = results/'index.html'
     document = landing.read_text()
     marker = '<!-- '+destination.name+' -->'

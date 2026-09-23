@@ -39,7 +39,7 @@ import numpy as np
 import xgboost_root_varfiles_module as xgbtools
 
 
-ANALYSIS_VERSION = "2.7.0"
+ANALYSIS_VERSION = "2.9.0"
 ROOT_PASS_CHECKPOINT_VERSION = 1
 ROOT_PASS_CHECKPOINT_RELATIVE = Path("checkpoints") / "root-pass"
 RUN_LOG_NAME = "run.log"
@@ -62,6 +62,9 @@ SCORE_PULL_BIN_COUNT = 10
 SCORE_PULL_MOMENT_MODEL = "event_level_xgboost_score_quantile_by_folded_pull"
 COMPARISON_PINV_RCOND = 1.0e-12
 COMPARISON_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "*", "<", ">")
+COMPARISON_SCENARIO_MARKERS = {
+    "herwig-default": "o", "herwig-preco025": "s", "mg5-pythia8": "^",
+}
 COMPARISON_COLORS = (
     "#275DAD",
     "#D05A47",
@@ -98,12 +101,14 @@ CUT_PROFILE_NAMES = (
     NOMINAL_CUT_PROFILE,
     "eta2-mll71-111",
     "eta3-mll71-111",
+    "eta45-mll71-111",
     "y45-mll71-111",
 )
 CUT_PROFILE_LABELS = {
     NOMINAL_CUT_PROFILE: "Nominal |y_jet| < 4.5 and 80 < m(ll) < 100 GeV",
     "eta2-mll71-111": "Central jets |eta_jet| < 2.0 and 71 < m(ll) < 111 GeV",
     "eta3-mll71-111": "Central jets |eta_jet| < 3.0 and 71 < m(ll) < 111 GeV",
+    "eta45-mll71-111": "Full acceptance |eta_jet| < 4.5 and 71 < m(ll) < 111 GeV",
     "y45-mll71-111": "Full acceptance |y_jet| < 4.5 and 71 < m(ll) < 111 GeV",
 }
 
@@ -120,7 +125,9 @@ def resolved_cuts_for_profile(identifier: str) -> Tuple[Dict[str, float], str]:
     if identifier == "y45-mll71-111":
         return cuts, "rapidity"
     cuts.pop("jet_abs_y_max")
-    cuts["jet_abs_eta_max"] = 2.0 if identifier == "eta2-mll71-111" else 3.0
+    cuts["jet_abs_eta_max"] = {
+        "eta2-mll71-111": 2.0, "eta3-mll71-111": 3.0, "eta45-mll71-111": 4.5,
+    }[identifier]
     return cuts, "pseudorapidity"
 
 HIGGS_CUTFLOW = (
@@ -353,6 +360,18 @@ class AnalysisConfig:
     cut_profile: str = NOMINAL_CUT_PROFILE
     cuts: Mapping[str, float] = field(default_factory=lambda: dict(CUTS))
     jet_acceptance_variable: str = "rapidity"
+    pull_magnitude_min: Optional[float] = None
+    particle_pt_min_gev: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.pull_magnitude_min is not None and (
+            not math.isfinite(self.pull_magnitude_min) or self.pull_magnitude_min <= 0.0
+        ):
+            raise ValueError("Pull magnitude threshold must be finite and positive")
+        if self.particle_pt_min_gev is not None and (
+            not math.isfinite(self.particle_pt_min_gev) or self.particle_pt_min_gev <= 0.0
+        ):
+            raise ValueError("Input-particle pT threshold must be finite and positive")
 
 
 def validate_cut_configuration(
@@ -620,6 +639,9 @@ class SampleResult:
     cutflow: MutableMapping[str, CutStat] = field(default_factory=OrderedDict)
     histograms: MutableMapping[str, WeightedHistogram] = field(default_factory=dict)
     pull_total_sumw: float = 0.0
+    pull_pass_counts: MutableMapping[int, CutStat] = field(
+        default_factory=lambda: {k: CutStat() for k in range(3)}
+    )
     pull_beam_sumw: float = 0.0
     pull_left_sumw: float = 0.0
     pull_right_sumw: float = 0.0
@@ -790,9 +812,9 @@ def histogram_bin_index(edges: np.ndarray, value: float) -> int:
 
 
 def event_histogram_bin_vector(edges: np.ndarray, values: Sequence[float]) -> np.ndarray:
-    """Represent two tagging-jet entries as one half-weight event vector."""
-    if len(values) != 2:
-        raise ValueError("Exactly two tagging-jet observable values are required")
+    """Represent up to two accepted tagging jets, each with fixed half weight."""
+    if len(values) > 2:
+        raise ValueError("At most two tagging-jet observable values are allowed")
     bin_edges = np.asarray(edges, dtype=np.float64)
     vector = np.zeros(len(bin_edges) - 1, dtype=np.float64)
     for value in values:
@@ -801,8 +823,8 @@ def event_histogram_bin_vector(edges: np.ndarray, values: Sequence[float]) -> np
 
 
 def pull_event_bin_vector(signed_angles: Sequence[float]) -> np.ndarray:
-    if len(signed_angles) != 2:
-        raise ValueError("Exactly two tagging-jet pull angles are required")
+    if len(signed_angles) > 2:
+        raise ValueError("At most two tagging-jet pull angles are allowed")
     return event_histogram_bin_vector(
         PULL_BIN_EDGES,
         [fold_signed_pull_angle(float(angle)) for angle in signed_angles],
@@ -902,18 +924,15 @@ def differential_pull_statistics(
         }
     fractions = bins / total_pb
     mc_covariance = normalized_fraction_covariance(bins, mc_second)
-    mean_outer = event_second / total_pb
-    single_event_covariance = 0.5 * (
-        mean_outer - np.outer(fractions, fractions)
-        + (mean_outer - np.outer(fractions, fractions)).T
-    )
+    # The accepted weight per event can be 0, 1/2 or 1. Propagate the
+    # fluctuating normalization instead of assuming every event sums to one.
+    normalized_event_covariance = normalized_fraction_covariance(bins, event_second)
     selector = np.zeros(PULL_BIN_COUNT, dtype=np.float64)
     selector[: PULL_BIN_COUNT // 2] = 1.0
     expected_covariances: Dict[str, List[List[float]]] = {}
     expected_fbeam_errors: Dict[str, float] = {}
     for luminosity in luminosities_fb:
-        expected_events = 1000.0 * float(luminosity) * total_pb
-        covariance = single_event_covariance / expected_events
+        covariance = normalized_event_covariance / (1000.0 * float(luminosity))
         covariance = 0.5 * (covariance + covariance.T)
         expected_covariances[str(float(luminosity))] = covariance.tolist()
         expected_fbeam_errors[str(float(luminosity))] = math.sqrt(
@@ -1276,7 +1295,7 @@ def plot_registry(cuts: Mapping[str, float] = CUTS) -> Tuple[PlotSpec, ...]:
                 PlotSpec("pull_t_beam", channel, "vbf", "Beam-oriented pull component", r"$t_{\mathrm{beam}}$", _linspace(-0.03, 0.03, 40)),
                 PlotSpec("pull_t_phi", channel, "vbf", "Azimuthal pull component", r"$t_{\phi}$", _linspace(-0.03, 0.03, 40)),
                 PlotSpec("pull_magnitude", channel, "vbf", "Pull-vector magnitude", r"$|\vec{t}|$", _linspace(0.0, 0.06, 40)),
-                PlotSpec("signed_pull_angle", channel, "vbf", "Signed pull angle", r"Signed pull angle [rad]", _linspace(-math.pi, math.pi, 12)),
+                PlotSpec("signed_pull_angle", channel, "vbf", "Signed pull angle", r"$\theta_s$ [rad]", _linspace(-math.pi, math.pi, 12)),
                 PlotSpec("folded_pull_angle", channel, "vbf", "Absolute signed pull angle", r"$|\theta_s|$ [rad]", _linspace(0.0, math.pi, 6)),
             ]
         )
@@ -1484,6 +1503,14 @@ def analysis_config_from_payload(
         cut_profile=cut_profile,
         cuts=cuts,
         jet_acceptance_variable=jet_acceptance_variable,
+        pull_magnitude_min=(
+            None if configuration.get("pull_magnitude_min") is None
+            else float(configuration["pull_magnitude_min"])
+        ),
+        particle_pt_min_gev=(
+            None if configuration.get("particle_pt_min_gev") is None
+            else float(configuration["particle_pt_min_gev"])
+        ),
     )
 
 
@@ -1503,6 +1530,8 @@ def resolved_config_payload(
         "cut_profile": config.cut_profile,
         "cut_profile_label": CUT_PROFILE_LABELS[config.cut_profile],
         "jet_acceptance_variable": config.jet_acceptance_variable,
+        "pull_magnitude_min": config.pull_magnitude_min,
+        "particle_pt_min_gev": config.particle_pt_min_gev,
         "cuts": dict(config.cuts),
         "max_events_per_sample": max_events,
         "source_manifest": config.source_manifest,
@@ -1698,6 +1727,7 @@ def _root_pass_result_metadata(result: SampleResult) -> Dict[str, Any]:
             key: histogram.entries for key, histogram in result.histograms.items()
         },
         "pull_total_sumw": result.pull_total_sumw,
+        "pull_pass_counts": {str(k): asdict(stat) for k, stat in result.pull_pass_counts.items()},
         "pull_beam_sumw": result.pull_beam_sumw,
         "pull_left_sumw": result.pull_left_sumw,
         "pull_right_sumw": result.pull_right_sumw,
@@ -1828,6 +1858,7 @@ def _restore_root_pass_result(
         for step in cutflow_steps(spec.channel, strategy)
     )
     result.pull_total_sumw = float(metadata["pull_total_sumw"])
+    restore_pull_pass_counts(result, metadata.get("pull_pass_counts"))
     result.pull_beam_sumw = float(metadata["pull_beam_sumw"])
     result.pull_left_sumw = float(metadata["pull_left_sumw"])
     result.pull_right_sumw = float(metadata["pull_right_sumw"])
@@ -2123,6 +2154,7 @@ def load_completed_run(
             result.histograms["folded_pull_angle"] = folded
             pull = source["pull"]
             result.pull_total_sumw = float(pull["sumw"])
+            restore_pull_pass_counts(result, pull.get("pass_counts"))
             f_beam = pull.get("f_beam")
             result.pull_beam_sumw = 0.0 if f_beam is None else float(f_beam) * result.pull_total_sumw
             result.pull_left_sumw = float(pull["left_sumw"])
@@ -2309,9 +2341,40 @@ def fill_common_histograms(
     return values
 
 
-def fill_pull_histograms(result: SampleResult, pulls: Sequence[PullVector], event_weight: float) -> None:
+def restore_pull_pass_counts(result: SampleResult, payload: Optional[Mapping[str, Any]]) -> None:
+    """Old uncut archives contain exactly two measured jets per selected event."""
+    if payload is None:
+        selected = result.cutflow[cutflow_steps(result.spec.channel, result.strategy)[-1]]
+        result.pull_pass_counts = {0: CutStat(), 1: CutStat(), 2: replace(selected)}
+    else:
+        result.pull_pass_counts = {k: CutStat(**payload[str(k)]) for k in range(3)}
+
+
+def pull_selection_summary(result: SampleResult) -> Dict[str, Any]:
+    selected = result.cutflow[cutflow_steps(result.spec.channel, result.strategy)[-1]]
+    counts = result.pull_pass_counts
+    return {
+        "pass_counts": {str(k): asdict(stat) for k, stat in counts.items()},
+        "accepted_sumw": math.fsum(0.5 * k * stat.sumw for k, stat in counts.items()),
+        "accepted_event_second_sumw": math.fsum((0.5 * k) ** 2 * stat.sumw for k, stat in counts.items()),
+        "accepted_mc_second_sumw2": math.fsum((0.5 * k) ** 2 * stat.sumw2 for k, stat in counts.items()),
+        "jet_retention_efficiency": result.pull_total_sumw / selected.sumw if selected.sumw else None,
+        "accepted_jets": sum(k * stat.raw_count for k, stat in counts.items()),
+        "entry_weight_fraction": 0.5,
+    }
+
+
+def fill_pull_histograms(
+    result: SampleResult, pulls: Sequence[PullVector], event_weight: float,
+    pull_magnitude_min: Optional[float] = None,
+) -> None:
     if len(pulls) != 2:
         raise ValueError("Exactly two tagging-jet pulls are required per selected event")
+    if pull_magnitude_min is not None:
+        if not math.isfinite(pull_magnitude_min) or pull_magnitude_min <= 0.0:
+            raise ValueError("Pull magnitude threshold must be finite and positive")
+        pulls = [pull for pull in pulls if pull.magnitude > pull_magnitude_min]
+    result.pull_pass_counts[len(pulls)].fill(event_weight)
     observable_values = {
         "pull_t_beam": [pull.t_beam for pull in pulls],
         "pull_t_phi": [pull.t_phi for pull in pulls],
@@ -2515,6 +2578,12 @@ def merge_sample_shard_results(
             histogram.entries += source.entries
 
     merged.pull_total_sumw = math.fsum(result.pull_total_sumw for result in results)
+    for k in range(3):
+        merged.pull_pass_counts[k] = CutStat(
+            raw_count=sum(result.pull_pass_counts[k].raw_count for result in results),
+            sumw=math.fsum(result.pull_pass_counts[k].sumw for result in results),
+            sumw2=math.fsum(result.pull_pass_counts[k].sumw2 for result in results),
+        )
     merged.pull_beam_sumw = math.fsum(result.pull_beam_sumw for result in results)
     merged.pull_left_sumw = math.fsum(result.pull_left_sumw for result in results)
     merged.pull_right_sumw = math.fsum(result.pull_right_sumw for result in results)
@@ -2569,7 +2638,9 @@ def merge_sample_shard_results(
     return merged
 
 
-def particles_from_root(objects: Any, numparticles: int) -> EventParticles:
+def particles_from_root(
+    objects: Any, numparticles: int, particle_pt_min_gev: Optional[float] = None
+) -> EventParticles:
     array = np.asarray(objects)
     if array.ndim == 1:
         if array.size % 8 != 0:
@@ -2577,12 +2648,16 @@ def particles_from_root(objects: Any, numparticles: int) -> EventParticles:
         array = array.reshape((8, array.size // 8))
     if array.ndim != 2 or array.shape[0] < 5 or numparticles > array.shape[1]:
         raise ValueError(f"Unexpected objects shape {array.shape} for {numparticles} particles")
+    selected = array[:, :numparticles]
+    if particle_pt_min_gev is not None:
+        if not math.isfinite(particle_pt_min_gev) or particle_pt_min_gev <= 0.0:
+            raise ValueError("Input-particle pT threshold must be finite and positive")
+        # Apply the writer-equivalent strict cut before candidate selection,
+        # isolation and clustering, preserving the order of retained particles.
+        selected = selected[:, np.hypot(selected[1], selected[2]) > particle_pt_min_gev]
     return EventParticles(
-        array[0, :numparticles],
-        array[1, :numparticles],
-        array[2, :numparticles],
-        array[3, :numparticles],
-        array[4, :numparticles].astype(np.int64, copy=False),
+        selected[0], selected[1], selected[2], selected[3],
+        selected[4].astype(np.int64, copy=False),
     )
 
 
@@ -2684,7 +2759,9 @@ def analyze_sample_shard(
                     result.invalid_events += 1
                     continue
                 try:
-                    particles = particles_from_root(tree.objects, int(tree.numparticles))
+                    particles = particles_from_root(
+                        tree.objects, int(tree.numparticles), config.particle_pt_min_gev
+                    )
                     decision = (
                         select_higgs_candidate(particles, config.cuts)
                         if spec.channel == "higgs"
@@ -2748,7 +2825,7 @@ def analyze_sample_shard(
                             calculate_pull_vector(jet1),
                             calculate_pull_vector(jet2),
                         )
-                    fill_pull_histograms(result, pulls, event_weight)
+                    fill_pull_histograms(result, pulls, event_weight, config.pull_magnitude_min)
                     del cluster
                 except (ArithmeticError, ValueError, RuntimeError) as error:
                     result.invalid_events += 1
@@ -3861,6 +3938,7 @@ def result_summary(result: SampleResult, luminosities: Sequence[float]) -> Dict[
             "inclusive_expected": 1000.0 * luminosity * result.spec.cross_section_pb,
             "processed_expected": factor * result.processed_sumw,
             "selected_expected": factor * selected_sumw,
+            "accepted_pull_expected": factor * result.pull_total_sumw,
         }
     pull_total = result.pull_total_sumw
     scale_pb = result.spec.cross_section_pb / result.generated_sumw
@@ -3893,6 +3971,7 @@ def result_summary(result: SampleResult, luminosities: Sequence[float]) -> Dict[
         "files": result.files,
         "cutflow": {step: asdict(stat) for step, stat in result.cutflow.items()},
         "pull": {
+            **pull_selection_summary(result),
             "sumw": pull_total,
             "f_beam": differential["f_beam"],
             "left_right_asymmetry": (result.pull_right_sumw - result.pull_left_sumw) / pull_total if pull_total else None,
@@ -3905,6 +3984,8 @@ def result_summary(result: SampleResult, luminosities: Sequence[float]) -> Dict[
             "selected_cutflow_sumw": selected_sumw,
             "integral_matches_selected": abs(signed_hist_integral - selected_sumw) <= pull_match_tolerance,
             "folded_integral_matches_selected": abs(folded_hist_integral - selected_sumw) <= pull_match_tolerance,
+            "integral_matches_accepted": math.isclose(signed_hist_integral, pull_total, rel_tol=1e-10, abs_tol=1e-10),
+            "folded_integral_matches_accepted": math.isclose(folded_hist_integral, pull_total, rel_tol=1e-10, abs_tol=1e-10),
             "differential": differential,
             "moment_model": result.pull_moment_model,
         },
@@ -3961,11 +4042,20 @@ def channel_pull_summary(
         "f_beam": f_beam,
         "left_right_asymmetry": (right_pb - left_pb) / total_pb if total_pb else None,
         "expected_selected_yields": expected_yields,
+        "expected_accepted_pull_yields": {
+            str(luminosity): 1000.0 * luminosity * total_pb for luminosity in luminosities
+        },
+        "jet_retention_efficiency": total_pb / selected_pb if selected_pb else None,
         "f_beam_statistical_error": differential["f_beam_statistical_error"],
         "f_beam_mc_statistical_error": differential["f_beam_mc_statistical_error"],
         "statistical_error_model": "event_level_two_tagging_jet_covariance",
         "mc_error_model": "event_level_weighted_outer_products",
-        "pull_entries_per_selected_event": 2.0,
+        "pull_entries_per_selected_event": (
+            sum(pull_selection_summary(result)["accepted_jets"] for result in channel_results)
+            / sum(result.cutflow[cutflow_steps(channel, strategy)[-1]].raw_count for result in channel_results)
+            if any(result.cutflow[cutflow_steps(channel, strategy)[-1]].raw_count for result in channel_results)
+            else None
+        ),
         "differential": differential,
     }
 
@@ -3993,6 +4083,7 @@ def total_pull_observable_statistics(
     event_second_pb = np.zeros((len(edges) - 1, len(edges) - 1), dtype=np.float64)
     mc_second_pb2 = np.zeros_like(event_second_pb)
     selected_cross_section_pb = 0.0
+    accepted_pull_cross_section_pb = 0.0
     for result in selected:
         if result.pull_moment_model != PULL_MOMENT_MODEL:
             raise ValueError(
@@ -4011,16 +4102,17 @@ def total_pull_observable_statistics(
         mc_second_pb2 += scale_pb * scale_pb * moments.mc_second_sumw2
         final_step = cutflow_steps(channel, strategy)[-1]
         selected_cross_section_pb += scale_pb * result.cutflow[final_step].sumw
+        accepted_pull_cross_section_pb += scale_pb * result.pull_total_sumw
     if not np.all(np.isfinite(bin_cross_sections_pb)):
         raise ValueError(f"Non-finite total {observable} prediction")
     if not math.isclose(
         float(np.sum(bin_cross_sections_pb, dtype=np.float64)),
-        selected_cross_section_pb,
+        accepted_pull_cross_section_pb,
         rel_tol=1.0e-10,
         abs_tol=1.0e-12,
     ):
         raise RuntimeError(
-            f"{channel} {strategy} {observable} integral does not match selected yield"
+            f"{channel} {strategy} {observable} integral does not match accepted pull yield"
         )
     luminosity_scale = 1000.0 * float(luminosity_fb)
     return {
@@ -4032,6 +4124,7 @@ def total_pull_observable_statistics(
         "data_covariance": luminosity_scale * event_second_pb,
         "mc_covariance": luminosity_scale * luminosity_scale * mc_second_pb2,
         "selected_cross_section_pb": np.asarray(selected_cross_section_pb),
+        "accepted_pull_cross_section_pb": np.asarray(accepted_pull_cross_section_pb),
     }
 
 
@@ -4562,6 +4655,12 @@ def validate_comparison_sources(
             raise ValueError(f"Process identities differ in source run {source.run_dir}")
         if source.config.tree_name != reference_tree:
             raise ValueError(f"ROOT tree setting differs in source run {source.run_dir}")
+        if source.config.particle_pt_min_gev != reference.config.particle_pt_min_gev:
+            raise ValueError("Comparison input-particle pT thresholds differ")
+        if source.config.pull_magnitude_min != reference.config.pull_magnitude_min:
+            raise ValueError(f"Pull magnitude threshold differs in source run {source.run_dir}")
+        if source.config.jet_acceptance_variable != reference.config.jet_acceptance_variable:
+            raise ValueError(f"Jet acceptance definition differs in source run {source.run_dir}")
         if source.metadata.get("analysis_version") != reference_version:
             raise ValueError(f"Analysis version differs in source run {source.run_dir}")
         if source.metadata.get("configuration", {}).get("cuts", {}) != reference_cuts:
@@ -4745,6 +4844,8 @@ def build_comparison_statistics(
                     "label": source.scenario.label,
                     "color": source.scenario.color,
                     "selected_cross_section_pb": float(folded["selected_cross_section_pb"]),
+                    "accepted_pull_cross_section_pb": float(folded["accepted_pull_cross_section_pb"]),
+                    "jet_retention_efficiency": float(folded["accepted_pull_cross_section_pb"] / folded["selected_cross_section_pb"]),
                     "R": differential["R"],
                     "f_beam": differential["f_beam"],
                     "mc_statistical_covariance": differential["mc_statistical_covariance"],
@@ -5648,9 +5749,33 @@ def _step_values(values: np.ndarray) -> np.ndarray:
     return np.r_[values, values[-1]] if len(values) else values
 
 
-def _save_figure_exclusive(figure: Any, path: Path, **kwargs: Any) -> None:
+def format_pull_angle_axis(axis: Any, observable: str) -> None:
+    """Use exact pi fractions without changing histogram edges or axis units."""
+    if observable == "folded_pull_angle":
+        axis.set_xticks(np.linspace(0, math.pi, 7),
+                       [r"$0$", r"$\pi/6$", r"$\pi/3$", r"$\pi/2$",
+                        r"$2\pi/3$", r"$5\pi/6$", r"$\pi$"])
+    elif observable == "signed_pull_angle":
+        axis.set_xticks(np.linspace(-math.pi, math.pi, 7),
+                       [r"$-\pi$", r"$-2\pi/3$", r"$-\pi/3$", r"$0$",
+                        r"$\pi/3$", r"$2\pi/3$", r"$\pi$"])
+
+
+def _save_figure_exclusive(
+    figure: Any, path: Path, *, particle_pt_min_gev: Optional[float] = None,
+    **kwargs: Any,
+) -> None:
     if path.exists():
         raise FileExistsError(f"Refusing to overwrite plot: {path}")
+    if particle_pt_min_gev is not None and not any(
+        item.get_gid() == "input-particle-selection" for item in figure.texts
+    ):
+        annotation = figure.text(
+            0.99, -0.018,
+            rf"Input particles: $p_T>{particle_pt_min_gev:g}\,\mathrm{{GeV}}$",
+            ha="right", va="top", fontsize=8, color="#657086",
+        )
+        annotation.set_gid("input-particle-selection")
     path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(path, **kwargs)
 
@@ -5714,6 +5839,8 @@ def generate_plots(
     partial: bool,
     cuts: Mapping[str, float] = CUTS,
     scenario_label: Optional[str] = None,
+    pull_magnitude_min: Optional[float] = None,
+    particle_pt_min_gev: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     matplotlib_config = Path(tempfile.gettempdir()) / "pullpheno-matplotlib"
     matplotlib_config.mkdir(parents=True, exist_ok=True)
@@ -5752,6 +5879,8 @@ def generate_plots(
                 continue
             stage = spec.stage if strategy == "cutbased" else "xgboost"
             display_title = spec.title + (" · XGBoost selection" if strategy == "xgboost" else "")
+            if spec.key in PULL_OBSERVABLE_KEYS and pull_magnitude_min is not None:
+                display_title += rf" · $|\vec t|>{pull_magnitude_min:g}$"
             for luminosity in luminosities:
                 lumi_tag = _format_luminosity(luminosity)
                 relative_base = (
@@ -5773,7 +5902,10 @@ def generate_plots(
                         luminosity, result.spec.cross_section_pb, result.generated_sumw
                     )
                     values = factor * histogram.sumw
-                    variance += factor * factor * histogram.sumw2
+                    variance += factor * factor * (
+                        np.diag(result.pull_observable_moments[spec.key].mc_second_sumw2)
+                        if spec.key in PULL_OBSERVABLE_KEYS else histogram.sumw2
+                    )
                     ax.bar(
                         edges[:-1], values, width=widths, align="edge", bottom=bottom,
                         color=result.spec.color, edgecolor="none", linewidth=0.0,
@@ -5790,7 +5922,9 @@ def generate_plots(
                 )
                 ax.set_xlim(edges[0], edges[-1])
                 ax.set_xlabel(spec.xlabel)
-                ax.set_ylabel(rf"Expected events / bin at {luminosity:g} fb$^{{-1}}$")
+                format_pull_angle_axis(ax, spec.key)
+                count_label = "jet entries / 2" if spec.key in PULL_OBSERVABLE_KEYS else "events"
+                ax.set_ylabel(rf"Expected {count_label} / bin at {luminosity:g} fb$^{{-1}}$")
                 ax.set_title(display_title, loc="left", pad=34, fontweight="semibold")
                 subtitle = "Particle level · "
                 if scenario_label:
@@ -5824,9 +5958,9 @@ def generate_plots(
                 png_path = run_dir / relative_base.with_suffix(".png")
                 pdf_path = run_dir / relative_base.with_suffix(".pdf")
                 _save_figure_exclusive(
-                    fig, png_path, dpi=PNG_PLOT_DPI, bbox_inches="tight"
+                    fig, png_path, particle_pt_min_gev=particle_pt_min_gev, dpi=PNG_PLOT_DPI, bbox_inches="tight"
                 )
-                _save_figure_exclusive(fig, pdf_path, bbox_inches="tight")
+                _save_figure_exclusive(fig, pdf_path, particle_pt_min_gev=particle_pt_min_gev, bbox_inches="tight")
                 plt.close(fig)
                 plot_records.append({
                     "strategy": strategy, "observable": spec.key, "title": display_title,
@@ -5850,6 +5984,11 @@ def generate_plots(
                     continue
                 values = histogram.sumw / integral
                 errors = np.sqrt(np.maximum(histogram.sumw2, 0.0)) / abs(integral)
+                if spec.key in PULL_OBSERVABLE_KEYS:
+                    values, covariance = normalized_binned_prediction(
+                        histogram.sumw, result.pull_observable_moments[spec.key].mc_second_sumw2
+                    )
+                    errors = np.sqrt(np.maximum(np.diag(covariance), 0.0))
                 centers = 0.5 * (histogram.edges[:-1] + histogram.edges[1:])
                 ax.stairs(values, histogram.edges, color=result.spec.color, linewidth=1.8,
                            label=result.spec.label)
@@ -5857,6 +5996,7 @@ def generate_plots(
                             linewidth=0.8, capsize=1.2)
             ax.set_xlim(spec.edges[0], spec.edges[-1])
             ax.set_xlabel(spec.xlabel)
+            format_pull_angle_axis(ax, spec.key)
             ax.set_ylabel("Fraction / bin")
             ax.set_title(display_title, loc="left", pad=34, fontweight="semibold")
             ax.text(1.0, 1.015, "Particle level · unit-area process comparison",
@@ -5866,9 +6006,9 @@ def generate_plots(
             png_path = run_dir / relative_base.with_suffix(".png")
             pdf_path = run_dir / relative_base.with_suffix(".pdf")
             _save_figure_exclusive(
-                fig, png_path, dpi=PNG_PLOT_DPI, bbox_inches="tight"
+                fig, png_path, particle_pt_min_gev=particle_pt_min_gev, dpi=PNG_PLOT_DPI, bbox_inches="tight"
             )
-            _save_figure_exclusive(fig, pdf_path, bbox_inches="tight")
+            _save_figure_exclusive(fig, pdf_path, particle_pt_min_gev=particle_pt_min_gev, bbox_inches="tight")
             plt.close(fig)
             plot_records.append({
                 "strategy": strategy, "observable": spec.key, "title": display_title,
@@ -5885,6 +6025,8 @@ def generate_ri_plots(
     results: Sequence[SampleResult],
     luminosities: Sequence[float],
     partial: bool,
+    pull_magnitude_min: Optional[float] = None,
+    particle_pt_min_gev: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     import matplotlib.pyplot as plt
 
@@ -5904,6 +6046,8 @@ def generate_ri_plots(
             if not channel_results:
                 continue
             title_suffix = "cuts" if strategy == "cutbased" else "XGBoost"
+            if pull_magnitude_min is not None:
+                title_suffix += rf" · $|\vec t|>{pull_magnitude_min:g}$"
             relative_base = (
                 Path("plots") / strategy / "shapes" / channel / "ri" / "ri_processes"
             )
@@ -5928,6 +6072,7 @@ def generate_ri_plots(
             ax.axvline(0.5 * math.pi, color="#657086", linestyle="--", linewidth=1.0)
             ax.set_xlim(0.0, math.pi)
             ax.set_xlabel(r"$|\theta_s|$ [rad]")
+            format_pull_angle_axis(ax, "folded_pull_angle")
             ax.set_ylabel(r"$R_i$")
             ax.set_title(f"Differential pull fractions · {title_suffix}", loc="left", pad=34,
                          fontweight="semibold")
@@ -5938,9 +6083,9 @@ def generate_ri_plots(
             png_path = run_dir / relative_base.with_suffix(".png")
             pdf_path = run_dir / relative_base.with_suffix(".pdf")
             _save_figure_exclusive(
-                fig, png_path, dpi=PNG_PLOT_DPI, bbox_inches="tight"
+                fig, png_path, particle_pt_min_gev=particle_pt_min_gev, dpi=PNG_PLOT_DPI, bbox_inches="tight"
             )
-            _save_figure_exclusive(fig, pdf_path, bbox_inches="tight")
+            _save_figure_exclusive(fig, pdf_path, particle_pt_min_gev=particle_pt_min_gev, bbox_inches="tight")
             plt.close(fig)
             records.append({
                 "strategy": strategy, "observable": "R_i", "title": f"Differential R_i · {title_suffix}",
@@ -5982,6 +6127,7 @@ def generate_ri_plots(
                 ax.axvline(0.5 * math.pi, color="#657086", linestyle="--", linewidth=1.0)
                 ax.set_xlim(0.0, math.pi)
                 ax.set_xlabel(r"$|\theta_s|$ [rad]")
+                format_pull_angle_axis(ax, "folded_pull_angle")
                 ax.set_ylabel(r"$R_i$")
                 ax.set_title(f"Total differential pull fractions · {title_suffix}", loc="left",
                              pad=34, fontweight="semibold")
@@ -5995,9 +6141,9 @@ def generate_ri_plots(
                 png_path = run_dir / relative_base.with_suffix(".png")
                 pdf_path = run_dir / relative_base.with_suffix(".pdf")
                 _save_figure_exclusive(
-                    fig, png_path, dpi=PNG_PLOT_DPI, bbox_inches="tight"
+                    fig, png_path, particle_pt_min_gev=particle_pt_min_gev, dpi=PNG_PLOT_DPI, bbox_inches="tight"
                 )
-                _save_figure_exclusive(fig, pdf_path, bbox_inches="tight")
+                _save_figure_exclusive(fig, pdf_path, particle_pt_min_gev=particle_pt_min_gev, bbox_inches="tight")
                 plt.close(fig)
                 records.append({
                     "strategy": strategy, "observable": "R_i", "title": f"Total differential R_i · {title_suffix}",
@@ -6007,6 +6153,13 @@ def generate_ri_plots(
                     "pdf": pdf_path.relative_to(run_dir).as_posix(),
                 })
     return records
+
+
+def comparison_marker(scenario_id: str, fallback_index: int) -> str:
+    """Keep a generator's marker when other scenarios are omitted from a plot."""
+    return COMPARISON_SCENARIO_MARKERS.get(
+        scenario_id, COMPARISON_MARKERS[fallback_index % len(COMPARISON_MARKERS)]
+    )
 
 
 def generate_comparison_plots(
@@ -6035,6 +6188,9 @@ def generate_comparison_plots(
     }
     planned_paths = set()
     reference_id = sources[0].scenario.identifier
+    threshold = sources[0].config.pull_magnitude_min
+    particle_pt_min_gev = sources[0].config.particle_pt_min_gev
+    pull_title_suffix = "" if threshold is None else rf" · $|\vec t|>{threshold:g}$"
     stack_luminosities = luminosities if include_reference_stacks else ()
     for strategy in analyses:
         for channel in ("higgs", "z"):
@@ -6177,9 +6333,7 @@ def generate_comparison_plots(
                     ) * min(0.12, 0.55 / max(len(variations), 1))
                     shifted_centers = folded_centers + offset_fraction * folded_widths
                     color = str(source.scenario.color)
-                    marker = COMPARISON_MARKERS[
-                        (variation_index + 1) % len(COMPARISON_MARKERS)
-                    ]
+                    marker = comparison_marker(scenario_id, variation_index + 1)
                     variation_folded_statistics.append(
                         (
                             source,
@@ -6210,12 +6364,13 @@ def generate_comparison_plots(
 
                 display_title = folded_spec.title + (
                     " · XGBoost selection" if strategy == "xgboost" else ""
-                )
+                ) + pull_title_suffix
                 axis.set_xlim(folded_edges[0], folded_edges[-1])
                 axis.set_ylim(bottom=0.0)
                 axis.set_xlabel(folded_spec.xlabel)
+                format_pull_angle_axis(axis, "folded_pull_angle")
                 axis.set_ylabel(
-                    rf"Expected events / bin at {luminosity:g} fb$^{{-1}}$"
+                    rf"Expected jet entries / 2 / bin at {luminosity:g} fb$^{{-1}}$"
                 )
                 axis.set_title(
                     display_title, loc="left", pad=34, fontweight="semibold"
@@ -6248,9 +6403,9 @@ def generate_comparison_plots(
                 png_path = run_dir / relative_base.with_suffix(".png")
                 pdf_path = run_dir / relative_base.with_suffix(".pdf")
                 _save_figure_exclusive(
-                    figure, png_path, dpi=PNG_PLOT_DPI, bbox_inches="tight"
+                    figure, png_path, particle_pt_min_gev=particle_pt_min_gev, dpi=PNG_PLOT_DPI, bbox_inches="tight"
                 )
-                _save_figure_exclusive(figure, pdf_path, bbox_inches="tight")
+                _save_figure_exclusive(figure, pdf_path, particle_pt_min_gev=particle_pt_min_gev, bbox_inches="tight")
                 plt.close(figure)
                 records.append(
                     {
@@ -6405,7 +6560,7 @@ def generate_comparison_plots(
                 ratio_stack_axis.set_xlim(folded_edges[0], folded_edges[-1])
                 ratio_stack_axis.set_ylim(bottom=0.0)
                 ratio_stack_axis.set_ylabel(
-                    rf"Expected events / bin at {luminosity:g} fb$^{{-1}}$"
+                    rf"Expected jet entries / 2 / bin at {luminosity:g} fb$^{{-1}}$"
                 )
                 ratio_stack_axis.set_title(
                     display_title, loc="left", pad=34, fontweight="semibold"
@@ -6440,6 +6595,7 @@ def generate_comparison_plots(
                 ratio_axis.axhline(1.0, color="#657086", linewidth=1.0, zorder=1)
                 ratio_axis.set_ylabel("Scenario / ref.")
                 ratio_axis.set_xlabel(folded_spec.xlabel)
+                format_pull_angle_axis(ratio_axis, "folded_pull_angle")
                 ratio_axis.set_xlim(folded_edges[0], folded_edges[-1])
                 ratio_axis.grid(False)
                 if ratio_extent_values:
@@ -6453,12 +6609,12 @@ def generate_comparison_plots(
                 ratio_pdf_path = run_dir / ratio_relative_base.with_suffix(".pdf")
                 _save_figure_exclusive(
                     ratio_figure,
-                    ratio_png_path,
+                    ratio_png_path, particle_pt_min_gev=particle_pt_min_gev,
                     dpi=PNG_PLOT_DPI,
                     bbox_inches="tight",
                 )
                 _save_figure_exclusive(
-                    ratio_figure, ratio_pdf_path, bbox_inches="tight"
+                    ratio_figure, ratio_pdf_path, particle_pt_min_gev=particle_pt_min_gev, bbox_inches="tight"
                 )
                 plt.close(ratio_figure)
                 records.append(
@@ -6548,9 +6704,7 @@ def generate_comparison_plots(
                             ) * min(0.12, 0.55 / max(scenario_count, 1))
                             shifted_centers = centers + offset_fraction * bin_widths
                             color = str(source.scenario.color)
-                            marker = COMPARISON_MARKERS[
-                                source_index % len(COMPARISON_MARKERS)
-                            ]
+                            marker = comparison_marker(scenario_id, source_index)
                             axis.errorbar(
                                 shifted_centers,
                                 values,
@@ -6591,10 +6745,10 @@ def generate_comparison_plots(
                                 color=color,
                             )
                         axis.set_ylabel(
-                            rf"Expected events / bin at {luminosity:g} fb$^{{-1}}$"
+                            rf"Expected jet entries / 2 / bin at {luminosity:g} fb$^{{-1}}$"
                         )
                         axis.set_title(
-                            f"{plot_spec.title} · total scenario comparison",
+                            f"{plot_spec.title}{pull_title_suffix} · scenario totals",
                             loc="left",
                             pad=28,
                             fontweight="semibold",
@@ -6626,6 +6780,7 @@ def generate_comparison_plots(
                         ratio_axis.axhline(1.0, color="#657086", linewidth=1.0)
                         ratio_axis.set_ylabel("Scenario / ref.")
                         ratio_axis.set_xlabel(plot_spec.xlabel)
+                        format_pull_angle_axis(ratio_axis, plot_spec.key)
                         ratio_axis.set_xlim(edges[0], edges[-1])
                         if ratio_extent_values:
                             deviation = max(
@@ -6638,11 +6793,11 @@ def generate_comparison_plots(
                         pdf_path = run_dir / relative_base.with_suffix(".pdf")
                         _save_figure_exclusive(
                             figure,
-                            png_path,
+                            png_path, particle_pt_min_gev=particle_pt_min_gev,
                             dpi=PNG_PLOT_DPI,
                             bbox_inches="tight",
                         )
-                        _save_figure_exclusive(figure, pdf_path, bbox_inches="tight")
+                        _save_figure_exclusive(figure, pdf_path, particle_pt_min_gev=particle_pt_min_gev, bbox_inches="tight")
                         plt.close(figure)
                         records.append(
                             {
@@ -7278,6 +7433,12 @@ def generate_run_index(
         f"{html.escape(cut_profile_label)} "
         f"(<code>{html.escape(cut_profile)}</code>)"
     )
+    particle_threshold = run_metadata.get("configuration", {}).get("particle_pt_min_gev")
+    if particle_threshold is not None:
+        cut_profile_html += (
+            f"<br><strong>Input particles:</strong> pT &gt; {particle_threshold:g} GeV "
+            "before candidate selection, isolation and jet clustering"
+        )
     cutflow_html = _html_cutflow_tables(results, luminosities, cut_labels)
     cutflow_links = " · ".join(
         f'<a href="cutflows/{strategy}/{channel}.csv">{strategy} {channel} CSV</a>'
@@ -7615,6 +7776,12 @@ def generate_comparison_index(
         "propagate the independent variation and reference MC uncertainties. "
         if any(kind.startswith("reference-stack") for kind in kinds) else ""
     )
+    particle_threshold = sources[0].config.particle_pt_min_gev
+    particle_selection_html = (
+        "" if particle_threshold is None else
+        f"<p><strong>Common input-particle selection:</strong> pT &gt; {particle_threshold:g} GeV "
+        "before candidate selection, isolation, jet clustering and pull.</p>"
+    )
     document = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>PullPheno scenario comparison · {html.escape(str(run_metadata['run_id']))}</title>
@@ -7623,7 +7790,7 @@ def generate_comparison_index(
 *{{box-sizing:border-box}}body{{margin:0;background:var(--wash);color:var(--ink);font:15px/1.5 Inter,system-ui,sans-serif}}a{{color:var(--accent);text-decoration:none}}a:hover{{text-decoration:underline}}header{{padding:3rem max(1rem,calc((100vw - 1280px)/2));background:linear-gradient(125deg,#12213c,#244b78 62%,#11776d);color:white}}header p{{color:#dce9f8}}h1{{font-size:clamp(2rem,5vw,3.7rem);margin:.3rem 0}}main{{max-width:1320px;margin:auto;padding:1.5rem}}section{{margin:1.2rem 0}}.panel,.plot-card{{background:white;border:1px solid var(--line);border-radius:14px;box-shadow:0 5px 18px #2435510c}}.panel{{padding:1rem}}.table-wrap{{overflow:auto}}table{{border-collapse:collapse;width:100%;font-size:.87rem}}th,td{{padding:.5rem .65rem;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}}th:first-child,td:first-child{{text-align:left}}.swatch{{display:inline-block;width:.75rem;height:.75rem;border-radius:50%;margin-right:.4rem}}.controls{{display:grid;grid-template-columns:repeat(5,minmax(130px,1fr));gap:.7rem;position:sticky;top:0;z-index:2;background:#f3f6faed;backdrop-filter:blur(8px);padding:.8rem 0}}label{{font-size:.78rem;color:var(--muted);font-weight:700}}select,input{{display:block;width:100%;margin-top:.2rem;padding:.5rem;border:1px solid #bfc8d5;border-radius:8px;background:white}}.gallery{{display:grid;grid-template-columns:repeat(auto-fit,minmax(315px,1fr));gap:1rem}}.plot-card{{overflow:hidden}}.plot-card[hidden]{{display:none}}.thumb-link{{display:block;aspect-ratio:1.25;background:white;overflow:hidden}}.thumb-link img{{width:100%;height:100%;object-fit:contain}}.plot-copy{{padding:.85rem}}.plot-copy h3{{font-size:1rem;margin:.45rem 0}}.badges{{display:flex;gap:.35rem;flex-wrap:wrap}}.badges span{{font-size:.68rem;text-transform:uppercase;font-weight:750;border-radius:999px;padding:.18rem .45rem;background:#e7eef8;color:#274b79}}code{{overflow-wrap:anywhere}}footer{{padding:2.5rem;text-align:center;color:var(--muted)}}@media(max-width:760px){{.controls{{grid-template-columns:1fr 1fr;position:static}}}}
 </style></head><body><header><div>PullPheno particle-level analysis</div>
 <h1>Independent generator scenarios</h1><p><strong>Comparison run:</strong> {html.escape(str(run_metadata['run_id']))}<br>
-In total-scenario plots, each point with error bars is the complete prediction from one independently generated scenario, with no connecting lines. {stack_description}All process samples, including backgrounds, are scenario-specific; no background sample is shared. The first run fixes the process cross sections and is the ratio reference.</p></header><main>
+In total-scenario plots, each point with error bars is the complete prediction from one independently generated scenario, with no connecting lines. {stack_description}All process samples, including backgrounds, are scenario-specific; no background sample is shared. The first run fixes the process cross sections and is the ratio reference.</p>{particle_selection_html}</header><main>
 <section class="panel"><h2>Source runs</h2><div class="table-wrap"><table><thead><tr><th>Role</th><th>Scenario</th><th>Parameters</th><th>Immutable source</th></tr></thead><tbody>{''.join(source_rows)}</tbody></table></div><h3>Common reference cross sections</h3><p>Every scenario uses the first run's final-state cross sections; scenario-specific efficiencies and generated sums of weights remain independent.</p><div class="table-wrap"><table><thead><tr><th>Process</th><th>Cross section [pb]</th></tr></thead><tbody>{cross_section_rows}</tbody></table></div></section>
 <section class="panel"><h2>Absolute signed-pull-angle numerical comparison</h2><p>Directional f<sub>beam</sub> values retain their signs. Six-bin D² values are Mahalanobis distances in the supported covariance subspace; √D² is not labelled as a one-dimensional Gaussian significance.</p><div class="table-wrap"><table><thead><tr><th>Analysis</th><th>Channel</th><th>Variation</th><th>fb⁻¹</th><th>f<sub>beam</sub> ref.</th><th>f<sub>beam</sub> var.</th><th>Δf<sub>beam</sub></th><th>Z (ref. truth)</th><th>Z (var. truth)</th><th>D² (ref. truth)</th><th>p (ref., data+MC)</th></tr></thead><tbody>{''.join(summary_rows)}</tbody></table></div><p><a href="summaries/comparison.json">JSON</a> · <a href="summaries/comparison.csv">CSV</a> · <a href="summaries/comparison.npz">NPZ arrays, tests and covariances</a></p></section>
 {hypothesis_html}
@@ -7821,9 +7988,17 @@ def validate_results(results: Sequence[SampleResult], partial: bool) -> Dict[str
         selected = result.cutflow[steps[-1]].sumw
         pull_integral = result.histograms["signed_pull_angle"].integral
         folded_pull_integral = result.histograms["folded_pull_angle"].integral
-        integral_match = math.isclose(selected, pull_integral, rel_tol=1.0e-10, abs_tol=1.0e-10)
+        acceptance = pull_selection_summary(result)
+        accepted = acceptance["accepted_sumw"]
+        pass_counts_valid = (
+            sum(stat.raw_count for stat in result.pull_pass_counts.values()) == result.cutflow[steps[-1]].raw_count
+            and math.isclose(sum(stat.sumw for stat in result.pull_pass_counts.values()), selected, rel_tol=1e-10, abs_tol=1e-10)
+            and math.isclose(sum(stat.sumw2 for stat in result.pull_pass_counts.values()), result.cutflow[steps[-1]].sumw2, rel_tol=1e-10, abs_tol=1e-10)
+            and math.isclose(accepted, result.pull_total_sumw, rel_tol=1e-10, abs_tol=1e-10)
+        )
+        integral_match = math.isclose(accepted, pull_integral, rel_tol=1.0e-10, abs_tol=1.0e-10)
         folded_integral_match = math.isclose(
-            selected, folded_pull_integral, rel_tol=1.0e-10, abs_tol=1.0e-10
+            accepted, folded_pull_integral, rel_tol=1.0e-10, abs_tol=1.0e-10
         )
         pull_moments_valid = True
         exact_pull_moments = result.pull_moment_model == PULL_MOMENT_MODEL
@@ -7858,13 +8033,13 @@ def validate_results(results: Sequence[SampleResult], partial: bool) -> Dict[str
                 )
                 and math.isclose(
                     float(np.sum(moments.bin_sumw)),
-                    selected,
+                    accepted,
                     rel_tol=1.0e-10,
                     abs_tol=tolerance,
                 )
                 and math.isclose(
                     float(np.sum(moments.event_second_sumw)),
-                    selected,
+                    acceptance["accepted_event_second_sumw"],
                     rel_tol=1.0e-10,
                     abs_tol=tolerance,
                 )
@@ -7872,14 +8047,14 @@ def validate_results(results: Sequence[SampleResult], partial: bool) -> Dict[str
                     not exact_pull_moments
                     or math.isclose(
                         float(np.sum(moments.mc_second_sumw2)),
-                        selected_sumw2,
+                        acceptance["accepted_mc_second_sumw2"],
                         rel_tol=1.0e-10,
                         abs_tol=sumw2_tolerance,
                     )
                 )
             )
         bin_integral_match = math.isclose(
-            selected,
+            accepted,
             float(np.sum(result.pull_bin_sumw, dtype=np.float64)),
             rel_tol=1.0e-10,
             abs_tol=1.0e-10,
@@ -7994,10 +8169,11 @@ def validate_results(results: Sequence[SampleResult], partial: bool) -> Dict[str
             "no_invalid_events": result.invalid_events == 0,
             "monotonic_cutflow": monotonic,
             "finite_histograms": finite,
-            "pull_integral_matches_selected": integral_match,
-            "folded_pull_integral_matches_selected": folded_integral_match,
+            "pull_integral_matches_accepted": integral_match,
+            "pull_pass_counts_valid": pass_counts_valid,
+            "folded_pull_integral_matches_accepted": folded_integral_match,
             "all_pull_observable_moments_valid": pull_moments_valid,
-            "ri_integral_matches_selected": bin_integral_match,
+            "ri_integral_matches_accepted": bin_integral_match,
             "ri_and_fbeam_closure": ri_closure,
             "covariances_valid": covariance_valid,
             "processed_sumw_matches_generated": generated_match,
@@ -8082,6 +8258,14 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=Path,
         help="Completed nominal run supplying frozen XGBoost models and thresholds",
     )
+    parser.add_argument(
+        "--pull-magnitude-min", type=float,
+        help="Strict per-tagging-jet pull-magnitude threshold for a fresh cut-based ROOT run",
+    )
+    parser.add_argument(
+        "--particle-pt-min", type=float,
+        help="Strict input-particle pT threshold in GeV, applied before all reconstruction in a fresh cut-based ROOT run",
+    )
     parser.add_argument("--max-events", type=int, help="Maximum events per sample (marks the run as partial)")
     parser.add_argument("--luminosities", type=float, nargs="+", help="Override manifest luminosities in fb^-1")
     parser.add_argument(
@@ -8126,6 +8310,16 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--cut-profile requires --samples and a new ROOT-event pass")
     if args.cut_profile is not None and tuple(args.analyses) != ("cutbased",):
         parser.error("--cut-profile currently supports only --analyses cutbased")
+    if args.pull_magnitude_min is not None:
+        if not math.isfinite(args.pull_magnitude_min) or args.pull_magnitude_min <= 0.0:
+            parser.error("--pull-magnitude-min must be finite and positive")
+        if args.samples is None or tuple(args.analyses) != ("cutbased",):
+            parser.error("--pull-magnitude-min requires --samples and only --analyses cutbased")
+    if args.particle_pt_min is not None:
+        if not math.isfinite(args.particle_pt_min) or args.particle_pt_min <= 0.0:
+            parser.error("--particle-pt-min must be finite and positive")
+        if args.samples is None or tuple(args.analyses) != ("cutbased",):
+            parser.error("--particle-pt-min requires --samples and only --analyses cutbased")
     if args.xgb_model_run is not None and "xgboost" not in args.analyses:
         parser.error("--xgb-model-run requires --analyses to include xgboost")
     if args.from_run is not None and args.xgb_model_run is not None:
@@ -8179,6 +8373,8 @@ def run_comparison(args: argparse.Namespace, started: datetime) -> int:
         "cut_profile": sources[0].config.cut_profile,
         "cut_profile_label": CUT_PROFILE_LABELS[sources[0].config.cut_profile],
         "jet_acceptance_variable": sources[0].config.jet_acceptance_variable,
+        "pull_magnitude_min": sources[0].config.pull_magnitude_min,
+        "particle_pt_min_gev": sources[0].config.particle_pt_min_gev,
         "cuts": dict(sources[0].config.cuts),
         "source_runs": [
             {
@@ -8193,6 +8389,10 @@ def run_comparison(args: argparse.Namespace, started: datetime) -> int:
         "presentation": {
             "points_only": args.comparison_points_only,
             "scenario_colors": scenario_colors,
+            "scenario_markers": {
+                source.scenario.identifier: comparison_marker(source.scenario.identifier, index)
+                for index, source in enumerate(sources)
+            },
             "reference_stack_uncertainties": (
                 [] if args.comparison_points_only else ["mc-stat", "data-stat"]
             ),
@@ -8416,6 +8616,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             read_manifest(args.samples, args.luminosities),
             args.cut_profile or NOMINAL_CUT_PROFILE,
         )
+        config = replace(config, pull_magnitude_min=args.pull_magnitude_min,
+                         particle_pt_min_gev=args.particle_pt_min)
         effective_max_events = args.max_events
         effective_event_shards = args.event_shards or 1
         analyses = tuple(
@@ -8584,10 +8786,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             partial,
             config.cuts,
             scenario_label=config.scenario.label if config.scenario is not None else None,
+            pull_magnitude_min=config.pull_magnitude_min,
+            particle_pt_min_gev=config.particle_pt_min_gev,
         )
         plot_records.extend(
             generate_ri_plots(
-                reservation.incomplete_dir, results, config.luminosities_fb, partial
+                reservation.incomplete_dir, results, config.luminosities_fb, partial,
+                pull_magnitude_min=config.pull_magnitude_min,
+                particle_pt_min_gev=config.particle_pt_min_gev,
             )
         )
         if xgboost_diagnostics:

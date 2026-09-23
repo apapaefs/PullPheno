@@ -1,0 +1,131 @@
+{
+  "study_tag": "pullscan-20260923",
+  "reference_scenario": "herwig",
+  "particle_pt_min_gev": 0.1,
+  "luminosities_fb": [
+    300,
+    3000
+  ],
+  "profiles": [
+    "eta2-mll71-111",
+    "eta3-mll71-111",
+    "eta45-mll71-111"
+  ],
+  "selections": {
+    "uncut": null,
+    "pullcut-0p0015": 0.0015,
+    "pullcut-0p003": 0.003,
+    "pullcut-0p006": 0.006
+  },
+  "comparison_sets": {
+    "three-way": [
+      "herwig",
+      "preco025",
+      "mg5-pythia"
+    ],
+    "herwig-vs-preco": [
+      "herwig",
+      "preco025"
+    ],
+    "herwig-vs-pythia": [
+      "herwig",
+      "mg5-pythia"
+    ]
+  },
+  "comparison_labels": {
+    "three-way": "Three-way comparison",
+    "herwig-vs-preco": "Herwig nominal vs. Herwig pReco = 0.25",
+    "herwig-vs-pythia": "Herwig nominal vs. MG5+Pythia 8"
+  },
+  "workers": 112,
+  "event_shards": 256,
+  "concurrent_analyses": 3,
+  "smoke_workers": 4,
+  "smoke_events": 5000,
+  "smoke_profile": "eta45-mll71-111",
+  "smoke_selections": [
+    "pullcut-0p003",
+    "pullcut-0p006"
+  ],
+  "scenarios": {
+    "herwig": {
+      "manifest": "/micron/Projects/PullPheno/analysis-input-cache/campaign-00014/manifests/samples_odysseus_campaign00014_herwig.json",
+      "identifier": "herwig-default",
+      "color": "#275DAD"
+    },
+    "preco025": {
+      "manifest": "/micron/Projects/PullPheno/analysis-input-cache/campaign-00014/manifests/samples_odysseus_campaign00014_herwig_preco025.json",
+      "identifier": "herwig-preco025",
+      "color": "#D05A47"
+    },
+    "mg5-pythia": {
+      "manifest": "/micron/Projects/PullPheno/analysis-input-cache/campaign-00020/manifests/samples_odysseus_campaign00020_mg5_pythia.json",
+      "identifier": "mg5-pythia8",
+      "color": "#8A5FBF"
+    }
+  },
+  "reuse_sources": {
+    "eta2-mll71-111": {
+      "uncut": {
+        "herwig": "20260916T001023.518496Z-herwig-eta2-mll71-111-uncut-particlept-0p1-v29-5e192b0b",
+        "preco025": "20260916T001023.524949Z-preco025-eta2-mll71-111-uncut-particlept-0p1-v29-d7eaa878",
+        "mg5-pythia": "20260916T001023.518457Z-mg5-pythia-eta2-mll71-111-uncut-particlept-0p1-v-a45b1ed8"
+      },
+      "pullcut-0p0015": {
+        "herwig": "20260916T003247.656225Z-herwig-eta2-mll71-111-pullcut-0p0015-particlept--ab19f683",
+        "preco025": "20260916T003247.653604Z-preco025-eta2-mll71-111-pullcut-0p0015-particlep-66e86135",
+        "mg5-pythia": "20260916T003247.657543Z-mg5-pythia-eta2-mll71-111-pullcut-0p0015-particl-3a1cbdb9"
+      }
+    },
+    "eta3-mll71-111": {
+      "uncut": {
+        "herwig": "20260916T005438.929858Z-herwig-eta3-mll71-111-uncut-particlept-0p1-v29-17ef6139",
+        "preco025": "20260916T005438.927332Z-preco025-eta3-mll71-111-uncut-particlept-0p1-v29-6295bf67",
+        "mg5-pythia": "20260916T005438.929958Z-mg5-pythia-eta3-mll71-111-uncut-particlept-0p1-v-37944a6f"
+      },
+      "pullcut-0p0015": {
+        "herwig": "20260916T011726.437184Z-herwig-eta3-mll71-111-pullcut-0p0015-particlept--8c23268d",
+        "preco025": "20260916T011726.359456Z-preco025-eta3-mll71-111-pullcut-0p0015-particlep-94c4c1df",
+        "mg5-pythia": "20260916T011726.383529Z-mg5-pythia-eta3-mll71-111-pullcut-0p0015-particl-351780e2"
+      }
+    },
+    "eta45-mll71-111": {
+      "uncut": {
+        "herwig": "20260915T234447.083300Z-herwig-eta45-mll71-111-uncut-particlept-0p1-v29-a04ab831",
+        "preco025": "20260915T234447.112642Z-preco025-eta45-mll71-111-uncut-particlept-0p1-v2-17e659a2",
+        "mg5-pythia": "20260915T234447.113346Z-mg5-pythia-eta45-mll71-111-uncut-particlept-0p1--4d2a2e28"
+      },
+      "pullcut-0p0015": {
+        "herwig": "20260915T235508.162070Z-herwig-eta45-mll71-111-pullcut-0p0015-particlept-e5e1dbca",
+        "preco025": "20260915T235508.164954Z-preco025-eta45-mll71-111-pullcut-0p0015-particle-0baa524a",
+        "mg5-pythia": "20260915T235508.164424Z-mg5-pythia-eta45-mll71-111-pullcut-0p0015-partic-7375e02d"
+      }
+    }
+  },
+  "reuse_comparisons": {
+    "eta2-mll71-111": {
+      "uncut": {
+        "three-way": "20260916T003156.515723Z-c14-c20-eta2-mll71-111-uncut-comparison-particle-3e63a9c7"
+      },
+      "pullcut-0p0015": {
+        "three-way": "20260916T005349.813464Z-c14-c20-eta2-mll71-111-pullcut-0p0015-comparison-49d97cb8"
+      }
+    },
+    "eta3-mll71-111": {
+      "uncut": {
+        "three-way": "20260916T011653.700024Z-c14-c20-eta3-mll71-111-uncut-comparison-particle-f0f7a3a4"
+      },
+      "pullcut-0p0015": {
+        "three-way": "20260916T012753.059962Z-c14-c20-eta3-mll71-111-pullcut-0p0015-comparison-214bcc58"
+      }
+    },
+    "eta45-mll71-111": {
+      "uncut": {
+        "three-way": "20260915T235446.993788Z-c14-c20-eta45-mll71-111-uncut-comparison-particl-ddb9f30a"
+      },
+      "pullcut-0p0015": {
+        "three-way": "20260916T000921.379245Z-c14-c20-eta45-mll71-111-pullcut-0p0015-compariso-0ea9adb8"
+      }
+    }
+  }
+}

@@ -722,3 +722,142 @@ For each campaign, record the generator and analysis versions, process cards, mo
 7. [ATLAS Collaboration, *A new ATLAS for the high-luminosity era*](https://atlas.cern/Updates/Feature/High-Luminosity-ATLAS).
 8. [CMS Collaboration, *Electroweak production of two jets in association with a Z boson in proton-proton collisions at 13 TeV*, Eur. Phys. J. C 78 (2018) 589](https://cms-results.web.cern.ch/cms-results/public-results/publications/SMP-16-018/index.html).
 9. [ATLAS Collaboration, *Measurement of colour flow using jet-pull observables in $t\bar t$ events at 13 TeV*, Eur. Phys. J. C 78 (2018) 847](https://arxiv.org/abs/1805.02935).
+
+### Conditional pull measurement (version 2.8)
+
+Use `--pull-magnitude-min 0.0015` with a fresh cut-based ROOT pass to retain
+only tagging jets with a strictly larger pull magnitude. The two tagging jets
+are chosen before applying this requirement. Each accepted jet retains half
+the event weight, so an event contributes zero, one, or two half-weight entries.
+The same mask is applied to all five pull observables. Omitting the option
+preserves the uncut observable, including the previous treatment of zero pull.
+
+```bash
+python3 HwSimPythonAnalysis.py \
+  --samples samples.json --analyses cutbased \
+  --cut-profile eta45-mll71-111 --pull-magnitude-min 0.0015 \
+  --luminosities 300 3000 --workers 112 --event-shards 256 \
+  --output-root results --run-name eta45-pullcut-0p0015
+```
+
+The profiles `eta2-mll71-111`, `eta3-mll71-111`, and `eta45-mll71-111` use
+pseudorapidity acceptances of 2, 3, and 4.5, respectively, with the same
+71–111 GeV dilepton window. The hemisphere, rapidity-gap, boson-centrality,
+and beam-signed pull definitions continue to use rapidity. The previous
+`y45-mll71-111` profile remains available with its original meaning.
+
+The threshold is stored in resolved configuration and checkpoints; replotting
+and resuming inherit it. Selection overrides are rejected for those modes.
+Comparisons require matching thresholds and acceptance definitions. Older
+archives without a threshold or pass-count metadata load as uncut results.
+
+Event-selection yields and accepted pull yields are distinct. For an event
+with weight `w` and `k` accepted jets, the latter receives `w*k/2`; its second
+moments receive `w*(k/2)^2` for projected data and `w^2*(k/2)^2` for finite MC.
+Normalized fractions use the full normalization Jacobian and preserve the
+correlations between the two tagging jets. Summaries record the raw counts,
+weight sums and squared-weight sums for `k=0,1,2`, plus jet retention and both
+yields. Angle axes use exact multiples of pi without changing the binning.
+
+The campaign-14/campaign-20 study uses `scripts/run_pullcut_study.py`, first
+with `--phase smoke`, then `--phase production`, in an isolated code snapshot.
+It records commands, source hashes and validation in the specified batch
+directory and refuses to restart jobs with recoverable state. The report and
+LaTeX builders are `scripts/build_pullcut_report.py` and
+`scripts/write_pullcut_tables.py`; run either with `--help` for its inputs.
+The curated output is
+[the conditional-pull study](results/cutbased-herwig-preco-mg5-pullcut-0p0015/index.html).
+
+**Input-particle qualification:** the existing campaign-20 Pythia writer drops
+raw particles with `pT <= 0.1 GeV`; the Herwig raw objects include softer
+particles. This was checked in the writer sources and in 100 ROOT events per
+process and scenario, with provenance in the report's tables directory.
+Writer-side `|eta| < 6` reconstruction settings do not restrict these raw object
+branches. The positive pull threshold removes the undefined zero-vector angle;
+it does not remove the separate collinear sensitivity of an individual-particle
+threshold. The existing comparison therefore cannot, by itself, establish a
+fully IRC-safe implementation with all final-state particles.
+
+### Matched input-particle threshold (version 2.9)
+
+The new campaign-14/campaign-20 comparison applies a strict `pT > 0.1 GeV`
+requirement to **all raw final-state particles before boson selection, photon
+isolation, jet clustering and pull**. Use `--particle-pt-min 0.1` on a fresh
+cut-based ROOT analysis. The threshold must be finite and positive. No extra
+particle pseudorapidity cut is introduced. The original ROOT records, generator
+cross sections, and generated-weight denominators remain unchanged.
+
+```bash
+python3 HwSimPythonAnalysis.py \
+  --samples samples.json --analyses cutbased \
+  --cut-profile eta3-mll71-111 --particle-pt-min 0.1 \
+  --pull-magnitude-min 0.0015 --luminosities 300 3000 \
+  --workers 112 --event-shards 256 --output-root results \
+  --run-name eta3-particlept-0p1-pullcut-0p0015
+```
+
+Omit only `--pull-magnitude-min` to obtain the matching baseline without the
+pull cut. Omitting `--particle-pt-min` preserves the original raw-particle
+definition; older metadata loads with no analysis-level particle threshold.
+Replotting and checkpoint recovery inherit both thresholds. Comparisons reject
+different input-particle thresholds, pull thresholds, or jet acceptance definitions.
+
+All eighteen source analyses are reprocessed from ROOT for the three scenarios,
+three pseudorapidity acceptances, and two pull selections. Both luminosities
+are calculated from the stored moments. The new output bundle is
+[the study with matched particle inputs](results/cutbased-herwig-preco-mg5-particlept-0p1-pullcut-0p0015/index.html).
+It preserves the earlier study and supplies four folded-angle summaries, six
+complete comparison galleries, updated LaTeX tables, and changes relative to
+the earlier input definition. Pythia is checked for numerical compatibility
+because its writer already applies this threshold.
+
+Matching the particle threshold standardizes the two generators' input
+acceptance. The individual-particle threshold retains a separate collinear
+sensitivity, so matching it does not establish a fully IRC-safe all-particle
+measurement.
+
+### Configurable pull-threshold scan and pairwise comparisons
+
+`studies/pullcut-scan-20260923.json` specifies the campaign-14/campaign-20 scan
+at `|t| > 0.003` and `0.006`, alongside the archived uncut and `0.0015`
+results with matched particle inputs. Every selection covers pseudorapidity
+`|eta_j| < 2, 3, 4.5`, both channels, and 300/3000 fb^-1. Each acceptance
+has a three-way comparison and separate nominal-versus-preco and
+nominal-versus-Pythia comparisons. Nominal Herwig is always the reference.
+
+The configured driver uses explicit numerical thresholds, scenario membership,
+luminosities, worker settings and immutable run IDs to reuse. It performs
+18 fresh ROOT analyses and 30 new comparisons, reusing 18 source analyses
+and six three-way comparisons. Run from a clean snapshot of the synchronized
+Git commit with the established odysseus ROOT environment:
+
+```bash
+python scripts/run_pullcut_study.py --phase smoke \
+  --batch /data/Projects/PullPheno/analysis-results/batches/STUDY \
+  --inputs studies/pullcut-scan-20260923.json \
+  --output-root /data/Projects/PullPheno/analysis-results
+python scripts/run_pullcut_study.py --phase production \
+  --batch /data/Projects/PullPheno/analysis-results/batches/STUDY \
+  --inputs studies/pullcut-scan-20260923.json \
+  --output-root /data/Projects/PullPheno/analysis-results
+```
+
+The runner locks its batch, checks frozen code and inputs, validates source
+definitions and event counts, and refuses to restart recoverable failed jobs.
+`status.json` contains every command, source reuse, code hash and Git commit.
+Existing fixed-study input files remain supported. Analysis format version
+2.9.0 and the stored moments are unchanged; only orchestration and plot
+presentation are extended. Scenario markers are selected by identity, so
+Pythia remains purple triangles in a two-sample comparison.
+
+After fetching completed runs with `scripts/fetch_pullcut_runs.py`, build the
+report with `scripts/build_pullcut_report.py --status ... --results results
+--destination results/cutbased-herwig-preco-mg5-particlept-0p1-pullcut-scan`.
+The status directory also contains the original-output checksum inventory,
+the passing unit-test report and the checkpoint-resume validation report.
+Publication checks threshold monotonicity, unchanged event selections,
+pairwise/three-way numerical closure, luminosity scaling and embedded downloads.
+The bundle supplies 24 six-panel folded-angle summaries and 36 full galleries,
+with both statistical error conventions and all five pull observables.
+Generated results, ROOT inputs and logs remain outside Git; study configuration,
+analysis code, report builders and tests are tracked.

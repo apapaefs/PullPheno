@@ -92,6 +92,20 @@ def validate_embedded(path, records):
 
 def build(args, state):
     inputs = validate_inputs(state['inputs'])
+    report_title = inputs.get('report_title', 'Pull-threshold scan and generator comparisons')
+    report_description = inputs.get('report_description', 'Nominal Herwig, Herwig pReco = 0.25, and MG5+Pythia 8')
+    report_note = inputs.get('report_note', '')
+    fresh_sources = sum(name not in inputs.get('reuse_sources', {}).get(profile, {}).get(selection, {})
+                        for profile in inputs['profiles'] for selection in inputs['selections']
+                        for name in inputs['scenarios'])
+    fresh_comparisons = sum(group not in inputs.get('reuse_comparisons', {}).get(profile, {}).get(selection, {})
+                            for profile in inputs['profiles'] for selection in inputs['selections']
+                            for group in inputs['comparison_sets'])
+    total_sources = len(inputs['profiles'])*len(inputs['selections'])*len(inputs['scenarios'])
+    total_comparisons = len(inputs['profiles'])*len(inputs['selections'])*len(inputs['comparison_sets'])
+    work_summary = (f'{fresh_sources} new ROOT analyses and {fresh_comparisons} new comparison runs; '
+                    f'{total_sources-fresh_sources} archived source runs and '
+                    f'{total_comparisons-fresh_comparisons} archived comparisons reused.')
     assert state['status'] == 'complete'
     results, destination = args.results.resolve(), args.destination.resolve()
     operation = args.status.parent
@@ -197,7 +211,8 @@ def build(args, state):
         threshold = inputs['selections'][selection]
         for group, members in inputs['comparison_sets'].items():
             group_label = inputs['comparison_labels'][group]
-            style_text = ' '.join({'herwig': '', 'preco025': 'Herwig pReco = 0.25: orange squares.', 'mg5-pythia': 'MG5+Pythia 8: purple triangles.'}[name] for name in members).strip()
+            style_labels = inputs.get('scenario_style_labels', {'herwig': '', 'preco025': 'Herwig pReco = 0.25: orange squares.', 'mg5-pythia': 'MG5+Pythia 8: purple triangles.'})
+            style_text = html.escape(' '.join(style_labels[name] for name in members).strip())
             for luminosity in luminosities:
                 name = f'summary-{luminosity:g}fb-folded-angle-{selection}-{group}'
                 sections, exported, embeds = [], [], []
@@ -218,12 +233,14 @@ def build(args, state):
                         exported.append({'profile': profile, 'channel': channel, 'comparison_run': run.name, 'plot': record,
                             'predictions': data['analyses']['cutbased'][channel]['observables']['folded_pull_angle']['luminosities'][str(float(luminosity))]})
                         embeds.append((run, record))
-                    sections.append(f'<section id="{profile}"><h2>|η<sub>j</sub>| &lt; {eta:g}</h2><p>{html.escape(selection_text(threshold))}; 71 &lt; mℓℓ &lt; 111 GeV. '
+                    sections.append(f'<section id="{profile}"><h2>|η<sub>j</sub>| &lt; {eta:g}</h2><p>{html.escape(selection_text(threshold))}; 71 &lt; m<sub>ll</sub> &lt; 111 GeV. '
                         f'<a href="{gallery_path(profile,selection,group)}">Full gallery and statistical tables</a>.</p><div class="figures">'+''.join(figures)+'</div></section>')
                 title = f'{luminosity:g} fb⁻¹ · {selection_text(threshold)} · {group_label}'
                 body = f'<h1>{html.escape(title)}</h1><p>Folded pull angle · Cut-based particle-level analysis · H → γγ and Z → e⁺e⁻, μ⁺μ⁻ · 13.6 TeV.</p>'
                 body += '<nav><a href="index.html">Study overview</a>'+''.join(f'<a href="#{p}">|ηj| &lt; {eta_values[p]:g}</a>' for p in inputs['profiles'])+f'<a href="{name}.json">Binned predictions</a></nav>'
                 body += f'<p class="note">{convention} {style_text}</p><p class="note">{particle_note}</p>'+''.join(sections)
+                if report_note and 'mg5-pythia' in members:
+                    body += f'<p class="note">{html.escape(report_note)}</p>'
                 body += '<footer>Common nominal-Herwig cross sections with scenario-specific efficiencies. BR(H → γγ) = 0.002270 is applied once; Z includes electron and muon decays. Generation-level m(jj) > 200 GeV and reconstructed m(jj) > 400 GeV are retained.</footer>'
                 (destination/(name+'.html')).write_text(page(title, body))
                 write_json(destination/(name+'.json'), {'luminosity_fb': luminosity, 'selection': selection,
@@ -232,9 +249,20 @@ def build(args, state):
                 validation['pages'].append(validate_embedded(destination/(name+'.html'), embeds))
                 summaries.append({'name': name, 'selection': selection, 'luminosity_fb': luminosity, 'comparison_set': group})
 
-    body = '<h1>Pull-threshold scan and generator comparisons</h1><p>Nominal Herwig, Herwig pReco = 0.25, and MG5+Pythia 8 · H → γγ and Z → e⁺e⁻, μ⁺μ⁻ · 13.6 TeV.</p>'
+    body = f'<h1>{html.escape(report_title)}</h1><p>{html.escape(report_description)} · H → γγ and Z → e⁺e⁻, μ⁺μ⁻ · 13.6 TeV.</p>'
+    if report_note:
+        body += f'<p class="note">{html.escape(report_note)}</p>'
+    body += f'<p>{html.escape(work_summary)}</p>'
     body += f'<p class="note">{particle_note} All jet acceptances use pseudorapidity; the rapidity definitions of the gap, hemispheres, centrality and pull remain unchanged.</p>'
     body += '<nav><a href="../index.html">All results</a><a href="retention.json">Retention and yields</a><a href="study-inputs.json">Study configuration</a><a href="study-validation.json">Validation</a><a href="manifest.json">Provenance</a></nav>'
+    generation_links = []
+    for name, label in (('generation-complete.json', 'Completed reshower validation'), ('generation-manifest.json', 'Generator sample manifest')):
+        source = operation/name
+        if source.exists():
+            (destination/name).write_bytes(source.read_bytes())
+            generation_links.append(f'<a href="{name}">{label}</a>')
+    if generation_links:
+        body += '<nav>'+' · '.join(generation_links)+'</nav>'
     for selection in ordered_selections:
         body += f'<section><h2>{html.escape(selection_text(inputs["selections"][selection]))}</h2><div class="table-wrap"><table><thead><tr><th>Comparison</th>'+''.join(f'<th>{l:g} fb<sup>−1</sup></th>' for l in luminosities)+'<th>Full galleries</th></tr></thead><tbody>'
         for group in inputs['comparison_sets']:
@@ -256,13 +284,13 @@ def build(args, state):
                     fraction_text = 'undefined' if fraction is None else f'{fraction:.5f}'
                     body += f'<tr><td>{eta_values[profile]:g}</td><td>{html.escape(selection_text(inputs["selections"][selection]))}</td><td>{label}</td><td>{html.escape(values["label"])}</td><td>{eff_text}</td><td>{fraction_text}</td><td>{300000*values["selected_cross_section_pb"]:,.1f}</td><td>{300000*values["accepted_pull_cross_section_pb"]:,.1f}</td></tr>'
     body += '</tbody></table></div></section>'
-    body += '<footer>The archived no-cut and 0.0015 results use the same common particle threshold as the new 0.003 and 0.006 runs. Original reports remain available from the results index. Shared generation settings and original cross sections are documented in the <a href="../cutbased-herwig-preco-mg5-particlept-0p1-pullcut-0p0015/tables/cuts-and-cross-sections.tex">earlier LaTeX tables</a>.</footer>'
-    (destination/'index.html').write_text(page('Pull-threshold scan', body))
+    body += '<footer>All selections use the same common particle threshold. Original reports remain available from the results index. The shared hard-generation cuts and original cross sections are documented in the <a href="../cutbased-herwig-preco-mg5-particlept-0p1-pullcut-0p0015/tables/cuts-and-cross-sections.tex">earlier LaTeX tables</a>; the study configuration records the shower scenario used here.</footer>'
+    (destination/'index.html').write_text(page(report_title, body))
     write_json(destination/'retention.json', retention)
     write_json(destination/'study-inputs.json', inputs)
     write_json(destination/'study-status.json', state)
     write_json(destination/'study-validation.json', validation)
-    (destination/'README.md').write_text('# Pull-threshold scan\n\nOpen index.html for all summaries and galleries. The four selections are uncut, |t| > 0.0015, 0.003 and 0.006 per measured tagging jet. Each accepted jet contributes half the event weight. All inputs have particle pT > 0.1 GeV.\n\nThere are 18 fresh ROOT analyses and 30 new comparison runs, with 18 archived source runs and six archived three-way comparisons reused. The 24 summary pages and 36 galleries include both channels, eta 2/3/4.5 and 300/3000 fb^-1. All five pull observables, expected-data and finite-MC uncertainties, bin fractions, f_beam and shape/rate statistics are included.\n\nThe summaries hold the nominal prediction fixed for ratio errors. Generation-level m(jj) > 200 GeV and reconstructed m(jj) > 400 GeV remain distinct cuts. Original generator cross sections differ from common nominal-Herwig plotting normalization. BR(H -> gamma gamma) = 0.002270 is applied once; Z includes ee and mu mu.\n\nClick a plot to enlarge it and access embedded PNG/PDF downloads; Escape closes the viewer. Reused and newly generated run IDs, exact commands, code hashes, input configuration and validation are recorded in the JSON files.\n')
+    (destination/'README.md').write_text(f'# {report_title}\n\n{report_description}.\n\n{report_note}\n\nOpen index.html for all summaries and galleries. The four selections are uncut, |t| > 0.0015, 0.003 and 0.006 per measured tagging jet. Each accepted jet contributes half the event weight. All inputs have particle pT > 0.1 GeV.\n\n{work_summary} The 24 summary pages and 36 galleries include both channels, eta 2/3/4.5 and 300/3000 fb^-1. All five pull observables, expected-data and finite-MC uncertainties, bin fractions, f_beam and shape/rate statistics are included.\n\nThe summaries hold the nominal prediction fixed for ratio errors. Generation-level m(jj) > 200 GeV and reconstructed m(jj) > 400 GeV remain distinct cuts. Original generator cross sections differ from common nominal-Herwig plotting normalization. BR(H -> gamma gamma) = 0.002270 is applied once; Z includes ee and mu mu.\n\nClick a plot to enlarge it and access embedded PNG/PDF downloads; Escape closes the viewer. Reused and newly generated run IDs, exact commands, code hashes, input configuration and validation are recorded in the JSON files.\n')
     manifest = {'analysis_version': analysis.ANALYSIS_VERSION, 'git': state['git'],
         'report_git': analysis.git_provenance(ROOT), 'code_sha256': state['code_sha256'],
         'report_code_sha256': {str(p.relative_to(ROOT)): digest(p) for p in (
@@ -279,7 +307,7 @@ def build(args, state):
     marker = '<!-- '+destination.name+' -->'
     if marker not in document:
         relative = destination.relative_to(results).as_posix()
-        link = marker+f'<section style="margin:24px 0;padding:20px;border:1px solid #c8d4e5;border-radius:10px;background:#eaf0f8"><h2>Pull-threshold scan: 0.003 and 0.006</h2><p>Three-way and pairwise comparisons, including corrected no-cut and 0.0015 baselines; |ηj| &lt; 2, 3, 4.5; 300 and 3000 fb<sup>−1</sup>. <a href="{relative}/index.html">Open all 24 summaries and 36 galleries</a>.</p></section>'
+        link = marker+f'<section style="margin:24px 0;padding:20px;border:1px solid #c8d4e5;border-radius:10px;background:#eaf0f8"><h2>{html.escape(report_title)}</h2><p>{html.escape(report_description)}; uncut and |t| &gt; 0.0015, 0.003, 0.006; |ηj| &lt; 2, 3, 4.5; 300 and 3000 fb<sup>−1</sup>. <a href="{relative}/index.html">Open all 24 summaries and 36 galleries</a>.</p></section>'
         document = document.replace('</header>', '</header>'+link, 1) if '</header>' in document else document.replace('<body>', '<body>'+link, 1)
         assert marker in document
         analysis.atomic_write_text(landing, document)

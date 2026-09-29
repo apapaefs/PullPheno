@@ -1483,7 +1483,14 @@ class RunManagementTests(unittest.TestCase):
             index_text = (completed[0] / "index.html").read_text()
             self.assertIn("Pairwise scenario histogram p-values", index_text)
             plots = json.loads((completed[0] / "summaries" / "plots.json").read_text())
-            self.assertEqual(len(plots), 28)
+            self.assertEqual(len(plots), 44)
+            asymmetry_plots = [record for record in plots
+                               if record["kind"].startswith("asymmetry-")]
+            self.assertEqual(len(asymmetry_plots), 16)
+            self.assertEqual({record["observable"] for record in asymmetry_plots},
+                             set(analysis.ASYMMETRY_KEYS))
+            self.assertTrue((completed[0] / "summaries" / "asymmetries.json").is_file())
+            self.assertTrue((completed[0] / "summaries" / "asymmetries.npz").is_file())
             stack_overlays = [
                 record
                 for record in plots
@@ -1580,8 +1587,14 @@ class RunManagementTests(unittest.TestCase):
             self.assertEqual(len(saved_figures), 40)
             point_run = next((output_root / "runs").glob("*synthetic-three-way-points*"))
             point_plots = json.loads((point_run / "summaries" / "plots.json").read_text())
-            self.assertEqual(len(point_plots), 20)
-            self.assertEqual({record["kind"] for record in point_plots}, {"data-stat", "mc-stat"})
+            self.assertEqual(len(point_plots), 36)
+            ordinary_point_plots = [record for record in point_plots
+                                    if not record["kind"].startswith("asymmetry-")]
+            self.assertEqual({record["kind"] for record in ordinary_point_plots},
+                             {"data-stat", "mc-stat"})
+            self.assertTrue(all(record["kind"].startswith("asymmetry-total-ratio")
+                                for record in point_plots
+                                if record["kind"].startswith("asymmetry-")))
             point_comparison = json.loads(
                 (point_run / "summaries" / "comparison.json").read_text()
             )

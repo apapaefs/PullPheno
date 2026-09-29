@@ -1,0 +1,92 @@
+{
+  "study_tag": "campaign22-beam-asymmetries-20260929",
+  "reference_scenario": "herwig",
+  "particle_pt_min_gev": 0.1,
+  "luminosities_fb": [
+    300,
+    3000
+  ],
+  "profiles": [
+    "eta2-mll71-111",
+    "eta3-mll71-111",
+    "eta45-mll71-111"
+  ],
+  "selections": {
+    "uncut": null
+  },
+  "comparison_sets": {
+    "three-way": [
+      "herwig",
+      "preco025",
+      "mg5-pythia"
+    ],
+    "herwig-vs-preco": [
+      "herwig",
+      "preco025"
+    ],
+    "herwig-vs-pythia": [
+      "herwig",
+      "mg5-pythia"
+    ]
+  },
+  "comparison_labels": {
+    "three-way": "Herwig, Herwig pReco and Pythia dipole recoil",
+    "herwig-vs-preco": "Herwig nominal vs. Herwig pReco = 0.25",
+    "herwig-vs-pythia": "Herwig nominal vs. MG5+Pythia 8 dipole recoil"
+  },
+  "workers": 190,
+  "event_shards": 384,
+  "concurrent_analyses": 2,
+  "smoke_workers": 4,
+  "smoke_events": 5000,
+  "smoke_profile": "eta45-mll71-111",
+  "smoke_selections": [
+    "uncut"
+  ],
+  "scenarios": {
+    "herwig": {
+      "manifest": "/micron/Projects/PullPheno/analysis-input-cache/campaign-00022/manifests/samples_campaign00022_herwig.json",
+      "identifier": "herwig-default",
+      "color": "#275DAD"
+    },
+    "preco025": {
+      "manifest": "/micron/Projects/PullPheno/analysis-input-cache/campaign-00022/manifests/samples_campaign00022_preco025.json",
+      "identifier": "herwig-preco025",
+      "color": "#D05A47"
+    },
+    "mg5-pythia": {
+      "manifest": "/micron/Projects/PullPheno/analysis-input-cache/mg5-pythia8-dipolerecoil-c20-20260923/manifests/samples_production_mg5_pythia8_dipolerecoil.json",
+      "identifier": "mg5-pythia8-dipolerecoil",
+      "color": "#8A5FBF"
+    }
+  },
+  "reuse_sources": {},
+  "reuse_comparisons": {},
+  "report_title": "Campaign 22: beam-oriented pull asymmetries",
+  "report_description": "Individual process asymmetries and stacked Herwig comparisons with pReco = 0.25 and older Pythia dipole recoil",
+  "report_note": "Herwig H/Z events come from campaign 22; the continuum diphoton background is retained from campaign 14. Z generation includes its Breit-Wigner width and production-decay correlations. Shower spin correlations are enabled for the H/Z samples; the Higgs hard-process spin density is not supplied by the existing providers. The existing Pythia dipole-recoil events are reanalysed to obtain the new asymmetry moments. Comparison normalization uses the nominal Herwig cross sections, with BR(H to gamma gamma)=0.002270 applied once.",
+  "scenario_style_labels": {
+    "herwig": "",
+    "preco025": "Herwig pReco = 0.25: orange squares.",
+    "mg5-pythia": "MG5+Pythia 8 dipole recoil: purple triangles."
+  },
+  "baseline_status": "/micron/Projects/PullPheno/analysis-results/campaign22-dipole-20260928/batches/campaign22-dipole-20260928/status.json",
+  "asymmetry_observables": [
+    "pull_asymmetry_beam",
+    "pull_asymmetry_phi"
+  ],
+  "asymmetry_bins": {
+    "count": 60,
+    "minimum": 0.0,
+    "maximum": 0.03,
+    "near_zero_maximum": 0.008
+  },
+  "runtime": {
+    "repository": "/home/apapaefs/Projects/PullPheno",
+    "root_setup": "/home/apapaefs/Projects/root/root_v6.40.02/bin/thisroot.sh",
+    "python": "/home/apapaefs/Projects/PullPheno/.venv-odysseus/bin/python",
+    "thermal_guard": "/home/apapaefs/.local/bin/pullpheno-thermal-guard",
+    "thermal_config": "/home/apapaefs/.config/pullpheno-thermal-guard.conf"
+  },
+  "output_root": "/micron/Projects/PullPheno/analysis-results/campaign22-beam-asymmetries-20260929"
+}

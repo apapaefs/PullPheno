@@ -53,7 +53,7 @@ def validate_inputs(inputs):
 
 
 def selection_text(threshold):
-    return 'No pull-magnitude cut' if threshold is None else f'|t⃗| > {threshold:g} per measured jet'
+    return 'No pull-magnitude cut' if threshold is None else f'|t| > {threshold:g} per measured jet'
 
 
 def comparison_key(profile, selection, group):

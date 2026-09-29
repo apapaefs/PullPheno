@@ -20,7 +20,7 @@ ETAS = (2., 3., 4.5)
 SELECTIONS = ('uncut', 'pullcut-0p0015')
 CHANNELS = (('higgs', 'H → γγ'), ('z', 'Z → e⁺e⁻, μ⁺μ⁻'))
 CSS = '''*{box-sizing:border-box}body{max-width:1500px;margin:auto;padding:28px;background:#f7f8fa;color:#172033;font:16px/1.5 system-ui,sans-serif}h1{font-size:2rem;margin-bottom:10px}h2{font-size:1.4rem;margin:0 0 10px}h3{font-size:1.05rem;margin:0 0 10px}a{color:#275dad}nav{display:flex;flex-wrap:wrap;gap:10px 24px;margin:22px 0}section{background:#fff;border:1px solid #dce2eb;border-radius:10px;padding:22px;margin:22px 0}.figures{display:grid;grid-template-columns:1fr 1fr;gap:20px}figure{margin:0;min-width:0}img{display:block;width:100%;height:auto}figcaption,footer{font-size:.87rem;color:#556070}.note{padding:14px 18px;border-left:4px solid #275dad;background:#eaf0f8}.caveat{border-left-color:#98641b;background:#fff4df}.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:.9rem}th,td{text-align:left;padding:9px 12px;border-bottom:1px solid #dce2eb}th{background:#f1f4f8}.summary-links a{display:block;padding:12px;border:1px solid #dce2eb;background:white;border-radius:6px}.muted{color:#556070}@media(max-width:850px){body{padding:12px}section{padding:14px}.figures{grid-template-columns:1fr}}@media print{body{padding:0;background:white}section{break-inside:avoid;border:0;padding:0}nav{display:none}}'''
-VIEWER_CSS = '''.plot-zoom>summary{display:block;list-style:none;cursor:zoom-in}.plot-zoom>summary::-webkit-details-marker{display:none}.plot-zoom>summary:focus-visible{outline:3px solid #275dad;outline-offset:4px}.plot-zoom img{display:block;width:100%;height:auto;background:white}.plot-zoom .close-label{display:none}.plot-zoom .viewer-label{display:block;padding:8px 12px;background:#eaf0f8;color:#172033;border-radius:6px;font:14px/1.5 system-ui,sans-serif}.plot-zoom[open]{position:fixed;inset:0;z-index:1000;margin:0;padding:20px;background:#fff;overflow:auto;overscroll-behavior:contain}.plot-zoom[open]>summary{cursor:zoom-out}.plot-zoom[open] .open-label{display:none}.plot-zoom[open] .close-label{display:block;position:sticky;top:0;z-index:1;text-align:right}.plot-zoom[open] img{width:100%;max-width:1800px;margin:12px auto}.plot-actions{display:flex;flex-wrap:wrap;justify-content:center;gap:12px;padding:12px}.plot-actions a{display:inline-block;padding:8px 16px;border:1px solid #bfc8d5;border-radius:6px;background:#eaf0f8;color:#275dad}.plot-zoom[open] .plot-actions{position:sticky;bottom:0;background:#fff}@media print{.plot-zoom[open]{position:static;overflow:visible;padding:0}.plot-zoom .viewer-label,.plot-actions{display:none}}'''
+VIEWER_CSS = '''.plot-zoom>summary{display:block;list-style:none;cursor:zoom-in}.plot-zoom>summary::-webkit-details-marker{display:none}.plot-zoom>summary:focus-visible{outline:3px solid #275dad;outline-offset:4px}.plot-zoom img{display:block;width:100%;height:auto;background:white}.plot-zoom .viewer-label.close-label{display:none}.plot-zoom .viewer-label{display:block;padding:8px 12px;background:#eaf0f8;color:#172033;border-radius:6px;font:14px/1.5 system-ui,sans-serif}.plot-zoom[open]{position:fixed;inset:0;z-index:1000;margin:0;padding:20px;background:#fff;overflow:auto;overscroll-behavior:contain}.plot-zoom[open]>summary{cursor:zoom-out}.plot-zoom[open] .open-label{display:none}.plot-zoom[open] .close-label{display:block;position:sticky;top:0;z-index:1;text-align:right}.plot-zoom[open] img{width:100%;max-width:1800px;margin:12px auto}.plot-actions{display:flex;flex-wrap:wrap;justify-content:center;gap:12px;padding:12px}.plot-actions a{display:inline-block;padding:8px 16px;border:1px solid #bfc8d5;border-radius:6px;background:#eaf0f8;color:#275dad}.plot-zoom[open] .plot-actions{position:sticky;bottom:0;background:#fff}@media print{.plot-zoom[open]{position:static;overflow:visible;padding:0}.plot-zoom .viewer-label,.plot-actions{display:none}}'''
 VIEWER_SCRIPT = '''<script>document.addEventListener("keydown",function(event){if(event.key==="Escape"){document.querySelectorAll(".plot-zoom[open]").forEach(function(plot){plot.removeAttribute("open");});}});</script>'''
 
 
@@ -79,10 +79,10 @@ def write_embedded_gallery(run, destination, profile, selection, records, compar
     document=document.replace('</head>',f'<style>{VIEWER_CSS}</style></head>',1)
     eta=dict(zip(PROFILES,ETAS))[profile]
     pull_min=configuration.get('pull_magnitude_min')
-    selection_text='No pull-magnitude cut' if pull_min is None else f'|t⃗| &gt; {pull_min:g} per measured jet'
+    selection_text='No pull-magnitude cut' if pull_min is None else f'|t| &gt; {pull_min:g} per measured jet'
     luminosity_text=' and '.join(f'{x:g}' for x in configuration['luminosities_fb'])
     document=document.replace('<main>','<main><section class="panel"><a href="../index.html">Study overview</a>'
-                              f'<h2>|ηj| &lt; {eta:g} · {selection_text}</h2><p>71 &lt; mℓℓ &lt; 111 GeV; {luminosity_text} fb<sup>−1</sup>.</p>'
+                              f'<h2>|ηj| &lt; {eta:g} · {selection_text}</h2><p>71 &lt; m<sub>ll</sub> &lt; 111 GeV; {luminosity_text} fb<sup>−1</sup>.</p>'
                               '<p>Click a plot to enlarge it here and download its PNG or PDF. '
                               'Click again, or press Escape, to close. Images and downloads are embedded.</p></section>',1)
     document=document.replace('</body>',VIEWER_SCRIPT+'</body>',1)
@@ -241,7 +241,7 @@ def main():
         write_embedded_gallery(run,destination,profile,selection,records)
     summaries=[]
     for selection in SELECTIONS:
-        selection_title='No pull-magnitude cut' if selection=='uncut' else '|t⃗| > 0.0015 per measured jet'
+        selection_title='No pull-magnitude cut' if selection=='uncut' else '|t| > 0.0015 per measured jet'
         for luminosity in (300,3000):
             sections=[]; exported=[]
             for eta,profile in zip(ETAS,PROFILES):
@@ -273,7 +273,7 @@ def main():
             summaries.append({'name':name,'luminosity':luminosity,'selection':selection})
     rows=[]; gallery=[]; multiplicity_rows=[]
     for eta,profile in zip(ETAS,PROFILES):
-        gallery.append('<tr><th>|ηj| &lt; '+f'{eta:g}</th>'+''.join(f'<td><a href="{gallery_path(profile,selection)}">'+('Uncut' if selection=='uncut' else '|t⃗| > 0.0015')+'</a></td>' for selection in SELECTIONS)+'</tr>')
+        gallery.append('<tr><th>|ηj| &lt; '+f'{eta:g}</th>'+''.join(f'<td><a href="{gallery_path(profile,selection)}">'+('Uncut' if selection=='uncut' else '|t| > 0.0015')+'</a></td>' for selection in SELECTIONS)+'</tr>')
         for channel,label in CHANNELS:
             old=comparisons[('uncut',profile)][3]['analyses']['cutbased'][channel]['scenarios']
             new=comparisons[('pullcut-0p0015',profile)][3]['analyses']['cutbased'][channel]['scenarios']
@@ -287,8 +287,8 @@ def main():
                 np.testing.assert_allclose(nk[1]/2+nk[2],300000*values['accepted_pull_cross_section_pb'],rtol=1e-10)
                 multiplicity_rows.append(f'<tr><td>{eta:g}</td><td>{label}</td><td>{html.escape(values["label"])}</td>'
                                          +''.join(f'<td>{n:,.1f}</td>' for n in nk)+'</tr>')
-    body='<h1>Pull-magnitude selection: three-sample comparison</h1><p>Nominal Herwig, Herwig pReco = 0.25, and MG5+Pythia 8 · H → γγ and Z → e⁺e⁻, μ⁺μ⁻ · 13.6 TeV.</p><p>The strict cut |t⃗| &gt; 0.0015 is applied separately to each measured tagging jet. All profiles use |ηj| acceptance and 71 &lt; mℓℓ &lt; 111 GeV.</p><nav><a href="../index.html">All results</a><a href="../cutbased-herwig-preco-mg5/summary-300fb-folded-angle.html">Preserved earlier summary</a><a href="tables/cuts-and-cross-sections.tex">LaTeX tables</a><a href="tables/tables-preview.pdf">Compiled tables</a><a href="retention.json">Retention and yields (JSON)</a></nav>'
-    body+='<section><h2>Folded-angle summaries</h2><div class="figures summary-links">'+''.join(f'<a href="{s["name"]}.html">{s["luminosity"]} fb<sup>−1</sup> · '+('No magnitude cut' if s['selection']=='uncut' else '|t⃗| > 0.0015')+'</a>' for s in summaries)+'</div></section>'
+    body='<h1>Pull-magnitude selection: three-sample comparison</h1><p>Nominal Herwig, Herwig pReco = 0.25, and MG5+Pythia 8 · H → γγ and Z → e⁺e⁻, μ⁺μ⁻ · 13.6 TeV.</p><p>The strict cut |t| &gt; 0.0015 is applied separately to each measured tagging jet. All profiles use |ηj| acceptance and 71 &lt; m<sub>ll</sub> &lt; 111 GeV.</p><nav><a href="../index.html">All results</a><a href="../cutbased-herwig-preco-mg5/summary-300fb-folded-angle.html">Preserved earlier summary</a><a href="tables/cuts-and-cross-sections.tex">LaTeX tables</a><a href="tables/tables-preview.pdf">Compiled tables</a><a href="retention.json">Retention and yields (JSON)</a></nav>'
+    body+='<section><h2>Folded-angle summaries</h2><div class="figures summary-links">'+''.join(f'<a href="{s["name"]}.html">{s["luminosity"]} fb<sup>−1</sup> · '+('No magnitude cut' if s['selection']=='uncut' else '|t| > 0.0015')+'</a>' for s in summaries)+'</div></section>'
     if particle_pt_min is not None:
         body=body.replace('<a href="retention.json">',
             '<a href="../cutbased-herwig-preco-mg5-pullcut-0p0015/index.html">Previous particle-input study</a><a href="retention.json">',1)
@@ -308,7 +308,7 @@ def main():
             if record['selection']=='pullcut-0p0015':
                 eta=dict(zip(PROFILES,ETAS))[record['profile']]
                 impact_rows.append(f'<tr><td>{eta:g}</td><td>{dict(CHANNELS)[record["channel"]]}</td><td>{html.escape(record["scenario"])}</td><td>{record["selected_event_change_percent"]:+.3f}%</td><td>{record["accepted_pull_change_percent"]:+.3f}%</td><td>{record["delta_f_beam"]:+.5f}</td></tr>')
-        body+='<section><h2>Effect of matching the particle threshold</h2><p>Changes relative to the earlier input definition, with |t⃗| &gt; 0.0015. The Pythia prediction already uses the particle threshold. These comparisons use the same input events, so no independent-sample errors are assigned to the shifts. Full cut and uncut <a href="particle-threshold-channel-impact.json">channel results</a> and <a href="particle-threshold-impact.json">process weight sums</a> are available.</p><div class="table-wrap"><table><thead><tr><th>|ηj| max.</th><th>Channel</th><th>Scenario</th><th>Selected-event change</th><th>Accepted-pull change</th><th>Δf<sub>beam</sub></th></tr></thead><tbody>'+''.join(impact_rows)+'</tbody></table></div></section>'
+        body+='<section><h2>Effect of matching the particle threshold</h2><p>Changes relative to the earlier input definition, with |t| &gt; 0.0015. The Pythia prediction already uses the particle threshold. These comparisons use the same input events, so no independent-sample errors are assigned to the shifts. Full cut and uncut <a href="particle-threshold-channel-impact.json">channel results</a> and <a href="particle-threshold-impact.json">process weight sums</a> are available.</p><div class="table-wrap"><table><thead><tr><th>|ηj| max.</th><th>Channel</th><th>Scenario</th><th>Selected-event change</th><th>Accepted-pull change</th><th>Δf<sub>beam</sub></th></tr></thead><tbody>'+''.join(impact_rows)+'</tbody></table></div></section>'
     body+='<footer>Cross sections use the common nominal-Herwig reference normalization. Generator cross sections and integration errors are reported separately in the LaTeX tables. Statistical comparisons do not include experimental or modelling systematic uncertainties. <a href="study-validation.json">Validation</a> · <a href="manifest.json">Provenance manifest</a>.</footer>'
     overview_title='Pull-magnitude cut: comparisons and tables'
     if particle_pt_min is not None: overview_title+=f' · particle pT > {particle_pt_min:g} GeV'
@@ -383,7 +383,7 @@ The original uncut runs and earlier report were checked against their saved hash
         link = (marker + '<section style="margin:24px 0;padding:20px;border:1px solid #c8d4e5;border-radius:10px;background:#eaf0f8">'
                 '<h2>Pull-magnitude cut: three-sample comparisons</h2>'
                 + (f'<p>{particle_text}</p>' if particle_text else '') +
-                '<p>|t⃗| &gt; 0.0015 and uncut results; |ηj| &lt; 2, 3, 4.5; 300 and 3000 fb<sup>−1</sup>; '
+                '<p>|t| &gt; 0.0015 and uncut results; |ηj| &lt; 2, 3, 4.5; 300 and 3000 fb<sup>−1</sup>; '
                 f'<a href="{relative}/index.html">summaries, full galleries and LaTeX tables</a>.</p></section>')
         document = document.replace('</header>', '</header>'+link, 1) if '</header>' in document else document.replace('<body>', '<body>'+link, 1)
         assert marker in document

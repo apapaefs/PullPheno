@@ -861,3 +861,34 @@ The bundle supplies 24 six-panel folded-angle summaries and 36 full galleries,
 with both statistical error conventions and all five pull observables.
 Generated results, ROOT inputs and logs remain outside Git; study configuration,
 analysis code, report builders and tests are tracked.
+
+### Beam-oriented pull asymmetries (version 2.10)
+
+Fresh analyses also save the signed-density asymmetries of
+[Eqs. (5.1)–(5.2) of arXiv:1911.05090](https://arxiv.org/pdf/1911.05090),
+using the beam-oriented components `t_beam` and `t_phi`. For each of 60 linear
+bins in `u = |x|` between 0 and 0.03, the plotted value is
+`A_i = (u_i / bin_width) * (W_i_positive - W_i_negative) / W_selected`.
+Both tagging jets contribute half the event weight before any pull-magnitude
+selection. Zero projections and overflow contribute to the selected denominator;
+overflow is recorded separately. Full-range and `[0,0.008]` views are produced.
+
+Individual process plots show finite-MC errors and projected-data errors at the
+requested luminosities. Comparison plots show signed
+nominal-Herwig process contributions with a common channel denominator,
+scenario totals and ratios to Herwig. Separate finite-MC and projected-data
+errors at the requested luminosities use saved event-level numerator/denominator
+covariances, including correlations between the two jets. Ratio bins with zero
+or nonfinite reference values are masked. JSON and NPZ exports are linked from
+each run's index. Older completed runs remain readable but require a fresh ROOT
+pass to obtain these new moments.
+
+The committed [campaign-22 launcher](launchers/campaign22-beam-asymmetries-20260929/README.md)
+and [study configuration](studies/campaign22-beam-asymmetries-20260929.json)
+separate `smoke`, `analysis`, `plots` and `report` phases. The study reanalyses
+campaign-22 Herwig H/Z, campaign-14 diphoton background and older Pythia
+dipole-recoil events without a pull-magnitude cut, with `pT > 0.1 GeV` raw
+particles and all three pseudorapidity acceptances. It produces nine source
+analyses, nine comparisons, dedicated galleries and 12 summary pages. Its
+prepared batch records the exact Git commit, frozen source and manifest hashes,
+input inventory and sample normalization.

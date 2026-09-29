@@ -41,6 +41,7 @@ class PullcutStudyTests(unittest.TestCase):
         self.assertFalse(any('preco' in x for x in command))
         for index in (1, 2):
             self.assertEqual(analysis.comparison_marker('mg5-pythia8', index), '^')
+            self.assertEqual(analysis.comparison_marker('mg5-pythia8-dipolerecoil', index), '^')
             self.assertEqual(analysis.comparison_marker('herwig-preco025', index), 's')
         self.assertEqual(analysis.comparison_marker('unknown', 1), 's')
 

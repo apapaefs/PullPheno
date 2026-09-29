@@ -37,9 +37,10 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional,
 import numpy as np
 
 import xgboost_root_varfiles_module as xgbtools
+from beam_asymmetry import ASYMMETRY_EDGES, ASYMMETRY_KEYS, ASYMMETRY_MODEL, BeamAsymmetryMoments
 
 
-ANALYSIS_VERSION = "2.9.0"
+ANALYSIS_VERSION = "2.10.0"
 ROOT_PASS_CHECKPOINT_VERSION = 1
 ROOT_PASS_CHECKPOINT_RELATIVE = Path("checkpoints") / "root-pass"
 RUN_LOG_NAME = "run.log"
@@ -64,6 +65,7 @@ COMPARISON_PINV_RCOND = 1.0e-12
 COMPARISON_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "*", "<", ">")
 COMPARISON_SCENARIO_MARKERS = {
     "herwig-default": "o", "herwig-preco025": "s", "mg5-pythia8": "^",
+    "mg5-pythia8-dipolerecoil": "^",
 }
 COMPARISON_COLORS = (
     "#275DAD",
@@ -659,6 +661,10 @@ class SampleResult:
     pull_observable_moments: MutableMapping[str, PullObservableMoments] = field(
         default_factory=dict
     )
+    pull_asymmetry_moments: MutableMapping[str, BeamAsymmetryMoments] = field(
+        default_factory=dict
+    )
+    beam_asymmetry_model: Optional[str] = ASYMMETRY_MODEL
     pull_moment_model: str = PULL_MOMENT_MODEL
     score_pull_moments: Optional[ScorePullMoments] = None
     score_pull_moment_model: Optional[str] = None
@@ -1532,6 +1538,12 @@ def resolved_config_payload(
         "jet_acceptance_variable": config.jet_acceptance_variable,
         "pull_magnitude_min": config.pull_magnitude_min,
         "particle_pt_min_gev": config.particle_pt_min_gev,
+        "beam_asymmetries": {
+            "observables": list(ASYMMETRY_KEYS),
+            "axes": ["t_beam", "t_phi"],
+            "pull_magnitude_cut_applied": False,
+            "normalization": "all_selected_events_with_two_half_weight_jets",
+        },
         "cuts": dict(config.cuts),
         "max_events_per_sample": max_events,
         "source_manifest": config.source_manifest,
@@ -1734,6 +1746,7 @@ def _root_pass_result_metadata(result: SampleResult) -> Dict[str, Any]:
         "zero_pull_jets": result.zero_pull_jets,
         "zero_pull_sumw": result.zero_pull_sumw,
         "pull_moment_model": result.pull_moment_model,
+        "pull_asymmetry_keys": list(result.pull_asymmetry_moments),
         "invalid_events": result.invalid_events,
         "files": result.files,
         "common_event_observable_keys": (
@@ -1757,6 +1770,8 @@ def _root_pass_result_arrays(result: SampleResult) -> Dict[str, np.ndarray]:
         arrays[f"{prefix}__bin_sumw"] = moments.bin_sumw
         arrays[f"{prefix}__event_second_sumw"] = moments.event_second_sumw
         arrays[f"{prefix}__mc_second_sumw2"] = moments.mc_second_sumw2
+    for key, moments in result.pull_asymmetry_moments.items():
+        arrays.update(moments.to_arrays(f"asymmetry__{key}"))
     if result.common_events is not None:
         common = result.common_events
         arrays["common__weights"] = common.weights
@@ -1781,6 +1796,8 @@ def _validate_root_pass_results(
     for result in results:
         if result.strategy != "cutbased":
             raise ValueError("ROOT-pass checkpoints may contain only cut-based source results")
+        if set(result.pull_asymmetry_moments) != set(ASYMMETRY_KEYS):
+            raise ValueError(f"Sample {result.spec.name} lacks beam-asymmetry checkpoint moments")
         if result.generated_sumw == 0.0 or not math.isfinite(result.generated_sumw):
             raise ValueError(f"Sample {result.spec.name} has invalid generated sum of weights")
         if "xgboost" in analyses and result.common_events is None:
@@ -1912,6 +1929,12 @@ def _restore_root_pass_result(
             ).copy()
             restored_moments[key] = moments
         result.pull_observable_moments = restored_moments
+        if set(metadata.get("pull_asymmetry_keys", ())) != set(ASYMMETRY_KEYS):
+            raise ValueError(f"Checkpoint beam-asymmetry moments are missing for {spec.name}")
+        result.pull_asymmetry_moments = {
+            key: BeamAsymmetryMoments.from_arrays(arrays, f"asymmetry__{key}")
+            for key in metadata.get("pull_asymmetry_keys", ())
+        }
         folded = restored_moments["folded_pull_angle"]
         result.pull_bin_sumw = folded.bin_sumw
         result.pull_event_second_sumw = folded.event_second_sumw
@@ -2065,6 +2088,7 @@ def initialize_result(
         key: PullObservableMoments(pull_specs[key].edges.copy())
         for key in PULL_OBSERVABLE_KEYS
     }
+    result.pull_asymmetry_moments = {key: BeamAsymmetryMoments() for key in ASYMMETRY_KEYS}
     folded = result.pull_observable_moments["folded_pull_angle"]
     result.pull_bin_sumw = folded.bin_sumw
     result.pull_event_second_sumw = folded.event_second_sumw
@@ -2221,6 +2245,20 @@ def load_completed_run(
                     arrays[legacy_moment_keys["mc"]], dtype=np.float64
                 ).copy()
             result.pull_observable_moments = loaded_moments
+            prefixes = {key: f"{result_prefix}__asymmetry__{key}" for key in ASYMMETRY_KEYS}
+            present = [f"{prefix}__edges" in available for prefix in prefixes.values()]
+            if any(present) and not all(present):
+                raise ValueError(f"Incomplete beam-asymmetry moments for {spec.name}")
+            if not all(present) and (
+                metadata.get("analysis_version") == ANALYSIS_VERSION
+                or configuration.get("beam_asymmetries") is not None
+            ):
+                raise ValueError(f"Beam-asymmetry moments are missing for {spec.name}; reanalyse its events")
+            result.pull_asymmetry_moments = (
+                {key: BeamAsymmetryMoments.from_arrays(arrays, prefix)
+                 for key, prefix in prefixes.items()} if all(present) else {}
+            )
+            result.beam_asymmetry_model = ASYMMETRY_MODEL if all(present) else None
             folded_moments = loaded_moments["folded_pull_angle"]
             result.pull_bin_sumw = folded_moments.bin_sumw
             result.pull_event_second_sumw = folded_moments.event_second_sumw
@@ -2370,9 +2408,18 @@ def fill_pull_histograms(
 ) -> None:
     if len(pulls) != 2:
         raise ValueError("Exactly two tagging-jet pulls are required per selected event")
+    if pull_magnitude_min is not None and (
+        not math.isfinite(pull_magnitude_min) or pull_magnitude_min <= 0.0
+    ):
+        raise ValueError("Pull magnitude threshold must be finite and positive")
+    if result.pull_asymmetry_moments:
+        result.pull_asymmetry_moments["pull_asymmetry_beam"].fill(
+            [pull.t_beam for pull in pulls], event_weight
+        )
+        result.pull_asymmetry_moments["pull_asymmetry_phi"].fill(
+            [pull.t_phi for pull in pulls], event_weight
+        )
     if pull_magnitude_min is not None:
-        if not math.isfinite(pull_magnitude_min) or pull_magnitude_min <= 0.0:
-            raise ValueError("Pull magnitude threshold must be finite and positive")
         pulls = [pull for pull in pulls if pull.magnitude > pull_magnitude_min]
     result.pull_pass_counts[len(pulls)].fill(event_weight)
     observable_values = {
@@ -2593,6 +2640,11 @@ def merge_sample_shard_results(
     if len(moment_models) != 1:
         raise ValueError(f"Shard pull-moment models differ for {spec.name}")
     merged.pull_moment_model = moment_models.pop()
+    if any(set(result.pull_asymmetry_moments) != set(ASYMMETRY_KEYS) for result in results):
+        raise ValueError(f"Shard beam-asymmetry moments are missing for {spec.name}")
+    for key, moments in merged.pull_asymmetry_moments.items():
+        for result in results:
+            moments.add(result.pull_asymmetry_moments[key])
     for key, moments in merged.pull_observable_moments.items():
         for result in results:
             source = result.pull_observable_moments[key]
@@ -5668,6 +5720,8 @@ def write_histogram_npz(run_dir: Path, results: Sequence[SampleResult]) -> Path:
             arrays[f"{prefix}__bin_sumw"] = moments.bin_sumw
             arrays[f"{prefix}__event_second_sumw"] = moments.event_second_sumw
             arrays[f"{prefix}__mc_second_sumw2"] = moments.mc_second_sumw2
+        for observable, moments in result.pull_asymmetry_moments.items():
+            arrays.update(moments.to_arrays(f"{result_prefix}__asymmetry__{observable}"))
         if result.score_pull_moments is not None:
             prefix = f"{result_prefix}__score_pull"
             moments = result.score_pull_moments
@@ -7343,6 +7397,11 @@ def generate_run_index(
     xgboost_metadata: Optional[Mapping[str, Any]] = None,
     cut_labels: Mapping[str, str] = CUT_LABELS,
 ) -> Path:
+    asymmetry_links = (
+        ' · <a href="summaries/asymmetries.json">Beam asymmetries JSON</a>'
+        ' · <a href="summaries/asymmetries.npz">Beam asymmetries and covariances</a>'
+        if (run_dir / "summaries" / "asymmetries.json").is_file() else ""
+    )
     cards: List[str] = []
     for record in plot_records:
         lumi = "shape" if record["luminosity_fb"] is None else _format_luminosity(float(record["luminosity_fb"]))
@@ -7533,7 +7592,7 @@ header p{{max-width:70rem;color:#dce9f8}} .eyebrow{{font-size:.76rem;letter-spac
 <p class="method-note"><strong>Uncertainties:</strong> both projected-data and current-MC errors use event-level six-bin covariance matrices, retaining the correlation between the two tagging jets. The MC term does not decrease with displayed luminosity.
 <strong>Zero-|t| jets:</strong> raw tagging jets whose pull-vector magnitude is exactly zero. Their angle is undefined, so this analysis maps it to zero and reports the count explicitly.</p></section>
 {xgb_html}
-<section class="panel"><h2>Cutflows and data</h2>{cutflow_html}<p>{cutflow_links} · <a href="summaries/analysis.json">Complete JSON summary</a> · <a href="summaries/histograms.npz">Histogram arrays</a> · <a href="summaries/ri.csv">R<sub>i</sub> CSV</a> · <a href="summaries/ri_covariances.npz">R<sub>i</sub> covariances</a> · <a href="{RUN_LOG_NAME}">Run log</a></p></section>
+<section class="panel"><h2>Cutflows and data</h2>{cutflow_html}<p>{cutflow_links} · <a href="summaries/analysis.json">Complete JSON summary</a> · <a href="summaries/histograms.npz">Histogram arrays</a> · <a href="summaries/ri.csv">R<sub>i</sub> CSV</a> · <a href="summaries/ri_covariances.npz">R<sub>i</sub> covariances</a>{asymmetry_links} · <a href="{RUN_LOG_NAME}">Run log</a></p></section>
 <section><h2>Plot gallery</h2><div class="controls">
 <label>Analysis<select id="strategy"><option value="all">All</option>{''.join(f'<option value="{name}">{name}</option>' for name in strategies)}</select></label>
 <label>Channel<select id="channel"><option value="all">All</option><option value="higgs">Higgs</option><option value="z">Z</option></select></label>
@@ -7767,6 +7826,11 @@ def generate_comparison_index(
         )
     analyses = list(comparison["analyses"])
     kinds = sorted({str(record["kind"]) for record in plot_records})
+    asymmetry_links = (
+        '<p><a href="summaries/asymmetries.json">Beam asymmetries JSON</a> · '
+        '<a href="summaries/asymmetries.npz">Asymmetry arrays and covariances</a></p>'
+        if (run_dir / "summaries" / "asymmetries.json").is_file() else ""
+    )
     stack_description = (
         "Absolute signed-pull-angle stack overlays retain the first run's process stack "
         "and draw every variation as total-yield error bars; companion plots add "
@@ -7792,7 +7856,7 @@ def generate_comparison_index(
 <h1>Independent generator scenarios</h1><p><strong>Comparison run:</strong> {html.escape(str(run_metadata['run_id']))}<br>
 In total-scenario plots, each point with error bars is the complete prediction from one independently generated scenario, with no connecting lines. {stack_description}All process samples, including backgrounds, are scenario-specific; no background sample is shared. The first run fixes the process cross sections and is the ratio reference.</p>{particle_selection_html}</header><main>
 <section class="panel"><h2>Source runs</h2><div class="table-wrap"><table><thead><tr><th>Role</th><th>Scenario</th><th>Parameters</th><th>Immutable source</th></tr></thead><tbody>{''.join(source_rows)}</tbody></table></div><h3>Common reference cross sections</h3><p>Every scenario uses the first run's final-state cross sections; scenario-specific efficiencies and generated sums of weights remain independent.</p><div class="table-wrap"><table><thead><tr><th>Process</th><th>Cross section [pb]</th></tr></thead><tbody>{cross_section_rows}</tbody></table></div></section>
-<section class="panel"><h2>Absolute signed-pull-angle numerical comparison</h2><p>Directional f<sub>beam</sub> values retain their signs. Six-bin D² values are Mahalanobis distances in the supported covariance subspace; √D² is not labelled as a one-dimensional Gaussian significance.</p><div class="table-wrap"><table><thead><tr><th>Analysis</th><th>Channel</th><th>Variation</th><th>fb⁻¹</th><th>f<sub>beam</sub> ref.</th><th>f<sub>beam</sub> var.</th><th>Δf<sub>beam</sub></th><th>Z (ref. truth)</th><th>Z (var. truth)</th><th>D² (ref. truth)</th><th>p (ref., data+MC)</th></tr></thead><tbody>{''.join(summary_rows)}</tbody></table></div><p><a href="summaries/comparison.json">JSON</a> · <a href="summaries/comparison.csv">CSV</a> · <a href="summaries/comparison.npz">NPZ arrays, tests and covariances</a></p></section>
+<section class="panel"><h2>Absolute signed-pull-angle numerical comparison</h2><p>Directional f<sub>beam</sub> values retain their signs. Six-bin D² values are Mahalanobis distances in the supported covariance subspace; √D² is not labelled as a one-dimensional Gaussian significance.</p><div class="table-wrap"><table><thead><tr><th>Analysis</th><th>Channel</th><th>Variation</th><th>fb⁻¹</th><th>f<sub>beam</sub> ref.</th><th>f<sub>beam</sub> var.</th><th>Δf<sub>beam</sub></th><th>Z (ref. truth)</th><th>Z (var. truth)</th><th>D² (ref. truth)</th><th>p (ref., data+MC)</th></tr></thead><tbody>{''.join(summary_rows)}</tbody></table></div><p><a href="summaries/comparison.json">JSON</a> · <a href="summaries/comparison.csv">CSV</a> · <a href="summaries/comparison.npz">NPZ arrays, tests and covariances</a></p>{asymmetry_links}</section>
 {hypothesis_html}
 {score_pull_html}
 <section><h2>Pull-observable comparisons and diagnostics</h2><div class="controls">
@@ -8003,6 +8067,39 @@ def validate_results(results: Sequence[SampleResult], partial: bool) -> Dict[str
         pull_moments_valid = True
         exact_pull_moments = result.pull_moment_model == PULL_MOMENT_MODEL
         selected_sumw2 = result.cutflow[steps[-1]].sumw2
+        asymmetry_moments_valid = (
+            result.beam_asymmetry_model is None
+            or set(result.pull_asymmetry_moments) == set(ASYMMETRY_KEYS)
+        )
+        if result.pull_asymmetry_moments:
+            asymmetry_moments_valid = set(result.pull_asymmetry_moments) == set(ASYMMETRY_KEYS)
+            for moments in result.pull_asymmetry_moments.values():
+                tolerance = max(1.0e-10, 1.0e-10 * abs(selected))
+                mc_tolerance = max(1.0e-10, 1.0e-10 * abs(selected_sumw2))
+                try:
+                    moments.validate()
+                except ValueError:
+                    asymmetry_moments_valid = False
+                asymmetry_moments_valid = asymmetry_moments_valid and (
+                    np.array_equal(moments.edges, ASYMMETRY_EDGES)
+                    and moments.event_count == result.cutflow[steps[-1]].raw_count
+                    and np.all(np.isfinite(moments.sumw))
+                    and np.all(np.isfinite(moments.event_second_sumw))
+                    and np.all(np.isfinite(moments.mc_second_sumw2))
+                    and np.allclose(moments.event_second_sumw, moments.event_second_sumw.T,
+                                    rtol=0.0, atol=tolerance)
+                    and np.allclose(moments.mc_second_sumw2, moments.mc_second_sumw2.T,
+                                    rtol=0.0, atol=mc_tolerance)
+                    and math.isclose(float(moments.sumw[-1]), selected,
+                                     rel_tol=1.0e-10, abs_tol=tolerance)
+                    and math.isclose(float(moments.event_second_sumw[-1, -1]), selected,
+                                     rel_tol=1.0e-10, abs_tol=tolerance)
+                    and math.isclose(float(moments.mc_second_sumw2[-1, -1]), selected_sumw2,
+                                     rel_tol=1.0e-10, abs_tol=mc_tolerance)
+                    and math.isclose(float(np.sum(moments.positive_sumw + moments.negative_sumw))
+                                     + moments.zero_sumw, selected,
+                                     rel_tol=1.0e-10, abs_tol=tolerance)
+                )
         for observable in PULL_OBSERVABLE_KEYS:
             moments = result.pull_observable_moments.get(observable)
             histogram = result.histograms[observable]
@@ -8173,6 +8270,7 @@ def validate_results(results: Sequence[SampleResult], partial: bool) -> Dict[str
             "pull_pass_counts_valid": pass_counts_valid,
             "folded_pull_integral_matches_accepted": folded_integral_match,
             "all_pull_observable_moments_valid": pull_moments_valid,
+            "beam_asymmetry_moments_valid_if_present": asymmetry_moments_valid,
             "ri_integral_matches_accepted": bin_integral_match,
             "ri_and_fbeam_closure": ri_closure,
             "covariances_valid": covariance_valid,
@@ -8443,6 +8541,15 @@ def run_comparison(args: argparse.Namespace, started: datetime) -> int:
             numerical,
             include_reference_stacks=not args.comparison_points_only,
         )
+        if all(result.pull_asymmetry_moments for source in sources for result in source.results):
+            import beam_asymmetry_plots
+            asymmetries = beam_asymmetry_plots.build_comparison_payload(
+                sources, analyses, luminosities, reference_cross_sections
+            )
+            plot_records.extend(beam_asymmetry_plots.generate_comparison_plots(
+                reservation.incomplete_dir, sources, analyses, luminosities, asymmetries,
+                include_reference_stacks=not args.comparison_points_only,
+            ))
         if score_pull_payload is not None:
             plot_records.extend(
                 generate_score_pull_diagnostic_plots(
@@ -8796,6 +8903,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 particle_pt_min_gev=config.particle_pt_min_gev,
             )
         )
+        if all(result.pull_asymmetry_moments for result in results):
+            import beam_asymmetry_plots
+            plot_records.extend(beam_asymmetry_plots.generate_sample_plots(
+                reservation.incomplete_dir, results, config.luminosities_fb,
+                partial=partial,
+                scenario_label=config.scenario.label if config.scenario is not None else None,
+                particle_pt_min_gev=config.particle_pt_min_gev,
+                cuts=config.cuts,
+            ))
         if xgboost_diagnostics:
             plot_records.extend(
                 generate_xgboost_diagnostic_plots(

@@ -1539,6 +1539,7 @@ def resolved_config_payload(
         "pull_magnitude_min": config.pull_magnitude_min,
         "particle_pt_min_gev": config.particle_pt_min_gev,
         "beam_asymmetries": {
+            "available": True,
             "observables": list(ASYMMETRY_KEYS),
             "axes": ["t_beam", "t_phi"],
             "pull_magnitude_cut_applied": False,
@@ -2249,7 +2250,13 @@ def load_completed_run(
             present = [f"{prefix}__edges" in available for prefix in prefixes.values()]
             if any(present) and not all(present):
                 raise ValueError(f"Incomplete beam-asymmetry moments for {spec.name}")
-            if not all(present) and (
+            asymmetry_definition = configuration.get("beam_asymmetries") or {}
+            legacy_replot = (
+                asymmetry_definition.get("available") is False
+                and configuration.get("event_source") == "stored_histograms"
+                and configuration.get("derived_from_run_id") is not None
+            )
+            if not all(present) and not legacy_replot and (
                 metadata.get("analysis_version") == ANALYSIS_VERSION
                 or configuration.get("beam_asymmetries") is not None
             ):
@@ -8747,6 +8754,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if source_metadata is not None:
         payload["derived_from_run_id"] = source_metadata["run_id"]
         payload["event_source"] = "stored_histograms"
+        if not all(result.pull_asymmetry_moments for result in preloaded_results):
+            payload["beam_asymmetries"].update(
+                available=False,
+                reason="Legacy source archive lacks beam-asymmetry moments; reanalyse its ROOT events",
+                source_analysis_version=source_metadata.get("analysis_version"),
+            )
     if resume_metadata is not None:
         payload["resumed_from_checkpoint"] = {
             "source_run_id": resume_metadata["source_run_id"],

@@ -4,6 +4,7 @@ import math
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 import HwSimPythonAnalysis as a
@@ -89,11 +90,28 @@ class BeamAsymmetryIntegrationTests(unittest.TestCase):
             metadata['analysis_version'] = '2.9.0'
             metadata['configuration']['analysis_version'] = '2.9.0'
             metadata['configuration'].pop('beam_asymmetries')
+            metadata['run_id'] = 'legacy-source'
+            metadata['partial'] = False
             (root / 'run.json').write_text(json.dumps(metadata))
             _, legacy, _ = a.load_completed_run(root)
             self.assertEqual(legacy[0].pull_asymmetry_moments, {})
             with self.assertRaisesRegex(ValueError, 'reanalyse'):
                 asymmetry_statistics(legacy, (300.,))
+            # Replotting ordinary legacy observables must not falsely advertise
+            # new moments or create an archive the same version cannot reload.
+            output = root / 'derived'
+            with mock.patch.object(a, 'generate_plots', return_value=[]), \
+                 mock.patch.object(a, 'generate_ri_plots', return_value=[]), \
+                 mock.patch.object(a, 'process_root_samples', side_effect=AssertionError('ROOT reopened')), \
+                 mock.patch('sys.stdout'):
+                self.assertEqual(a.main(['--from-run', str(root), '--output-root', str(output),
+                                         '--run-name', 'legacy-replot']), 0)
+            derived = next((output / 'runs').iterdir())
+            _, reloaded, derived_metadata = a.load_completed_run(derived)
+            self.assertFalse(derived_metadata['configuration']['beam_asymmetries']['available'])
+            self.assertEqual(reloaded[0].pull_asymmetry_moments, {})
+            self.assertIsNone(reloaded[0].beam_asymmetry_model)
+            a.validate_results(reloaded, False)
 
     def test_missing_checkpoint_keys_and_corrupt_signs_are_rejected(self):
         result = self.result()

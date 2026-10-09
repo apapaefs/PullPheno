@@ -1562,6 +1562,7 @@ class RunManagementTests(unittest.TestCase):
                     "--run-name", "synthetic-three-way-points",
                     "--comparison-points-only",
                     "--scenario-color", "mg5-pythia8=#8A5FBF",
+                    "--scenario-label", "mg5-pythia8=MG5+Py8 $\\alpha$",
                 ]
             )
             saved_figures = []
@@ -1574,6 +1575,10 @@ class RunManagementTests(unittest.TestCase):
                     self.assertEqual(len(point_lines), 3)
                     self.assertTrue(all(line.get_linestyle() == "None" for line in point_lines))
                     self.assertEqual(point_lines[2].get_color(), "#8A5FBF")
+                legend = figure.axes[0].get_legend()
+                self.assertIn(
+                    "MG5+Py8 $\\alpha$", [text.get_text() for text in legend.get_texts()]
+                )
                 saved_figures.append(path)
                 return save_figure(figure, path, **kwargs)
 
@@ -1602,6 +1607,17 @@ class RunManagementTests(unittest.TestCase):
             self.assertEqual(
                 point_comparison["source_runs"][2]["scenario"]["color"], "#8A5FBF"
             )
+            self.assertEqual(
+                point_comparison["source_runs"][2]["scenario"]["label"], "MG5+Py8 $\\alpha$"
+            )
+            self.assertEqual(
+                point_comparison["presentation"]["scenario_labels"],
+                {"mg5-pythia8": "MG5+Py8 $\\alpha$"},
+            )
+            with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+                analysis.parse_arguments(
+                    ["--samples", "x.json", "--scenario-label", "mg5-pythia8=MG5"]
+                )
             self.assertEqual((mg5 / "run.json").read_bytes(), source_metadata_before)
             analysis.validate_html_links(point_run / "index.html")
 

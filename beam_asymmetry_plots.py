@@ -7,24 +7,19 @@ reference predictions and mask only unavailable or exactly zero denominators.
 from __future__ import annotations
 
 import json
-import os
 import re
-import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+import plot_style
 from beam_asymmetry import ASYMMETRY_KEYS, asymmetry_statistics, ratio_statistics as moment_ratio_statistics
 
 VIEWS = {"full": (0.0, 0.03), "near-zero": (0.0, 0.008)}
 OBSERVABLE_LABELS = {
     "pull_asymmetry_beam": ("Beam pull asymmetry", r"$|t_{\mathrm{beam}}|$", r"$A_{\mathrm{beam}}$"),
     "pull_asymmetry_phi": ("Azimuthal pull asymmetry", r"$|t_\phi|$", r"$A_\phi$"),
-}
-SCENARIO_MARKERS = {
-    "herwig-default": "o", "herwig-preco025": "s", "mg5-pythia8": "^",
-    "mg5-pythia8-dipolerecoil": "^",
 }
 
 
@@ -194,36 +189,21 @@ def write_artifacts(run_dir: Path, payload: Mapping[str, Any]) -> None:
 
 
 def _pyplot() -> Any:
-    cache = Path(tempfile.gettempdir()) / "pullpheno-matplotlib"
-    cache.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("MPLCONFIGDIR", str(cache))
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    plt.rcParams.update({"font.size": 11, "axes.labelsize": 12, "axes.titlesize": 13,
-                         "legend.fontsize": 8.5, "savefig.facecolor": "white"})
-    return plt
+    return plot_style.pyplot()
 
 
 def _slug(value: Any) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value)).strip("-")
 
 
-def _step(values: Any) -> np.ndarray:
-    vector = _array(values)
-    return np.r_[vector, vector[-1]]
-
-
 def _errors(covariance: Any, count: int) -> np.ndarray:
     return np.zeros(count) if covariance is None else np.sqrt(np.maximum(np.diag(_array(covariance)), 0.0))
 
 
-def _visible_limits(axis: Any, centers: np.ndarray, view: str,
-                    vectors: Sequence[np.ndarray], baseline: float = 0.0) -> None:
-    """Give the near-zero view its own vertical range, including error bars."""
-    if view != "near-zero":
-        return
-    lower, upper = VIEWS[view]
+def _window_limits(axis: Any, centers: np.ndarray, window: tuple[float, float],
+                   vectors: Sequence[np.ndarray], baseline: float = 0.0) -> None:
+    """Fit the vertical range to the bins inside the horizontal window, with errors."""
+    lower, upper = window
     visible = (centers >= lower) & (centers <= upper)
     finite_values = [baseline]
     for vector in vectors:
@@ -235,51 +215,54 @@ def _visible_limits(axis: Any, centers: np.ndarray, view: str,
     axis.set_ylim(ymin - padding, ymax + padding)
 
 
-def _decorate(axis: Any, key: str, channel: str, strategy: str, view: str,
-              subtitle: str, ratio: bool = False) -> None:
-    title, xlabel, ylabel = OBSERVABLE_LABELS[key]
-    axis.set_xlim(*VIEWS[view])
-    axis.axhline(0.0, color="#5e6875", linewidth=0.8, zorder=4)
-    axis.set_ylabel(ylabel)
+def _visible_limits(axis: Any, centers: np.ndarray, view: str,
+                    vectors: Sequence[np.ndarray], baseline: float = 0.0) -> None:
+    """Give the near-zero view its own vertical range, including error bars."""
+    if view != "near-zero":
+        return
+    _window_limits(axis, centers, VIEWS[view], vectors, baseline)
+
+
+def _view_window(view: str, edges: np.ndarray, vectors: Sequence[np.ndarray]) -> tuple[float, float]:
+    """The near-zero view is fixed; the full view ends after the last populated bin."""
+    lower, upper = VIEWS[view]
+    if view != "full":
+        return lower, upper
+    return lower, min(upper, plot_style.populated_limits(edges, vectors)[1])
+
+
+def _decorate(axis: Any, key: str, window: tuple[float, float], ratio: bool = False) -> None:
+    _, xlabel, ylabel = OBSERVABLE_LABELS[key]
+    axis.set_xlim(*window)
+    axis.axhline(0.0, color=plot_style.GUIDE, linewidth=0.6, zorder=4)
+    plot_style.scaled_axis(axis, ylabel, max(abs(value) for value in axis.get_ylim()))
     if not ratio:
         axis.set_xlabel(xlabel)
-    axis.set_title(f"{title} · {'Higgs' if channel == 'higgs' else channel.upper()} channel",
-                   loc="left", pad=28, fontweight="bold")
-    axis.text(0.0, 1.025, subtitle + (" · XGBoost selection" if strategy == "xgboost" else ""),
-              transform=axis.transAxes, fontsize=9, color="#555b66", ha="left")
-    axis.ticklabel_format(axis="y", style="sci", scilimits=(-3, 4), useMathText=True)
-    axis.grid(axis="y", alpha=0.12)
+
+
+def _header(channel: str, strategy: str, cuts: Mapping[str, float] | None, luminosity: float | None,
+            prefix: str | None, particle_pt_min_gev: float | None, partial: bool) -> str:
+    # Asymmetries always use both tagging jets, whatever pull-magnitude cut the run applies.
+    return plot_style.header(prefix=prefix, channel=channel, cuts=cuts, luminosity=luminosity,
+                             threshold=None, particle_pt_min_gev=particle_pt_min_gev,
+                             notes=["XGBoost selection"] if strategy == "xgboost" else [],
+                             partial=partial)
 
 
 def _save(figure: Any, run_dir: Path, relative: Path, particle_pt_min_gev: float | None) -> dict[str, str]:
-    if particle_pt_min_gev is not None:
-        figure.text(0.985, 0.01, rf"Input particles: $p_T>{particle_pt_min_gev:g}\,\mathrm{{GeV}}$",
-                    ha="right", fontsize=8, color="#657086")
-    if not figure.get_constrained_layout():
-        figure.tight_layout(rect=(0.0, 0.025, 1.0, 1.0))
+    """Write PNG and PDF copies; the header already states ``particle_pt_min_gev``."""
     paths = {}
     for extension in ("png", "pdf"):
         path = Path(run_dir) / relative.with_suffix(f".{extension}")
         if path.exists():
             raise FileExistsError(f"Refusing to overwrite plot: {path}")
         path.parent.mkdir(parents=True, exist_ok=True)
-        figure.savefig(path, dpi=300, bbox_inches="tight")
+        figure.savefig(path, dpi=plot_style.PNG_DPI, bbox_inches="tight")
         paths[extension] = path.relative_to(run_dir).as_posix()
     return paths
 
 
-def _annotate_acceptance(figure: Any, cuts: Mapping[str, float] | None) -> None:
-    if not cuts:
-        return
-    if "jet_abs_eta_max" in cuts:
-        label = rf"Tagging jets: $|\eta_j|<{cuts['jet_abs_eta_max']:g}$"
-    elif "jet_abs_y_max" in cuts:
-        label = rf"Tagging jets: $|y_j|<{cuts['jet_abs_y_max']:g}$"
-    else:
-        return
-    figure.text(0.015, 0.01, label, ha="left", fontsize=8, color="#657086")
-
-
+@plot_style.paper_figures
 def generate_sample_plots(
     run_dir: Path, results: Sequence[Any], luminosities: Sequence[float],
     partial: bool = False, scenario_label: str | None = None,
@@ -291,6 +274,7 @@ def generate_sample_plots(
     lookup = {(item["strategy"], item["sample"]): item for item in payload["predictions"]}
     modes = [("mc-stat", None)] + [("data-stat", float(lumi)) for lumi in luminosities]
     for result in results:
+        label = plot_style.paper_label(result.spec.label)
         for key, statistics in lookup[(result.strategy, result.spec.name)]["observables"].items():
             defined = statistics.get("A") is not None
             centers, edges = map(_array, (statistics["centers"], statistics["bin_edges"]))
@@ -301,34 +285,31 @@ def generate_sample_plots(
                               if data else statistics["mc_covariance"])
                 errors = _errors(covariance, len(centers)) if defined else None
                 for view in VIEWS:
-                    figure, axis = plt.subplots(figsize=(7.4, 5.3))
-                    error_label = rf"expected stat., {luminosity:g} fb$^{{-1}}$" if data else "MC stat."
+                    figure, axis = plt.subplots(figsize=plot_style.SINGLE_FIGSIZE, constrained_layout=True)
+                    handle = plot_style.reference_handle(result.spec.color)
                     if defined:
-                        axis.stairs(values, edges, color=result.spec.color, linewidth=1.8,
-                                    label=f"{result.spec.label} ({error_label})")
+                        axis.stairs(values, edges, color=result.spec.color, linewidth=1.1, zorder=6)
                         axis.errorbar(centers, values, yerr=errors, fmt="none", color=result.spec.color,
-                                      linewidth=0.9, capsize=1.6)
+                                      elinewidth=plot_style.ERROR_LINE_WIDTH, capsize=plot_style.CAP_SIZE,
+                                      zorder=7)
+                        entry = (handle, f"{label}, {'expected stat.' if data else 'MC stat.'}")
+                        window = _view_window(view, edges, [values, errors])
+                        _window_limits(axis, centers, window, [values-errors, values+errors])
                     else:
-                        axis.plot([], [], color=result.spec.color, label=result.spec.label)
+                        entry = (handle, label)
                         axis.text(0.5, 0.55, "Asymmetry undefined: no selected events", ha="center", va="center",
-                                  transform=axis.transAxes, color="#555b66", fontsize=11,
-                                  bbox={"facecolor": "white", "edgecolor": "#aeb8c6", "boxstyle": "round,pad=0.6"})
+                                  transform=axis.transAxes, color=plot_style.MUTED)
                         axis.set_ylim(-0.1, 0.1)
-                    subtitle = "Particle level · 13.6 TeV · no pull magnitude cut"
-                    if scenario_label:
-                        subtitle = f"{scenario_label} · " + subtitle
-                    if partial:
-                        subtitle += " · PARTIAL RUN"
-                    _decorate(axis, key, result.spec.channel, result.strategy, view, subtitle)
-                    if defined:
-                        _visible_limits(axis, centers, view, [values-errors, values+errors])
-                    axis.legend(loc="best", framealpha=1.0)
+                        window = VIEWS[view]
+                    _decorate(axis, key, window)
+                    plot_style.legend_above(axis, [[entry]], title=_header(
+                        result.spec.channel, result.strategy, cuts, luminosity, scenario_label,
+                        particle_pt_min_gev, partial))
                     relative = (Path("plots") / result.strategy / "asymmetries" / result.spec.channel /
                                 _slug(result.spec.name))
                     if data:
                         relative = relative / "data-stat" / f"{luminosity:g}fb"
                     relative = relative / view / key
-                    _annotate_acceptance(figure, cuts)
                     records.append({"strategy": result.strategy, "observable": key,
                                     "title": f"{OBSERVABLE_LABELS[key][0]} · {result.spec.label} · {uncertainty} · {view}",
                                     "channel": result.spec.channel,
@@ -343,6 +324,8 @@ def generate_sample_plots(
     write_artifacts(run_dir, payload)
     return records
 
+
+@plot_style.paper_figures
 def generate_comparison_plots(
     run_dir: Path, sources: Sequence[Any], analyses: Sequence[str], luminosities: Sequence[float],
     payload: dict[str, Any] | None = None, *,
@@ -356,6 +339,11 @@ def generate_comparison_plots(
     ratios = {(item["strategy"], item["channel"], item["observable"], item["scenario"]): item
               for item in payload["ratios"]}
     reference_id = sources[0].scenario.identifier
+    label_prefix, scenario_labels = plot_style.scenario_labels([source.scenario.label for source in sources])
+    reference_label = scenario_labels[0]
+    cuts = getattr(sources[0].config, "cuts", None)
+    particle_pt_min_gev = sources[0].config.particle_pt_min_gev
+    partial = bool((getattr(sources[0], "metadata", None) or {}).get("partial"))
     for strategy in analyses:
         channels = sorted({channel for key_strategy, channel, scenario in predictions
                            if key_strategy == strategy and scenario == reference_id})
@@ -379,21 +367,27 @@ def generate_comparison_plots(
                         covariance = reference["data_covariances"].get(str(float(luminosity))) if data else reference["mc_covariance"]
                         errors = _errors(covariance, len(total))
                         for view in VIEWS:
-                            figure, (axis, ratio_axis) = plt.subplots(2, 1, figsize=(8.1, 7.2), sharex=True, layout="constrained",
-                                                                       gridspec_kw={"height_ratios": [3, 1.1], "hspace": 0.1})
+                            figure, (axis, ratio_axis) = plt.subplots(
+                                2, 1, figsize=plot_style.RATIO_FIGSIZE, sharex=True, layout="constrained",
+                                gridspec_kw={"height_ratios": plot_style.RATIO_HEIGHT_RATIOS})
+                            figure.get_layout_engine().set(hspace=0.0, h_pad=0.01)
                             visible_values = [total-errors, total+errors]
-                            visible_ratios = []
+                            populated = [total, errors]
+                            process_entries = []
                             if include_reference_stacks:
                                 visible_values.extend([stack["positive"], stack["negative"]])
                                 for result in processes:
                                     name = result.spec.name
-                                    axis.bar(edges[:-1], stack["values"][name], width=widths,
-                                             bottom=stack["bottoms"][name], align="edge", color=result.spec.color,
-                                             edgecolor="none", label=result.spec.label, zorder=2)
-                            axis.fill_between(edges, _step(total-errors), _step(total+errors), step="post",
-                                              color="#20242b", alpha=0.20, linewidth=0.0,
-                                              label=f"{sources[0].scenario.label} total ({'expected stat.' if data else 'MC stat.'})", zorder=5)
-                            axis.stairs(total, edges, color="#20242b", linewidth=1.2, zorder=6)
+                                    label = plot_style.paper_label(result.spec.label)
+                                    handle = plot_style.stacked_fill(axis, edges, stack["values"][name],
+                                                                     stack["bottoms"][name], result.spec.color, label)
+                                    process_entries.append((handle, label))
+                                    populated.append(stack["values"][name])
+                            band = plot_style.uncertainty_band(axis, edges, total-errors, total+errors)
+                            axis.stairs(total, edges, color=plot_style.REFERENCE_LINE, linewidth=1.1, zorder=6)
+                            reference_entries = [((band, plot_style.reference_handle()),
+                                                  f"{reference_label} total, {'expected stat.' if data else 'MC stat.'}")]
+                            variation_entries, ratio_points = [], []
                             for index, source in enumerate(sources[1:]):
                                 scenario = source.scenario.identifier
                                 statistics = predictions[(strategy, channel, scenario)][key]
@@ -403,14 +397,14 @@ def generate_comparison_plots(
                                 variation_covariance = statistics["data_covariances"].get(str(float(luminosity))) if data else statistics["mc_covariance"]
                                 variation_errors = _errors(variation_covariance, len(values))
                                 visible_values.extend([values-variation_errors, values+variation_errors])
+                                populated.append(values)
                                 shift = (index - 0.5 * (len(sources)-2)) * min(0.12, 0.55/(len(sources)-1))
                                 positions = centers + shift * widths
                                 color = source.scenario.color or ("#D05A47", "#0D8274", "#8A5FBF")[index % 3]
-                                marker = SCENARIO_MARKERS.get(scenario, ("s", "^", "D")[index % 3])
-                                axis.errorbar(positions, values, yerr=variation_errors, fmt=marker,
-                                              markersize=4.2, markerfacecolor="white", markeredgewidth=1.2,
-                                              color=color, capsize=2.0, elinewidth=1.0, linestyle="none",
-                                              label=f"{source.scenario.label} total", zorder=10)
+                                marker = plot_style.scenario_marker(scenario, index + 1)
+                                container = plot_style.points(axis, positions, values, variation_errors,
+                                                              color=color, marker=marker, zorder=10)
+                                variation_entries.append((container, scenario_labels[index + 1]))
                                 ratio = ratios[(strategy, channel, key, scenario)]
                                 validity = (ratio["numerical_valid"]["data"][str(float(luminosity))]
                                             if data else ratio["numerical_valid"]["mc"])
@@ -419,21 +413,29 @@ def generate_comparison_plots(
                                 ratio_covariance = ratio["data_covariances"].get(str(float(luminosity))) if data else ratio["mc_covariance"]
                                 ratio_errors = _errors(ratio_covariance, len(central))
                                 valid &= np.isfinite(central) & np.isfinite(ratio_errors)
-                                visible_ratios.extend([np.where(valid, central-ratio_errors, np.nan),
-                                                       np.where(valid, central+ratio_errors, np.nan)])
-                                ratio_axis.errorbar(positions[valid], central[valid], yerr=ratio_errors[valid], fmt=marker,
-                                                    markersize=4.0, markerfacecolor="white", color=color,
-                                                    markeredgewidth=1.1, capsize=1.6, elinewidth=0.9, linestyle="none")
-                            ratio_axis.axhline(1.0, color="#535c6a", linewidth=0.8)
-                            ratio_axis.set_ylabel(f"Ratio to\n{sources[0].scenario.label}", fontsize=10)
+                                plot_style.points(ratio_axis, positions[valid], central[valid], ratio_errors[valid],
+                                                  color=color, marker=marker, zorder=10)
+                                ratio_points.append((positions, central, ratio_errors, valid, color))
+                            window = _view_window(view, edges, populated)
+                            _window_limits(axis, centers, window, visible_values)
+                            ratio_axis.axhline(1.0, color=plot_style.GUIDE, linewidth=0.7)
+                            ratio_axis.set_ylabel(f"Ratio to\n{reference_label}")
                             ratio_axis.set_xlabel(OBSERVABLE_LABELS[key][1])
-                            ratio_axis.grid(axis="y", alpha=0.12)
-                            subtitle = rf"Particle level · {luminosity:g} fb$^{{-1}}$ · no pull magnitude cut"
-                            _decorate(axis, key, channel, strategy, view, subtitle, ratio=True)
-                            _visible_limits(axis, centers, view, visible_values)
-                            _visible_limits(ratio_axis, centers, view, visible_ratios, baseline=1.0)
-                            axis.legend(loc="best", ncol=2, framealpha=1.0, edgecolor="#aeb8c6")
-                            _annotate_acceptance(figure, getattr(sources[0].config, "cuts", None))
+                            in_window = (centers >= window[0]) & (centers <= window[1])
+                            ratio_range = plot_style.ratio_window(
+                                [(central[valid & in_window], ratio_errors[valid & in_window])
+                                 for _, central, ratio_errors, valid, _ in ratio_points])
+                            if ratio_range is not None:
+                                ratio_axis.set_ylim(*ratio_range)
+                            for positions, central, _, valid, color in ratio_points:
+                                plot_style.mark_clipped(ratio_axis, positions[valid & in_window],
+                                                        central[valid & in_window], color)
+                            _decorate(axis, key, window, ratio=True)
+                            plot_style.legend_above(
+                                axis, [reference_entries + process_entries[::-1], variation_entries],
+                                title=_header(channel, strategy, cuts, float(luminosity) if data else None,
+                                              label_prefix, particle_pt_min_gev, partial))
+                            figure.align_ylabels((axis, ratio_axis))
                             kind = ("asymmetry-reference-stack-plus-total-ratio" if include_reference_stacks
                                     else "asymmetry-total-ratio") + ("-data-stat" if data else "")
                             relative = (Path("plots") / "comparison" / strategy / "asymmetries" /
@@ -443,7 +445,7 @@ def generate_comparison_plots(
                                             "channel": channel, "stage": "comparison", "kind": kind,
                                             "view": view, "sample": None, "uncertainty": uncertainty,
                                             "error_mode": "data" if data else "mc", "luminosity_fb": float(luminosity),
-                                            **_save(figure, run_dir, relative, sources[0].config.particle_pt_min_gev)})
+                                            **_save(figure, run_dir, relative, particle_pt_min_gev)})
                             plt.close(figure)
     payload["plots"] = records
     write_artifacts(run_dir, payload)

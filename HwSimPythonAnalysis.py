@@ -36,6 +36,7 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional,
 
 import numpy as np
 
+import plot_style
 import xgboost_root_varfiles_module as xgbtools
 from beam_asymmetry import ASYMMETRY_EDGES, ASYMMETRY_KEYS, ASYMMETRY_MODEL, BeamAsymmetryMoments
 
@@ -62,11 +63,8 @@ PULL_MOMENT_MODEL = "event_level_two_tagging_jet_all_pull_observables"
 SCORE_PULL_BIN_COUNT = 10
 SCORE_PULL_MOMENT_MODEL = "event_level_xgboost_score_quantile_by_folded_pull"
 COMPARISON_PINV_RCOND = 1.0e-12
-COMPARISON_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "*", "<", ">")
-COMPARISON_SCENARIO_MARKERS = {
-    "herwig-default": "o", "herwig-preco025": "s", "mg5-pythia8": "^",
-    "mg5-pythia8-dipolerecoil": "^",
-}
+COMPARISON_MARKERS = plot_style.MARKERS
+COMPARISON_SCENARIO_MARKERS = plot_style.SCENARIO_MARKERS
 COMPARISON_COLORS = (
     "#275DAD",
     "#D05A47",
@@ -5806,10 +5804,6 @@ def write_cutflow_files(
     return csv_path, markdown_path
 
 
-def _step_values(values: np.ndarray) -> np.ndarray:
-    return np.r_[values, values[-1]] if len(values) else values
-
-
 def format_pull_angle_axis(axis: Any, observable: str) -> None:
     """Use exact pi fractions without changing histogram edges or axis units."""
     if observable == "folded_pull_angle":
@@ -5822,21 +5816,9 @@ def format_pull_angle_axis(axis: Any, observable: str) -> None:
                         r"$\pi/3$", r"$2\pi/3$", r"$\pi$"])
 
 
-def _save_figure_exclusive(
-    figure: Any, path: Path, *, particle_pt_min_gev: Optional[float] = None,
-    **kwargs: Any,
-) -> None:
+def _save_figure_exclusive(figure: Any, path: Path, **kwargs: Any) -> None:
     if path.exists():
         raise FileExistsError(f"Refusing to overwrite plot: {path}")
-    if particle_pt_min_gev is not None and not any(
-        item.get_gid() == "input-particle-selection" for item in figure.texts
-    ):
-        annotation = figure.text(
-            0.99, -0.018,
-            rf"Input particles: $p_T>{particle_pt_min_gev:g}\,\mathrm{{GeV}}$",
-            ha="right", va="top", fontsize=8, color="#657086",
-        )
-        annotation.set_gid("input-particle-selection")
     path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(path, **kwargs)
 
@@ -5893,6 +5875,16 @@ def _place_plot_legend(
     return legend
 
 
+XGBOOST_SCOPE_LABELS = {
+    "held_out_test_only": "held-out test",
+    "five_fold_out_of_fold_all_events": "5-fold out-of-fold",
+    "five_fold_routed_independent_events": "frozen 5-fold ensemble",
+    "legacy_single_model_independent_events": "legacy frozen model",
+    "all_independent_events": "independent application",
+}
+
+
+@plot_style.paper_figures
 def generate_plots(
     run_dir: Path,
     results: Sequence[SampleResult],
@@ -5903,25 +5895,8 @@ def generate_plots(
     pull_magnitude_min: Optional[float] = None,
     particle_pt_min_gev: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
-    matplotlib_config = Path(tempfile.gettempdir()) / "pullpheno-matplotlib"
-    matplotlib_config.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("MPLCONFIGDIR", str(matplotlib_config))
-    import matplotlib
+    plt = plot_style.pyplot()
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.ticker import ScalarFormatter
-
-    plt.rcParams.update(
-        {
-            "font.size": 11,
-            "axes.labelsize": 12,
-            "axes.titlesize": 13,
-            "legend.fontsize": 9,
-            "figure.figsize": (7.2, 5.2),
-            "savefig.facecolor": "white",
-        }
-    )
     plot_records: List[Dict[str, Any]] = []
     planned_paths = set()
     registry = plot_registry(cuts)
@@ -5940,8 +5915,18 @@ def generate_plots(
                 continue
             stage = spec.stage if strategy == "cutbased" else "xgboost"
             display_title = spec.title + (" · XGBoost selection" if strategy == "xgboost" else "")
-            if spec.key in PULL_OBSERVABLE_KEYS and pull_magnitude_min is not None:
+            is_pull = spec.key in PULL_OBSERVABLE_KEYS
+            if is_pull and pull_magnitude_min is not None:
                 display_title += rf" · $|\vec t|>{pull_magnitude_min:g}$"
+            notes = []
+            if strategy == "xgboost":
+                scopes = {item.application_scope for item in channel_results}
+                notes.append("XGBoost, " + (
+                    XGBOOST_SCOPE_LABELS.get(next(iter(scopes)), "independent application")
+                    if len(scopes) == 1
+                    else "mixed application scopes"
+                ))
+            labels = [plot_style.paper_label(result.spec.label) for result in channel_results]
             for luminosity in luminosities:
                 lumi_tag = _format_luminosity(luminosity)
                 relative_base = (
@@ -5952,12 +5937,12 @@ def generate_plots(
                     if candidate_path in planned_paths:
                         raise RuntimeError(f"Duplicate planned plot path: {candidate_path}")
                     planned_paths.add(candidate_path)
-                fig, ax = plt.subplots()
+                fig, ax = plt.subplots(constrained_layout=True)
                 edges = spec.edges
-                widths = np.diff(edges)
                 bottom = np.zeros(len(edges) - 1)
                 variance = np.zeros_like(bottom)
-                for result in channel_results:
+                process_entries = []
+                for result, label in zip(channel_results, labels):
                     histogram = result.histograms[spec.key]
                     factor = normalization_factor(
                         luminosity, result.spec.cross_section_pb, result.generated_sumw
@@ -5965,63 +5950,41 @@ def generate_plots(
                     values = factor * histogram.sumw
                     variance += factor * factor * (
                         np.diag(result.pull_observable_moments[spec.key].mc_second_sumw2)
-                        if spec.key in PULL_OBSERVABLE_KEYS else histogram.sumw2
+                        if is_pull else histogram.sumw2
                     )
-                    ax.bar(
-                        edges[:-1], values, width=widths, align="edge", bottom=bottom,
-                        color=result.spec.color, edgecolor="none", linewidth=0.0,
-                        label=result.spec.label,
+                    handle = plot_style.stacked_fill(
+                        ax, edges, values, bottom, result.spec.color, label
                     )
+                    process_entries.append((handle, label))
                     bottom += values
                 uncertainty = np.sqrt(np.maximum(variance, 0.0))
-                ax.fill_between(
-                    edges,
-                    _step_values(bottom - uncertainty),
-                    _step_values(bottom + uncertainty),
-                    step="post", color="#20242b", alpha=0.18, linewidth=0.0,
-                    label="MC statistical uncertainty",
+                band = plot_style.uncertainty_band(
+                    ax, edges, bottom - uncertainty, bottom + uncertainty
                 )
+                ax.stairs(bottom, edges, color=plot_style.REFERENCE_LINE, linewidth=1.0, zorder=6)
                 ax.set_xlim(edges[0], edges[-1])
                 ax.set_xlabel(spec.xlabel)
                 format_pull_angle_axis(ax, spec.key)
-                count_label = "jet entries / 2" if spec.key in PULL_OBSERVABLE_KEYS else "events"
-                ax.set_ylabel(rf"Expected {count_label} / bin at {luminosity:g} fb$^{{-1}}$")
-                ax.set_title(display_title, loc="left", pad=34, fontweight="semibold")
-                subtitle = "Particle level · "
-                if scenario_label:
-                    subtitle += f"{scenario_label} · "
-                subtitle += "13.6 TeV"
-                if strategy == "xgboost":
-                    scopes = {item.application_scope for item in channel_results}
-                    scope_labels = {
-                        "held_out_test_only": "held-out test",
-                        "five_fold_out_of_fold_all_events": "5-fold out-of-fold",
-                        "five_fold_routed_independent_events": "frozen 5-fold ensemble",
-                        "legacy_single_model_independent_events": "legacy frozen model",
-                        "all_independent_events": "independent application",
-                    }
-                    subtitle += " · " + (
-                        scope_labels.get(next(iter(scopes)), "independent application")
-                        if len(scopes) == 1
-                        else "mixed application scopes"
-                    )
-                if partial:
-                    subtitle += " · PARTIAL RUN"
-                ax.text(1.0, 1.015, subtitle, transform=ax.transAxes, fontsize=9,
-                        color="#555b66", ha="right")
-                formatter = ScalarFormatter(useMathText=True)
-                formatter.set_scientific(True)
-                formatter.set_powerlimits((-4, 4))
-                formatter.set_useOffset(False)
-                ax.yaxis.set_major_formatter(formatter)
-                _place_plot_legend(ax)
-                fig.tight_layout()
+                top = float(np.max(bottom + uncertainty)) if len(bottom) else 0.0
+                ax.set_ylim(0.0, 1.06 * top if top > 0.0 else 1.0)
+                count_label = "jet entries / 2" if is_pull else "events"
+                plot_style.scaled_axis(ax, rf"Expected {count_label} / bin", top)
+                entries = [((band, plot_style.reference_handle()), "Total, MC stat.")]
+                plot_style.legend_above(
+                    ax, [entries + process_entries[::-1]],
+                    title=plot_style.header(
+                        prefix=scenario_label, channel=spec.channel, cuts=cuts,
+                        luminosity=luminosity, threshold=pull_magnitude_min,
+                        show_threshold=is_pull, particle_pt_min_gev=particle_pt_min_gev,
+                        notes=notes, partial=partial,
+                    ),
+                )
                 png_path = run_dir / relative_base.with_suffix(".png")
                 pdf_path = run_dir / relative_base.with_suffix(".pdf")
                 _save_figure_exclusive(
-                    fig, png_path, particle_pt_min_gev=particle_pt_min_gev, dpi=PNG_PLOT_DPI, bbox_inches="tight"
+                    fig, png_path, dpi=PNG_PLOT_DPI, bbox_inches="tight"
                 )
-                _save_figure_exclusive(fig, pdf_path, particle_pt_min_gev=particle_pt_min_gev, bbox_inches="tight")
+                _save_figure_exclusive(fig, pdf_path, bbox_inches="tight")
                 plt.close(fig)
                 plot_records.append({
                     "strategy": strategy, "observable": spec.key, "title": display_title,
@@ -6037,39 +6000,48 @@ def generate_plots(
                 if candidate_path in planned_paths:
                     raise RuntimeError(f"Duplicate planned plot path: {candidate_path}")
                 planned_paths.add(candidate_path)
-            fig, ax = plt.subplots()
-            for result in channel_results:
+            fig, ax = plt.subplots(constrained_layout=True)
+            entries = []
+            for result, label in zip(channel_results, labels):
                 histogram = result.histograms[spec.key]
                 integral = histogram.integral
                 if integral == 0.0:
                     continue
                 values = histogram.sumw / integral
                 errors = np.sqrt(np.maximum(histogram.sumw2, 0.0)) / abs(integral)
-                if spec.key in PULL_OBSERVABLE_KEYS:
+                if is_pull:
                     values, covariance = normalized_binned_prediction(
                         histogram.sumw, result.pull_observable_moments[spec.key].mc_second_sumw2
                     )
                     errors = np.sqrt(np.maximum(np.diag(covariance), 0.0))
                 centers = 0.5 * (histogram.edges[:-1] + histogram.edges[1:])
-                ax.stairs(values, histogram.edges, color=result.spec.color, linewidth=1.8,
-                           label=result.spec.label)
+                ax.stairs(values, histogram.edges, color=result.spec.color, linewidth=1.1,
+                          zorder=4)
                 ax.errorbar(centers, values, yerr=errors, fmt="none", color=result.spec.color,
-                            linewidth=0.8, capsize=1.2)
+                            elinewidth=plot_style.ERROR_LINE_WIDTH, capsize=plot_style.CAP_SIZE,
+                            zorder=5)
+                entries.append((plot_style.reference_handle(result.spec.color), label))
             ax.set_xlim(spec.edges[0], spec.edges[-1])
+            ax.set_ylim(bottom=0.0)
             ax.set_xlabel(spec.xlabel)
             format_pull_angle_axis(ax, spec.key)
             ax.set_ylabel("Fraction / bin")
-            ax.set_title(display_title, loc="left", pad=34, fontweight="semibold")
-            ax.text(1.0, 1.015, "Particle level · unit-area process comparison",
-                    transform=ax.transAxes, fontsize=9, color="#555b66", ha="right")
-            _place_plot_legend(ax)
-            fig.tight_layout()
+            if entries:
+                plot_style.legend_above(
+                    ax, [entries],
+                    title=plot_style.header(
+                        prefix=scenario_label, channel=spec.channel, cuts=cuts,
+                        threshold=pull_magnitude_min, show_threshold=is_pull,
+                        particle_pt_min_gev=particle_pt_min_gev,
+                        notes=notes + ["unit area, MC stat."], partial=partial,
+                    ),
+                )
             png_path = run_dir / relative_base.with_suffix(".png")
             pdf_path = run_dir / relative_base.with_suffix(".pdf")
             _save_figure_exclusive(
-                fig, png_path, particle_pt_min_gev=particle_pt_min_gev, dpi=PNG_PLOT_DPI, bbox_inches="tight"
+                fig, png_path, dpi=PNG_PLOT_DPI, bbox_inches="tight"
             )
-            _save_figure_exclusive(fig, pdf_path, particle_pt_min_gev=particle_pt_min_gev, bbox_inches="tight")
+            _save_figure_exclusive(fig, pdf_path, bbox_inches="tight")
             plt.close(fig)
             plot_records.append({
                 "strategy": strategy, "observable": spec.key, "title": display_title,
@@ -6081,6 +6053,7 @@ def generate_plots(
     return plot_records
 
 
+@plot_style.paper_figures
 def generate_ri_plots(
     run_dir: Path,
     results: Sequence[SampleResult],
@@ -6088,14 +6061,17 @@ def generate_ri_plots(
     partial: bool,
     pull_magnitude_min: Optional[float] = None,
     particle_pt_min_gev: Optional[float] = None,
+    cuts: Optional[Mapping[str, float]] = None,
+    scenario_label: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    import matplotlib.pyplot as plt
+    plt = plot_style.pyplot()
 
     records: List[Dict[str, Any]] = []
     centers = 0.5 * (PULL_BIN_EDGES[:-1] + PULL_BIN_EDGES[1:])
     for strategy in ANALYSIS_STRATEGIES:
         if not any(result.strategy == strategy for result in results):
             continue
+        notes = ["XGBoost selection"] if strategy == "xgboost" else []
         for channel in ("higgs", "z"):
             channel_results = sorted(
                 (
@@ -6112,8 +6088,9 @@ def generate_ri_plots(
             relative_base = (
                 Path("plots") / strategy / "shapes" / channel / "ri" / "ri_processes"
             )
-            fig, ax = plt.subplots()
-            for result in channel_results:
+            fig, ax = plt.subplots(constrained_layout=True)
+            entries = []
+            for index, result in enumerate(channel_results):
                 scale_pb = result.spec.cross_section_pb / result.generated_sumw
                 statistics = differential_pull_statistics(
                     scale_pb * result.pull_bin_sumw,
@@ -6125,28 +6102,32 @@ def generate_ri_plots(
                     continue
                 fractions = np.asarray(statistics["R"])
                 errors = np.asarray(statistics["mc_statistical_errors"])
-                ax.errorbar(
-                    centers, fractions, yerr=errors, marker="o", markersize=3.8,
-                    linewidth=1.4, capsize=2.0, color=result.spec.color,
-                    label=result.spec.label,
+                ax.plot(centers, fractions, color=result.spec.color, linewidth=0.8, zorder=4)
+                container = plot_style.points(
+                    ax, centers, fractions, errors, color=result.spec.color,
+                    marker=plot_style.MARKERS[index % len(plot_style.MARKERS)], filled=True,
                 )
-            ax.axvline(0.5 * math.pi, color="#657086", linestyle="--", linewidth=1.0)
+                entries.append((container, plot_style.paper_label(result.spec.label)))
+            ax.axvline(0.5 * math.pi, color=plot_style.GUIDE, linestyle="--", linewidth=0.7)
             ax.set_xlim(0.0, math.pi)
             ax.set_xlabel(r"$|\theta_s|$ [rad]")
             format_pull_angle_axis(ax, "folded_pull_angle")
             ax.set_ylabel(r"$R_i$")
-            ax.set_title(f"Differential pull fractions · {title_suffix}", loc="left", pad=34,
-                         fontweight="semibold")
-            ax.text(1.0, 1.015, "Process comparison · MC errors", transform=ax.transAxes,
-                    fontsize=9, color="#555b66", ha="right")
-            _place_plot_legend(ax)
-            fig.tight_layout()
+            if entries:
+                plot_style.legend_above(
+                    ax, [entries],
+                    title=plot_style.header(
+                        prefix=scenario_label, channel=channel, cuts=cuts,
+                        threshold=pull_magnitude_min, particle_pt_min_gev=particle_pt_min_gev,
+                        notes=notes + ["MC stat."], partial=partial,
+                    ),
+                )
             png_path = run_dir / relative_base.with_suffix(".png")
             pdf_path = run_dir / relative_base.with_suffix(".pdf")
             _save_figure_exclusive(
-                fig, png_path, particle_pt_min_gev=particle_pt_min_gev, dpi=PNG_PLOT_DPI, bbox_inches="tight"
+                fig, png_path, dpi=PNG_PLOT_DPI, bbox_inches="tight"
             )
-            _save_figure_exclusive(fig, pdf_path, particle_pt_min_gev=particle_pt_min_gev, bbox_inches="tight")
+            _save_figure_exclusive(fig, pdf_path, bbox_inches="tight")
             plt.close(fig)
             records.append({
                 "strategy": strategy, "observable": "R_i", "title": f"Differential R_i · {title_suffix}",
@@ -6170,41 +6151,38 @@ def generate_ri_plots(
                     Path("plots") / strategy / "yields" / _format_luminosity(luminosity)
                     / channel / "ri" / "ri_total"
                 )
-                fig, ax = plt.subplots()
-                ax.fill_between(
-                    PULL_BIN_EDGES,
-                    _step_values(fractions - mc_errors),
-                    _step_values(fractions + mc_errors),
-                    step="post", color="#20242b", alpha=0.18, linewidth=0.0,
-                    label="MC statistical uncertainty",
+                fig, ax = plt.subplots(constrained_layout=True)
+                band = plot_style.uncertainty_band(
+                    ax, PULL_BIN_EDGES, fractions - mc_errors, fractions + mc_errors
                 )
-                ax.errorbar(
-                    centers, fractions, yerr=statistical_errors, fmt="o", color="#172033",
-                    markersize=4.5, capsize=2.5, linewidth=1.1,
-                    label=rf"Expected statistical uncertainty, {luminosity:g} fb$^{{-1}}$",
+                ax.stairs(fractions, PULL_BIN_EDGES, color=plot_style.REFERENCE_LINE,
+                          linewidth=1.1, zorder=6)
+                container = plot_style.points(
+                    ax, centers, fractions, statistical_errors, color=plot_style.INK,
+                    marker="o", filled=True,
                 )
-                ax.stairs(fractions, PULL_BIN_EDGES, color="#275dad", linewidth=1.5,
-                          label="Total prediction")
-                ax.axvline(0.5 * math.pi, color="#657086", linestyle="--", linewidth=1.0)
+                ax.axvline(0.5 * math.pi, color=plot_style.GUIDE, linestyle="--", linewidth=0.7)
                 ax.set_xlim(0.0, math.pi)
                 ax.set_xlabel(r"$|\theta_s|$ [rad]")
                 format_pull_angle_axis(ax, "folded_pull_angle")
                 ax.set_ylabel(r"$R_i$")
-                ax.set_title(f"Total differential pull fractions · {title_suffix}", loc="left",
-                             pad=34, fontweight="semibold")
-                subtitle = "Event-level two-jet covariance"
-                if partial:
-                    subtitle += " · PARTIAL RUN"
-                ax.text(1.0, 1.015, subtitle, transform=ax.transAxes, fontsize=9,
-                        color="#555b66", ha="right")
-                _place_plot_legend(ax)
-                fig.tight_layout()
+                plot_style.legend_above(
+                    ax,
+                    [[((band, plot_style.reference_handle()), "Total prediction, MC stat."),
+                      (container, "Expected stat. uncertainty")]],
+                    title=plot_style.header(
+                        prefix=scenario_label, channel=channel, cuts=cuts,
+                        luminosity=luminosity, threshold=pull_magnitude_min,
+                        particle_pt_min_gev=particle_pt_min_gev,
+                        notes=notes + ["two-jet event covariance"], partial=partial,
+                    ),
+                )
                 png_path = run_dir / relative_base.with_suffix(".png")
                 pdf_path = run_dir / relative_base.with_suffix(".pdf")
                 _save_figure_exclusive(
-                    fig, png_path, particle_pt_min_gev=particle_pt_min_gev, dpi=PNG_PLOT_DPI, bbox_inches="tight"
+                    fig, png_path, dpi=PNG_PLOT_DPI, bbox_inches="tight"
                 )
-                _save_figure_exclusive(fig, pdf_path, particle_pt_min_gev=particle_pt_min_gev, bbox_inches="tight")
+                _save_figure_exclusive(fig, pdf_path, bbox_inches="tight")
                 plt.close(fig)
                 records.append({
                     "strategy": strategy, "observable": "R_i", "title": f"Total differential R_i · {title_suffix}",
@@ -6218,11 +6196,19 @@ def generate_ri_plots(
 
 def comparison_marker(scenario_id: str, fallback_index: int) -> str:
     """Keep a generator's marker when other scenarios are omitted from a plot."""
-    return COMPARISON_SCENARIO_MARKERS.get(
-        scenario_id, COMPARISON_MARKERS[fallback_index % len(COMPARISON_MARKERS)]
-    )
+    return plot_style.scenario_marker(scenario_id, fallback_index)
 
 
+def comparison_labels(sources: Sequence[ComparisonSource]) -> Tuple[str, List[str]]:
+    """Shared generator prefix for plot headers and short typeset scenario labels."""
+    return plot_style.scenario_labels([source.scenario.label for source in sources])
+
+
+def _ratio_axis_label(reference_label: str) -> str:
+    return f"Ratio to\n{reference_label}"
+
+
+@plot_style.paper_figures
 def generate_comparison_plots(
     run_dir: Path,
     sources: Sequence[ComparisonSource],
@@ -6233,14 +6219,7 @@ def generate_comparison_plots(
     include_reference_stacks: bool = True,
 ) -> List[Dict[str, Any]]:
     """Draw total comparisons and nominal-stack overlays for pull predictions."""
-    matplotlib_config = Path(tempfile.gettempdir()) / "pullpheno-matplotlib"
-    matplotlib_config.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("MPLCONFIGDIR", str(matplotlib_config))
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.ticker import ScalarFormatter
+    plt = plot_style.pyplot()
 
     records: List[Dict[str, Any]] = []
     registry = {
@@ -6251,9 +6230,15 @@ def generate_comparison_plots(
     reference_id = sources[0].scenario.identifier
     threshold = sources[0].config.pull_magnitude_min
     particle_pt_min_gev = sources[0].config.particle_pt_min_gev
+    cuts = sources[0].config.cuts
+    partial = bool(sources[0].metadata.get("partial"))
+    label_prefix, scenario_labels = comparison_labels(sources)
+    reference_label = scenario_labels[0]
     pull_title_suffix = "" if threshold is None else rf" · $|\vec t|>{threshold:g}$"
+    count_label = "Expected jet entries / 2 / bin"
     stack_luminosities = luminosities if include_reference_stacks else ()
     for strategy in analyses:
+        notes = ["XGBoost selection"] if strategy == "xgboost" else []
         for channel in ("higgs", "z"):
             for luminosity, uncertainty_kind in itertools.product(
                 stack_luminosities, ("mc-stat", "data-stat")
@@ -6261,10 +6246,13 @@ def generate_comparison_plots(
                 is_data_stat = uncertainty_kind == "data-stat"
                 covariance_key = "data_covariance" if is_data_stat else "mc_covariance"
                 path_suffix = "-data-stat" if is_data_stat else ""
-                error_label = "expected stat." if is_data_stat else "MC stat."
-                band_label = (
-                    "expected statistical uncertainty"
-                    if is_data_stat else "MC statistical uncertainty"
+                band_label = f"{reference_label} total, " + (
+                    "expected stat." if is_data_stat else "MC stat."
+                )
+                header = plot_style.header(
+                    prefix=label_prefix, channel=channel, cuts=cuts,
+                    luminosity=luminosity, threshold=threshold,
+                    particle_pt_min_gev=particle_pt_min_gev, notes=notes, partial=partial,
                 )
                 folded_spec = registry[(channel, "folded_pull_angle")]
                 reference_folded = numerical[
@@ -6289,15 +6277,25 @@ def generate_comparison_plots(
                     / f"reference-stack{path_suffix}"
                     / "folded_pull_angle"
                 )
-                for extension in ("png", "pdf"):
-                    candidate = str(relative_base.with_suffix(f".{extension}"))
-                    if candidate in planned_paths:
-                        raise RuntimeError(
-                            f"Duplicate comparison plot path: {candidate}"
-                        )
-                    planned_paths.add(candidate)
+                ratio_relative_base = (
+                    Path("plots")
+                    / "comparison"
+                    / strategy
+                    / "yields"
+                    / _format_luminosity(luminosity)
+                    / channel
+                    / f"reference-stack-ratio{path_suffix}"
+                    / "folded_pull_angle"
+                )
+                for base in (relative_base, ratio_relative_base):
+                    for extension in ("png", "pdf"):
+                        candidate = str(base.with_suffix(f".{extension}"))
+                        if candidate in planned_paths:
+                            raise RuntimeError(
+                                f"Duplicate comparison plot path: {candidate}"
+                            )
+                        planned_paths.add(candidate)
 
-                figure, axis = plt.subplots(figsize=(7.2, 5.2))
                 reference_results = sorted(
                     (
                         result
@@ -6311,6 +6309,7 @@ def generate_comparison_plots(
                     raise ValueError(
                         f"Reference run has no {channel} {strategy} process results"
                     )
+                process_layers = []
                 stack_total = np.zeros(len(folded_edges) - 1, dtype=np.float64)
                 for result in reference_results:
                     histogram = result.histograms["folded_pull_angle"]
@@ -6324,18 +6323,7 @@ def generate_comparison_plots(
                         result.generated_sumw,
                     )
                     process_values = factor * histogram.sumw
-                    axis.bar(
-                        folded_edges[:-1],
-                        process_values,
-                        width=folded_widths,
-                        align="edge",
-                        bottom=stack_total,
-                        color=result.spec.color,
-                        edgecolor="none",
-                        linewidth=0.0,
-                        label=result.spec.label,
-                        zorder=2,
-                    )
+                    process_layers.append((result, process_values))
                     stack_total += process_values
 
                 reference_total = np.asarray(
@@ -6356,19 +6344,6 @@ def generate_comparison_plots(
                 )
                 reference_error = np.sqrt(
                     np.maximum(np.diag(reference_covariance), 0.0)
-                )
-                axis.fill_between(
-                    folded_edges,
-                    _step_values(reference_total - reference_error),
-                    _step_values(reference_total + reference_error),
-                    step="post",
-                    color="#20242b",
-                    alpha=0.18,
-                    linewidth=0.0,
-                    label=(
-                        f"{sources[0].scenario.label} total {band_label}"
-                    ),
-                    zorder=5,
                 )
 
                 variations = sources[1:]
@@ -6393,80 +6368,78 @@ def generate_comparison_plots(
                         variation_index - 0.5 * (len(variations) - 1)
                     ) * min(0.12, 0.55 / max(len(variations), 1))
                     shifted_centers = folded_centers + offset_fraction * folded_widths
-                    color = str(source.scenario.color)
-                    marker = comparison_marker(scenario_id, variation_index + 1)
                     variation_folded_statistics.append(
                         (
-                            source,
+                            scenario_labels[variation_index + 1],
                             values,
                             covariance,
                             errors,
                             shifted_centers,
-                            color,
-                            marker,
+                            str(source.scenario.color),
+                            comparison_marker(scenario_id, variation_index + 1),
                         )
                     )
-                    axis.errorbar(
-                        shifted_centers,
-                        values,
-                        yerr=errors,
-                        fmt=marker,
-                        linestyle="none",
-                        markersize=5.2,
-                        markerfacecolor="white",
-                        markeredgecolor=color,
-                        markeredgewidth=1.35,
-                        capsize=2.6,
-                        elinewidth=1.15,
-                        color=color,
-                        label=f"{source.scenario.label} total ({error_label})",
-                        zorder=12,
+
+                def draw_reference_stack(axis: Any) -> List[List[Tuple[Any, str]]]:
+                    bottom = np.zeros_like(stack_total)
+                    process_entries = []
+                    for result, process_values in process_layers:
+                        label = plot_style.paper_label(result.spec.label)
+                        handle = plot_style.stacked_fill(
+                            axis, folded_edges, process_values, bottom,
+                            result.spec.color, label,
+                        )
+                        process_entries.append((handle, label))
+                        bottom = bottom + process_values
+                    band = plot_style.uncertainty_band(
+                        axis, folded_edges,
+                        reference_total - reference_error,
+                        reference_total + reference_error,
                     )
+                    axis.stairs(
+                        reference_total, folded_edges, color=plot_style.REFERENCE_LINE,
+                        linewidth=1.1, zorder=6,
+                    )
+                    variation_entries = []
+                    for (
+                        label, values, _, errors, shifted_centers, color, marker,
+                    ) in variation_folded_statistics:
+                        container = plot_style.points(
+                            axis, shifted_centers, values, errors,
+                            color=color, marker=marker,
+                        )
+                        variation_entries.append((container, label))
+                    top = max(
+                        float(np.max(reference_total + reference_error)),
+                        max(
+                            (float(np.max(values + errors))
+                             for _, values, _, errors, *_ in variation_folded_statistics),
+                            default=0.0,
+                        ),
+                    )
+                    axis.set_xlim(folded_edges[0], folded_edges[-1])
+                    axis.set_ylim(0.0, 1.06 * top if top > 0.0 else 1.0)
+                    plot_style.scaled_axis(axis, count_label, top)
+                    reference_entries = [((band, plot_style.reference_handle()), band_label)]
+                    return [reference_entries + process_entries[::-1], variation_entries]
 
                 display_title = folded_spec.title + (
                     " · XGBoost selection" if strategy == "xgboost" else ""
                 ) + pull_title_suffix
-                axis.set_xlim(folded_edges[0], folded_edges[-1])
-                axis.set_ylim(bottom=0.0)
+
+                figure, axis = plt.subplots(
+                    figsize=plot_style.SINGLE_FIGSIZE, constrained_layout=True
+                )
+                legend_groups = draw_reference_stack(axis)
                 axis.set_xlabel(folded_spec.xlabel)
                 format_pull_angle_axis(axis, "folded_pull_angle")
-                axis.set_ylabel(
-                    rf"Expected jet entries / 2 / bin at {luminosity:g} fb$^{{-1}}$"
-                )
-                axis.set_title(
-                    display_title, loc="left", pad=34, fontweight="semibold"
-                )
-                subtitle = (
-                    f"Particle level · {sources[0].scenario.label} processes stacked · "
-                    "Scenario totals as points"
-                )
-                if bool(sources[0].metadata.get("partial")):
-                    subtitle += " · PARTIAL RUN"
-                axis.text(
-                    1.0,
-                    1.015,
-                    subtitle,
-                    transform=axis.transAxes,
-                    fontsize=8.8,
-                    color="#555b66",
-                    ha="right",
-                )
-                formatter = ScalarFormatter(useMathText=True)
-                formatter.set_scientific(True)
-                formatter.set_powerlimits((-4, 4))
-                formatter.set_useOffset(False)
-                axis.yaxis.set_major_formatter(formatter)
-                axis.yaxis.get_offset_text().set_x(-0.08)
-                axis.yaxis.get_offset_text().set_y(1.01)
-                axis.grid(False)
-                _place_plot_legend(axis)
-                figure.tight_layout()
+                plot_style.legend_above(axis, legend_groups, title=header)
                 png_path = run_dir / relative_base.with_suffix(".png")
                 pdf_path = run_dir / relative_base.with_suffix(".pdf")
                 _save_figure_exclusive(
-                    figure, png_path, particle_pt_min_gev=particle_pt_min_gev, dpi=PNG_PLOT_DPI, bbox_inches="tight"
+                    figure, png_path, dpi=PNG_PLOT_DPI, bbox_inches="tight"
                 )
-                _save_figure_exclusive(figure, pdf_path, particle_pt_min_gev=particle_pt_min_gev, bbox_inches="tight")
+                _save_figure_exclusive(figure, pdf_path, bbox_inches="tight")
                 plt.close(figure)
                 records.append(
                     {
@@ -6486,106 +6459,33 @@ def generate_comparison_plots(
                     }
                 )
 
-                ratio_relative_base = (
-                    Path("plots")
-                    / "comparison"
-                    / strategy
-                    / "yields"
-                    / _format_luminosity(luminosity)
-                    / channel
-                    / f"reference-stack-ratio{path_suffix}"
-                    / "folded_pull_angle"
-                )
-                for extension in ("png", "pdf"):
-                    candidate = str(ratio_relative_base.with_suffix(f".{extension}"))
-                    if candidate in planned_paths:
-                        raise RuntimeError(
-                            f"Duplicate comparison plot path: {candidate}"
-                        )
-                    planned_paths.add(candidate)
-
                 ratio_figure, (ratio_stack_axis, ratio_axis) = plt.subplots(
                     2,
                     1,
-                    figsize=(7.5, 6.5),
+                    figsize=plot_style.RATIO_FIGSIZE,
                     sharex=True,
                     constrained_layout=True,
-                    gridspec_kw={"height_ratios": (3.1, 1.15), "hspace": 0.06},
+                    gridspec_kw={"height_ratios": plot_style.RATIO_HEIGHT_RATIOS},
                 )
-                ratio_stack_total = np.zeros(
-                    len(folded_edges) - 1, dtype=np.float64
-                )
-                for result in reference_results:
-                    histogram = result.histograms["folded_pull_angle"]
-                    factor = normalization_factor(
-                        luminosity,
-                        result.spec.cross_section_pb,
-                        result.generated_sumw,
-                    )
-                    process_values = factor * histogram.sumw
-                    ratio_stack_axis.bar(
-                        folded_edges[:-1],
-                        process_values,
-                        width=folded_widths,
-                        align="edge",
-                        bottom=ratio_stack_total,
-                        color=result.spec.color,
-                        edgecolor="none",
-                        linewidth=0.0,
-                        label=result.spec.label,
+                ratio_figure.get_layout_engine().set(hspace=0.0, h_pad=0.01)
+                legend_groups = draw_reference_stack(ratio_stack_axis)
+                if is_data_stat:
+                    # Alternative data hypotheses share a fixed nominal prediction, so
+                    # the nominal counting uncertainty is shown as its own band.
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        relative_error = np.where(
+                            reference_total != 0.0,
+                            reference_error / np.abs(reference_total),
+                            np.nan,
+                        )
+                    plot_style.uncertainty_band(
+                        ratio_axis, folded_edges, 1.0 - relative_error, 1.0 + relative_error,
                         zorder=2,
                     )
-                    ratio_stack_total += process_values
-                if not np.allclose(
-                    ratio_stack_total,
-                    reference_total,
-                    rtol=1.0e-11,
-                    atol=1.0e-8,
-                ):
-                    raise RuntimeError(
-                        f"Reference ratio-panel stack does not close to the total "
-                        f"{channel} {strategy} folded-angle prediction"
-                    )
-                ratio_stack_axis.fill_between(
-                    folded_edges,
-                    _step_values(reference_total - reference_error),
-                    _step_values(reference_total + reference_error),
-                    step="post",
-                    color="#20242b",
-                    alpha=0.18,
-                    linewidth=0.0,
-                    label=(
-                        f"{sources[0].scenario.label} total {band_label}"
-                    ),
-                    zorder=5,
-                )
-
-                ratio_extent_values: List[float] = []
+                ratio_pairs = []
                 for (
-                    source,
-                    values,
-                    covariance,
-                    errors,
-                    shifted_centers,
-                    color,
-                    marker,
+                    _, values, covariance, _, shifted_centers, color, marker,
                 ) in variation_folded_statistics:
-                    ratio_stack_axis.errorbar(
-                        shifted_centers,
-                        values,
-                        yerr=errors,
-                        fmt=marker,
-                        linestyle="none",
-                        markersize=5.2,
-                        markerfacecolor="white",
-                        markeredgecolor=color,
-                        markeredgewidth=1.35,
-                        capsize=2.6,
-                        elinewidth=1.15,
-                        color=color,
-                        label=f"{source.scenario.label} total ({error_label})",
-                        zorder=12,
-                    )
                     ratios, ratio_errors = propagated_independent_ratio_errors(
                         values,
                         covariance,
@@ -6595,88 +6495,34 @@ def generate_comparison_plots(
                         # do not add the counting errors of two hypothetical datasets.
                         include_reference=not is_data_stat,
                     )
-                    finite_ratio = np.isfinite(ratios) & np.isfinite(ratio_errors)
-                    ratio_extent_values.extend(
-                        (ratios[finite_ratio] - ratio_errors[finite_ratio]).tolist()
+                    ratio_pairs.append((shifted_centers, ratios, ratio_errors, color))
+                    plot_style.points(
+                        ratio_axis, shifted_centers, ratios, ratio_errors,
+                        color=color, marker=marker,
                     )
-                    ratio_extent_values.extend(
-                        (ratios[finite_ratio] + ratio_errors[finite_ratio]).tolist()
-                    )
-                    ratio_axis.errorbar(
-                        shifted_centers,
-                        ratios,
-                        yerr=ratio_errors,
-                        fmt=marker,
-                        linestyle="none",
-                        markersize=4.6,
-                        markerfacecolor="white",
-                        markeredgecolor=color,
-                        markeredgewidth=1.25,
-                        capsize=2.4,
-                        elinewidth=1.05,
-                        color=color,
-                        zorder=12,
-                    )
-
-                ratio_stack_axis.set_xlim(folded_edges[0], folded_edges[-1])
-                ratio_stack_axis.set_ylim(bottom=0.0)
-                ratio_stack_axis.set_ylabel(
-                    rf"Expected jet entries / 2 / bin at {luminosity:g} fb$^{{-1}}$"
-                )
-                ratio_stack_axis.set_title(
-                    display_title, loc="left", pad=34, fontweight="semibold"
-                )
-                ratio_subtitle = (
-                    "Particle level · Expected data statistics · Fixed nominal ratio reference"
-                    if is_data_stat else
-                    f"Particle level · {sources[0].scenario.label} processes stacked · "
-                    "Scenario totals and ratio with MC uncertainty"
-                )
-                if bool(sources[0].metadata.get("partial")):
-                    ratio_subtitle += " · PARTIAL RUN"
-                ratio_stack_axis.text(
-                    1.0,
-                    1.015,
-                    ratio_subtitle,
-                    transform=ratio_stack_axis.transAxes,
-                    fontsize=8.8,
-                    color="#555b66",
-                    ha="right",
-                )
-                ratio_formatter = ScalarFormatter(useMathText=True)
-                ratio_formatter.set_scientific(True)
-                ratio_formatter.set_powerlimits((-4, 4))
-                ratio_formatter.set_useOffset(False)
-                ratio_stack_axis.yaxis.set_major_formatter(ratio_formatter)
-                ratio_stack_axis.yaxis.get_offset_text().set_x(-0.08)
-                ratio_stack_axis.yaxis.get_offset_text().set_y(1.01)
-                ratio_stack_axis.grid(False)
-                _place_plot_legend(ratio_stack_axis)
-
-                ratio_axis.axhline(1.0, color="#657086", linewidth=1.0, zorder=1)
-                ratio_axis.set_ylabel("Scenario / ref.")
+                ratio_axis.axhline(1.0, color=plot_style.GUIDE, linewidth=0.7, zorder=1)
+                ratio_axis.set_ylabel(_ratio_axis_label(reference_label))
                 ratio_axis.set_xlabel(folded_spec.xlabel)
                 format_pull_angle_axis(ratio_axis, "folded_pull_angle")
                 ratio_axis.set_xlim(folded_edges[0], folded_edges[-1])
-                ratio_axis.grid(False)
-                if ratio_extent_values:
-                    deviation = max(
-                        0.05,
-                        max(abs(value - 1.0) for value in ratio_extent_values) * 1.12,
-                    )
-                    ratio_axis.set_ylim(1.0 - deviation, 1.0 + deviation)
+                window = plot_style.ratio_window(
+                    [(ratios, errors) for _, ratios, errors, _ in ratio_pairs]
+                )
+                if window is not None:
+                    ratio_axis.set_ylim(*window)
+                for shifted_centers, ratios, _, color in ratio_pairs:
+                    plot_style.mark_clipped(ratio_axis, shifted_centers, ratios, color)
+                plot_style.legend_above(ratio_stack_axis, legend_groups, title=header)
                 ratio_figure.align_ylabels((ratio_stack_axis, ratio_axis))
                 ratio_png_path = run_dir / ratio_relative_base.with_suffix(".png")
                 ratio_pdf_path = run_dir / ratio_relative_base.with_suffix(".pdf")
                 _save_figure_exclusive(
                     ratio_figure,
-                    ratio_png_path, particle_pt_min_gev=particle_pt_min_gev,
+                    ratio_png_path,
                     dpi=PNG_PLOT_DPI,
                     bbox_inches="tight",
                 )
-                _save_figure_exclusive(
-                    ratio_figure, ratio_pdf_path, particle_pt_min_gev=particle_pt_min_gev, bbox_inches="tight"
-                )
+                _save_figure_exclusive(ratio_figure, ratio_pdf_path, bbox_inches="tight")
                 plt.close(ratio_figure)
                 records.append(
                     {
@@ -6701,6 +6547,7 @@ def generate_comparison_plots(
                 )
 
     for strategy in analyses:
+        notes = ["XGBoost selection"] if strategy == "xgboost" else []
         for channel in ("higgs", "z"):
             for luminosity in luminosities:
                 for observable in PULL_OBSERVABLE_KEYS:
@@ -6733,17 +6580,20 @@ def generate_comparison_plots(
                         figure, (axis, ratio_axis) = plt.subplots(
                             2,
                             1,
-                            figsize=(7.5, 6.5),
+                            figsize=plot_style.RATIO_FIGSIZE,
                             sharex=True,
                             constrained_layout=True,
-                            gridspec_kw={"height_ratios": (3.1, 1.15), "hspace": 0.06},
+                            gridspec_kw={"height_ratios": plot_style.RATIO_HEIGHT_RATIOS},
                         )
+                        figure.get_layout_engine().set(hspace=0.0, h_pad=0.01)
                         reference_yield = np.asarray(reference["yield"], dtype=np.float64)
                         reference_covariance = np.asarray(
                             reference[covariance_key], dtype=np.float64
                         )
                         scenario_count = len(sources)
-                        ratio_extent_values: List[float] = []
+                        entries = []
+                        plotted = []
+                        ratio_pairs = []
                         for source_index, source in enumerate(sources):
                             scenario_id = source.scenario.identifier
                             statistics = numerical[
@@ -6766,18 +6616,13 @@ def generate_comparison_plots(
                             shifted_centers = centers + offset_fraction * bin_widths
                             color = str(source.scenario.color)
                             marker = comparison_marker(scenario_id, source_index)
-                            axis.errorbar(
-                                shifted_centers,
-                                values,
-                                yerr=errors,
-                                fmt=marker,
-                                linestyle="none",
-                                markersize=4.5,
-                                capsize=2.4,
-                                elinewidth=1.05,
-                                color=color,
-                                label=source.scenario.label,
+                            filled = source_index == 0
+                            container = plot_style.points(
+                                axis, shifted_centers, values, errors,
+                                color=color, marker=marker, filled=filled,
                             )
+                            entries.append((container, scenario_labels[source_index]))
+                            plotted.extend((values, values + errors))
                             ratios, ratio_errors = propagated_independent_ratio_errors(
                                 values,
                                 covariance,
@@ -6787,78 +6632,69 @@ def generate_comparison_plots(
                                     include_reference and source_index != 0
                                 ),
                             )
-                            finite_ratio = np.isfinite(ratios) & np.isfinite(ratio_errors)
-                            ratio_extent_values.extend(
-                                (ratios[finite_ratio] - ratio_errors[finite_ratio]).tolist()
+                            ratio_pairs.append((shifted_centers, ratios, ratio_errors, color))
+                            plot_style.points(
+                                ratio_axis, shifted_centers, ratios, ratio_errors,
+                                color=color, marker=marker, filled=filled,
                             )
-                            ratio_extent_values.extend(
-                                (ratios[finite_ratio] + ratio_errors[finite_ratio]).tolist()
+                        if observable in ("pull_t_beam", "pull_t_phi", "pull_magnitude"):
+                            low, high = plot_style.populated_limits(
+                                edges, plotted[::2],
+                                symmetric=observable != "pull_magnitude",
                             )
-                            ratio_axis.errorbar(
-                                shifted_centers,
-                                ratios,
-                                yerr=ratio_errors,
-                                fmt=marker,
-                                linestyle="none",
-                                markersize=4.0,
-                                capsize=2.2,
-                                elinewidth=0.95,
-                                color=color,
-                            )
-                        axis.set_ylabel(
-                            rf"Expected jet entries / 2 / bin at {luminosity:g} fb$^{{-1}}$"
-                        )
-                        axis.set_title(
-                            f"{plot_spec.title}{pull_title_suffix} · scenario totals",
-                            loc="left",
-                            pad=28,
-                            fontweight="semibold",
-                        )
-                        subtitle = (
-                            "Projected counting uncertainty"
-                            if uncertainty_kind == "data-stat"
-                            else "Finite-MC uncertainty · independent samples"
-                        )
-                        axis.text(
-                            1.0,
-                            1.015,
-                            f"{strategy} · {channel} · {subtitle}",
-                            transform=axis.transAxes,
-                            fontsize=8.8,
-                            color="#555b66",
-                            ha="right",
-                        )
-                        formatter = ScalarFormatter(useMathText=True)
-                        formatter.set_scientific(True)
-                        formatter.set_powerlimits((-4, 4))
-                        formatter.set_useOffset(False)
-                        axis.yaxis.set_major_formatter(formatter)
-                        axis.yaxis.get_offset_text().set_x(-0.08)
-                        axis.yaxis.get_offset_text().set_y(1.01)
-                        axis.grid(False)
-                        ratio_axis.grid(False)
-                        _place_plot_legend(axis)
-                        ratio_axis.axhline(1.0, color="#657086", linewidth=1.0)
-                        ratio_axis.set_ylabel("Scenario / ref.")
+                        else:
+                            low, high = float(edges[0]), float(edges[-1])
+                        visible = (centers >= low) & (centers <= high)
+                        tops = [float(np.max(vector[visible])) for vector in plotted[1::2]
+                                if np.any(visible)]
+                        top = max(tops, default=0.0)
+                        if observable == "pull_magnitude":
+                            axis.set_yscale("log")
+                            positive = [float(np.min(vector[visible & (vector > 0.0)]))
+                                        for vector in plotted[::2]
+                                        if np.any(visible & (vector > 0.0))]
+                            if positive and top > 0.0:
+                                axis.set_ylim(0.3 * min(positive), 3.0 * top)
+                            axis.set_ylabel(count_label)
+                        else:
+                            axis.set_ylim(0.0, 1.08 * top if top > 0.0 else 1.0)
+                            plot_style.scaled_axis(axis, count_label, top)
+                        ratio_axis.axhline(1.0, color=plot_style.GUIDE, linewidth=0.7, zorder=1)
+                        ratio_axis.set_ylabel(_ratio_axis_label(reference_label))
                         ratio_axis.set_xlabel(plot_spec.xlabel)
                         format_pull_angle_axis(ratio_axis, plot_spec.key)
-                        ratio_axis.set_xlim(edges[0], edges[-1])
-                        if ratio_extent_values:
-                            deviation = max(
-                                0.05,
-                                max(abs(value - 1.0) for value in ratio_extent_values) * 1.12,
+                        ratio_axis.set_xlim(low, high)
+                        window = plot_style.ratio_window(
+                            [(ratios[visible], errors[visible])
+                             for _, ratios, errors, _ in ratio_pairs]
+                        )
+                        if window is not None:
+                            ratio_axis.set_ylim(*window)
+                        for shifted_centers, ratios, _, color in ratio_pairs:
+                            plot_style.mark_clipped(
+                                ratio_axis, shifted_centers[visible], ratios[visible], color
                             )
-                            ratio_axis.set_ylim(1.0 - deviation, 1.0 + deviation)
+                        header = plot_style.header(
+                            prefix=label_prefix, channel=channel, cuts=cuts,
+                            luminosity=luminosity, threshold=threshold,
+                            particle_pt_min_gev=particle_pt_min_gev,
+                            notes=notes + [
+                                "expected stat." if uncertainty_kind == "data-stat"
+                                else "MC stat."
+                            ],
+                            partial=partial,
+                        )
+                        plot_style.legend_above(axis, [entries], title=header, max_columns=3)
                         figure.align_ylabels((axis, ratio_axis))
                         png_path = run_dir / relative_base.with_suffix(".png")
                         pdf_path = run_dir / relative_base.with_suffix(".pdf")
                         _save_figure_exclusive(
                             figure,
-                            png_path, particle_pt_min_gev=particle_pt_min_gev,
+                            png_path,
                             dpi=PNG_PLOT_DPI,
                             bbox_inches="tight",
                         )
-                        _save_figure_exclusive(figure, pdf_path, particle_pt_min_gev=particle_pt_min_gev, bbox_inches="tight")
+                        _save_figure_exclusive(figure, pdf_path, bbox_inches="tight")
                         plt.close(figure)
                         records.append(
                             {
@@ -6895,6 +6731,9 @@ def generate_score_pull_diagnostic_plots(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.colors import TwoSlopeNorm
+
+    # These diagnostics keep the defaults they were designed with.
+    plt.rcParams.update(plot_style.LEGACY_RC_PARAMS)
 
     records: List[Dict[str, Any]] = []
     reference_id = sources[0].scenario.identifier
@@ -7244,6 +7083,9 @@ def generate_xgboost_diagnostic_plots(
     diagnostics: Mapping[str, Any],
 ) -> List[Dict[str, Any]]:
     import matplotlib.pyplot as plt
+
+    # These diagnostics keep the defaults they were designed with.
+    plt.rcParams.update(plot_style.LEGACY_RC_PARAMS)
 
     records: List[Dict[str, Any]] = []
     for channel, payload in diagnostics.items():
@@ -8301,6 +8143,13 @@ def parse_scenario_color(value: str) -> Tuple[str, str]:
     return identifier, color
 
 
+def parse_scenario_label(value: str) -> Tuple[str, str]:
+    identifier, separator, label = value.partition("=")
+    if not identifier or not separator or not label.strip():
+        raise argparse.ArgumentTypeError("expected SCENARIO=LABEL (quote the argument)")
+    return identifier, label
+
+
 def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
@@ -8337,6 +8186,17 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=[],
         metavar="SCENARIO=#RRGGBB",
         help="Override a scenario colour in this comparison only; may be repeated",
+    )
+    parser.add_argument(
+        "--scenario-label",
+        type=parse_scenario_label,
+        action="append",
+        default=[],
+        metavar="SCENARIO=LABEL",
+        help=(
+            "Override a scenario's legend label in this comparison only; may be repeated. "
+            "Labels may contain matplotlib mathtext, e.g. '$p_{\\mathrm{reco}}=0.6$'"
+        ),
     )
     parser.add_argument(
         "--comparison-points-only",
@@ -8389,10 +8249,16 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
     args = parser.parse_args(argv)
-    if (args.scenario_color or args.comparison_points_only) and args.compare_runs is None:
-        parser.error("--scenario-color and --comparison-points-only require --compare-runs")
+    if (
+        args.scenario_color or args.scenario_label or args.comparison_points_only
+    ) and args.compare_runs is None:
+        parser.error(
+            "--scenario-color, --scenario-label and --comparison-points-only require --compare-runs"
+        )
     if len(dict(args.scenario_color)) != len(args.scenario_color):
         parser.error("--scenario-color specifies the same scenario more than once")
+    if len(dict(args.scenario_label)) != len(args.scenario_label):
+        parser.error("--scenario-label specifies the same scenario more than once")
     if args.max_events is not None and args.max_events <= 0:
         parser.error("--max-events must be positive")
     if args.from_run is not None and args.max_events is not None:
@@ -8451,19 +8317,26 @@ def run_comparison(args: argparse.Namespace, started: datetime) -> int:
     )
     reference_cross_sections = validate_comparison_sources(sources, analyses)
     scenario_colors = dict(args.scenario_color)
-    unknown_scenarios = set(scenario_colors) - {
+    scenario_labels = dict(args.scenario_label)
+    unknown_scenarios = (set(scenario_colors) | set(scenario_labels)) - {
         source.scenario.identifier for source in sources
     }
     if unknown_scenarios:
         raise ValueError(f"Unknown comparison scenario ids: {sorted(unknown_scenarios)}")
+    overrides = {
+        identifier: {
+            field: values[identifier]
+            for field, values in (("color", scenario_colors), ("label", scenario_labels))
+            if identifier in values
+        }
+        for identifier in set(scenario_colors) | set(scenario_labels)
+    }
     sources = tuple(
         replace(
             source,
-            scenario=replace(
-                source.scenario, color=scenario_colors[source.scenario.identifier]
-            ),
+            scenario=replace(source.scenario, **overrides[source.scenario.identifier]),
         )
-        if source.scenario.identifier in scenario_colors else source
+        if source.scenario.identifier in overrides else source
         for source in sources
     )
     luminosities = tuple(
@@ -8501,6 +8374,8 @@ def run_comparison(args: argparse.Namespace, started: datetime) -> int:
             "reference_stack_uncertainties": (
                 [] if args.comparison_points_only else ["mc-stat", "data-stat"]
             ),
+            # Recorded only when used, so existing configurations keep their hashes.
+            **({"scenario_labels": scenario_labels} if scenario_labels else {}),
         },
     }
     reservation = reserve_run_directory(
@@ -8914,6 +8789,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 reservation.incomplete_dir, results, config.luminosities_fb, partial,
                 pull_magnitude_min=config.pull_magnitude_min,
                 particle_pt_min_gev=config.particle_pt_min_gev,
+                cuts=config.cuts,
+                scenario_label=config.scenario.label if config.scenario is not None else None,
             )
         )
         if all(result.pull_asymmetry_moments for result in results):
